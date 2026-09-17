@@ -864,6 +864,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
 			} else {
 				a.flush(pf, flushTime, cs, false)
 			}
+			// Always move past the timestamp just used: a tick landing on or slightly before the boundary
+			// would otherwise leave flushTime in place, and the next flush would reuse the same timestamp.
+			flushTime = flushTime.Add(a.interval)
 			for time.Now().After(flushTime) {
 				flushTime = flushTime.Add(a.interval)
 			}
