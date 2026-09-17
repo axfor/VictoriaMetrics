@@ -111,7 +111,7 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 		deleted := ctx.flushTimestamp > av.deleteDeadline
 		if deleted {
 			if ao.resetMarkerOnStale {
-				ao.appendResetMarkers(ctx, av, k.(string))
+				ao.appendResetMarkers(ctx, av, k.(string), ctx.flushTimestamp)
 			}
 			// Mark the current entry as deleted
 			av.deleteDeadline = -1
@@ -120,6 +120,11 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 			return true
 		}
 		outputKey := k.(string)
+		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
+			// The first visible flush of a new output entry: emit a zero one interval earlier.
+			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
+			av.started = true
+		}
 		if ctx.isGreen {
 			outputs = av.green
 		} else {
@@ -136,9 +141,13 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 	})
 }
 
-// appendResetMarkers emits a zero sample for every total and total_prometheus output of av,
-// which is going to be dropped because of staleness.
-func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputKey string) {
+// appendResetMarkers emits a zero sample at the given timestamp for every total and total_prometheus output of av.
+//
+// It is called for an entry which is going to be dropped because of staleness, and before the first visible flush
+// of a new entry. The latter covers entries lost without a marker, e.g. on vmagent restart or crash:
+// the previous output ends at some value X, and the new output restarts from a small value,
+// which increase() cannot detect as a counter reset if it isn't smaller than X.
+func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputKey string, timestamp int64) {
 	outputs := av.blue
 	if ctx.isGreen {
 		outputs = av.green
@@ -148,7 +157,7 @@ func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputK
 		if !ok || tc.resetTotalOnFlush {
 			continue
 		}
-		ctx.appendSeries(outputKey, tc.getSuffix(), 0)
+		ctx.appendSeriesAt(outputKey, tc.getSuffix(), timestamp, 0)
 	}
 }
 
@@ -157,6 +166,7 @@ type aggrValues struct {
 	blue           []aggrValue
 	green          []aggrValue
 	deleteDeadline int64
+	started        bool // a zero sample has been emitted before the first visible flush (reset_marker_on_stale)
 }
 
 type aggrConfig interface {

@@ -121,7 +121,8 @@ func markerConfig(outputs string, keepMetricNames, marker bool) string {
 }
 
 // Without a marker the output is 5 → gap → 5, so increase() over the gap is 0 while the real increase is 5.
-// With the marker a zero sample is emitted right after each alive period, which makes the reset explicit.
+// With the marker a zero sample is emitted right after each alive period and one interval before each one,
+// which makes the reset explicit.
 func TestResetMarkerOnStale(t *testing.T) {
 	without := runStaleScenario(t, markerConfig("[total]", true, false), twoPeriods, 20*time.Minute, 18*time.Minute)["foo"]
 	if got := collapse(without); !equalFloats(got, []float64{5}) {
@@ -129,19 +130,86 @@ func TestResetMarkerOnStale(t *testing.T) {
 	}
 
 	with := runStaleScenario(t, markerConfig("[total]", true, true), twoPeriods, 20*time.Minute, 18*time.Minute)["foo"]
-	if got := collapse(with); !equalFloats(got, []float64{5, 0, 5, 0}) {
-		t.Fatalf("with marker: got %v; want the shape [5 0 5 0]", with)
+	if got := collapse(with); !equalFloats(got, []float64{0, 5, 0, 5, 0}) {
+		t.Fatalf("with marker: got %v; want the shape [0 5 0 5 0]", with)
 	}
 	for i, s := range with {
 		if s.value != 0 {
 			continue
 		}
-		if i == 0 || with[i-1].value != 5 || s.at-with[i-1].at != time.Minute {
-			t.Fatalf("a marker must follow the last flush of an alive period by one interval; got %v", with)
+		leading := i+1 < len(with) && with[i+1].value == 5 && with[i+1].at-s.at == time.Minute
+		trailing := i > 0 && with[i-1].value == 5 && s.at-with[i-1].at == time.Minute
+		if leading == trailing {
+			t.Fatalf("a marker must either precede the first flush or follow the last flush of an alive period by one interval; got %v", with)
 		}
-		if i+1 < len(with) && with[i+1].at < 10*time.Minute-time.Minute {
+		if trailing && i+1 < len(with) && with[i+1].at < 10*time.Minute-time.Minute {
 			t.Fatalf("nothing must be emitted during the gap after a marker; got %v", with)
 		}
+	}
+}
+
+// vmagent restart (or crash) drops the aggregation state without any marker: the output ends at 1, and after the restart
+// a new low-frequency request makes it 1 again. Without the leading zero increase() over both sees no reset.
+//
+// ignore_first_sample_interval is 0s: lib/fasttime reads the real clock outside of goexperiment.synctest builds,
+// so the interval can't elapse on the fake clock. It doesn't take part in the problem anyway.
+func TestResetMarkerOnRestart(t *testing.T) {
+	const config = `
+- interval: 1m
+  staleness_interval: 2m
+  ignore_first_sample_interval: 0s
+  without: [pod]
+  outputs: [total]
+  keep_metric_names: true
+`
+	for _, c := range []struct {
+		marker bool
+		want   float64
+	}{{false, 1}, {true, 2}} {
+		cfg := config
+		if c.marker {
+			cfg += "  reset_marker_on_stale: true\n"
+		}
+		synctest.Test(t, func(t *testing.T) {
+			var mu sync.Mutex
+			var tss []prompb.TimeSeries
+			pushFunc := func(src []prompb.TimeSeries) {
+				mu.Lock()
+				tss = appendClonedTimeseries(tss, src)
+				mu.Unlock()
+			}
+			start := time.Now()
+			a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
+			if err != nil {
+				t.Fatalf("cannot load config: %s", err)
+			}
+			time.Sleep(30 * time.Second)
+			a.Push(prometheus.MustParsePromMetrics(`foo{pod="a"} 1`, time.Now().UnixMilli()), nil)
+			time.Sleep(90 * time.Second)
+			a.MustStop() // restart while the output is alive
+			time.Sleep(30 * time.Second)
+			b, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
+			if err != nil {
+				t.Fatalf("cannot load config: %s", err)
+			}
+			time.Sleep(10 * time.Minute)
+			b.Push(prometheus.MustParsePromMetrics(`foo{pod="b"} 1`, time.Now().UnixMilli()), nil)
+			time.Sleep(90 * time.Second)
+			b.MustStop()
+
+			mu.Lock()
+			defer mu.Unlock()
+			var out []markerSample
+			for _, ts := range tss {
+				for _, s := range ts.Samples {
+					out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+				}
+			}
+			sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
+			if got := increasePure(out); got != c.want {
+				t.Fatalf("marker=%v: want increase %v; got %v from %v", c.marker, c.want, got, out)
+			}
+		})
 	}
 }
 
@@ -153,8 +221,8 @@ func TestResetMarkerOnStaleOnlyCumulativeTotal(t *testing.T) {
 	const total, increase = "foo:1m_without_pod_total", "foo:1m_without_pod_increase"
 	for range 5 {
 		out := runStaleScenario(t, markerConfig("[total, increase]", false, true), twoPeriods, 20*time.Minute, 18*time.Minute)
-		if got := collapse(out[total]); !equalFloats(got, []float64{5, 0, 5, 0}) {
-			t.Fatalf("total output: got %v; want the shape [5 0 5 0]", out[total])
+		if got := collapse(out[total]); !equalFloats(got, []float64{0, 5, 0, 5, 0}) {
+			t.Fatalf("total output: got %v; want the shape [0 5 0 5 0]", out[total])
 		}
 		var totalFlushes []time.Duration
 		for _, s := range out[total] {
@@ -179,6 +247,7 @@ func TestResetMarkerOnStaleNotOnShutdown(t *testing.T) {
 	config := markerConfig("[total]", true, true) + "  flush_on_shutdown: true\n"
 	for range 5 {
 		// Stop 90 seconds after the second push, while the series is still alive.
+		// (A leading zero before the second alive period is expected; only the tail matters here.)
 		alive := runStaleScenario(t, config, twoPeriods, 11*time.Minute+30*time.Second, 0)["foo"]
 		if n := len(alive); n == 0 || alive[n-1].value != 5 {
 			t.Fatalf("no marker is expected at shutdown for alive series; got %v", alive)
