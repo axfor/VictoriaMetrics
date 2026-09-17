@@ -10,11 +10,22 @@ import (
 )
 
 type aggrOutputs struct {
-	m              sync.Map
-	useSharedState bool
-	useInputKey    bool
-	configs        []aggrConfig
-	outputSamples  *metrics.Counter
+	m                  sync.Map
+	useSharedState     bool
+	useInputKey        bool
+	resetMarkerOnStale bool
+	configs            []aggrConfig
+	outputSamples      *metrics.Counter
+}
+
+// hasCumulativeTotal returns true if ao has total or total_prometheus output.
+func (ao *aggrOutputs) hasCumulativeTotal() bool {
+	for _, c := range ao.configs {
+		if tc, ok := c.(*totalAggrConfig); ok && !tc.resetTotalOnFlush {
+			return true
+		}
+	}
+	return false
 }
 
 func (ao *aggrOutputs) getInputOutputKey(key string) (string, string) {
@@ -99,6 +110,9 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 		// check for stale entries
 		deleted := ctx.flushTimestamp > av.deleteDeadline
 		if deleted {
+			if ao.resetMarkerOnStale {
+				ao.appendResetMarkers(ctx, av, k.(string))
+			}
 			// Mark the current entry as deleted
 			av.deleteDeadline = -1
 			av.mu.Unlock()
@@ -120,6 +134,22 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 		}
 		return true
 	})
+}
+
+// appendResetMarkers emits a zero sample for every total and total_prometheus output of av,
+// which is going to be dropped because of staleness.
+func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputKey string) {
+	outputs := av.blue
+	if ctx.isGreen {
+		outputs = av.green
+	}
+	for i := range outputs {
+		tc, ok := ao.configs[i].(*totalAggrConfig)
+		if !ok || tc.resetTotalOnFlush {
+			continue
+		}
+		ctx.appendSeries(outputKey, tc.getSuffix(), 0)
+	}
 }
 
 type aggrValues struct {

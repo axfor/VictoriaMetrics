@@ -184,6 +184,18 @@ type Config struct {
 	// This parameter is relevant only for the following outputs: total, total_prometheus, increase, increase_prometheus, and histogram_bucket.
 	IgnoreFirstSampleInterval string `yaml:"ignore_first_sample_interval,omitempty"`
 
+	// ResetMarkerOnStale instructs to emit a single sample with zero value for total and total_prometheus outputs
+	// when their state is dropped because no input samples were received during staleness_interval.
+	//
+	// Without the marker the output restarts from a small value after the state is dropped, and query functions
+	// such as increase() cannot detect the counter reset if the new value isn't smaller than the last value before the gap.
+	// The zero sample makes the reset explicit.
+	//
+	// The marker is correct only if the inputs themselves restart from zero after the gap, e.g. when the scrape targets
+	// delete idle series. If inputs stop reporting for longer than staleness_interval without restarting
+	// (for example, because of a scrape outage), the marker makes the values before the gap to be counted twice.
+	ResetMarkerOnStale *bool `yaml:"reset_marker_on_stale,omitempty"`
+
 	// Outputs is a list of output aggregate functions to produce.
 	//
 	// The following names are allowed:
@@ -595,9 +607,10 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	useInputKey := dedupInterval <= 0
 	useSharedState := enableWindows && useInputKey
 	aggrOutputs := &aggrOutputs{
-		configs:        make([]aggrConfig, len(cfg.Outputs)),
-		useSharedState: useSharedState,
-		useInputKey:    useInputKey,
+		configs:            make([]aggrConfig, len(cfg.Outputs)),
+		useSharedState:     useSharedState,
+		useInputKey:        useInputKey,
+		resetMarkerOnStale: cfg.ResetMarkerOnStale != nil && *cfg.ResetMarkerOnStale,
 	}
 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
 	for i, output := range cfg.Outputs {
@@ -606,6 +619,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 			return nil, err
 		}
 		aggrOutputs.configs[i] = ac
+	}
+	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
+		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total` or `total_prometheus` output")
 	}
 	outputsLabels := make([]string, 0, len(outputsSeen))
 	for o := range outputsSeen {
