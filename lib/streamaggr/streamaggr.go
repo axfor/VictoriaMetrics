@@ -185,11 +185,13 @@ type Config struct {
 	IgnoreFirstSampleInterval string `yaml:"ignore_first_sample_interval,omitempty"`
 
 	// ResetMarkerOnStale instructs to emit a single sample with zero value for total and total_prometheus outputs
-	// when their state is dropped because no input samples were received during staleness_interval.
+	// when their state is dropped because no input samples were received during staleness_interval,
+	// and one interval before the first sample of a newly created output state.
 	//
 	// Without the marker the output restarts from a small value after the state is dropped, and query functions
 	// such as increase() cannot detect the counter reset if the new value isn't smaller than the last value before the gap.
-	// The zero sample makes the reset explicit.
+	// The zero sample makes the reset explicit. The leading zero also covers state lost without a marker,
+	// e.g. on vmagent restart or crash.
 	//
 	// The marker is correct only if the inputs themselves restart from zero after the gap, e.g. when the scrape targets
 	// delete idle series. If inputs stop reporting for longer than staleness_interval without restarting
@@ -1249,6 +1251,10 @@ func (ctx *flushCtx) flushSeries() {
 }
 
 func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+	ctx.appendSeriesAt(key, suffix, ctx.flushTimestamp, value)
+}
+
+func (ctx *flushCtx) appendSeriesAt(key, suffix string, timestamp int64, value float64) {
 	labelsLen := len(ctx.labels)
 	samplesLen := len(ctx.samples)
 	ctx.labels = decompressLabels(ctx.labels, key)
@@ -1256,7 +1262,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
 		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
 	}
 	ctx.samples = append(ctx.samples, prompb.Sample{
-		Timestamp: ctx.flushTimestamp,
+		Timestamp: timestamp,
 		Value:     value,
 	})
 	ctx.tss = append(ctx.tss, prompb.TimeSeries{
