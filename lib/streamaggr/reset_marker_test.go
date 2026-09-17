@@ -266,7 +266,7 @@ func TestResetMarkerOnStaleRequiresCumulativeTotal(t *testing.T) {
 			t.Fatalf("expecting an error for outputs %s", outputs)
 		}
 	}
-	for _, outputs := range []string{"[total]", "[total_prometheus]", "[increase, total]"} {
+	for _, outputs := range []string{"[total]", "[total_prometheus]", "[increase, total]", "[sum_samples_total]"} {
 		config := `
 - interval: 1m
   outputs: ` + outputs + `

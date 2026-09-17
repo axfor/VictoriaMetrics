@@ -47,6 +47,7 @@ var supportedOutputs = []string{
 	"stddev",
 	"stdvar",
 	"sum_samples",
+	"sum_samples_total",
 	"total",
 	"total_prometheus",
 	"unique_samples",
@@ -184,7 +185,7 @@ type Config struct {
 	// This parameter is relevant only for the following outputs: total, total_prometheus, increase, increase_prometheus, and histogram_bucket.
 	IgnoreFirstSampleInterval string `yaml:"ignore_first_sample_interval,omitempty"`
 
-	// ResetMarkerOnStale instructs to emit a single sample with zero value for total and total_prometheus outputs
+	// ResetMarkerOnStale instructs to emit a single sample with zero value for total, total_prometheus and sum_samples_total outputs
 	// when their state is dropped because no input samples were received during staleness_interval,
 	// and one interval before the first sample of a newly created output state.
 	//
@@ -623,7 +624,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		aggrOutputs.configs[i] = ac
 	}
 	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
-		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total` or `total_prometheus` output")
+		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total`, `total_prometheus` or `sum_samples_total` output")
 	}
 	outputsLabels := make([]string, 0, len(outputsSeen))
 	for o := range outputsSeen {
@@ -796,6 +797,8 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
 		return newStdvarAggrConfig(), nil
 	case "sum_samples":
 		return newSumSamplesAggrConfig(), nil
+	case "sum_samples_total":
+		return newSumSamplesTotalAggrConfig(), nil
 	case "total":
 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
 	case "total_prometheus":

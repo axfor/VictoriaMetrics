@@ -18,14 +18,25 @@ type aggrOutputs struct {
 	outputSamples      *metrics.Counter
 }
 
-// hasCumulativeTotal returns true if ao has total or total_prometheus output.
+// hasCumulativeTotal returns true if ao has total, total_prometheus or sum_samples_total output.
 func (ao *aggrOutputs) hasCumulativeTotal() bool {
 	for _, c := range ao.configs {
-		if tc, ok := c.(*totalAggrConfig); ok && !tc.resetTotalOnFlush {
+		if _, ok := cumulativeSuffix(c); ok {
 			return true
 		}
 	}
 	return false
+}
+
+// cumulativeSuffix returns the output suffix for outputs producing a cumulative counter.
+func cumulativeSuffix(c aggrConfig) (string, bool) {
+	switch t := c.(type) {
+	case *totalAggrConfig:
+		return t.getSuffix(), !t.resetTotalOnFlush
+	case *sumSamplesTotalAggrConfig:
+		return "sum_samples_total", true
+	}
+	return "", false
 }
 
 func (ao *aggrOutputs) getInputOutputKey(key string) (string, string) {
@@ -141,7 +152,7 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 	})
 }
 
-// appendResetMarkers emits a zero sample at the given timestamp for every total and total_prometheus output of av.
+// appendResetMarkers emits a zero sample at the given timestamp for every total, total_prometheus and sum_samples_total output of av.
 //
 // It is called for an entry which is going to be dropped because of staleness, and before the first visible flush
 // of a new entry. The latter covers entries lost without a marker, e.g. on vmagent restart or crash:
@@ -153,11 +164,9 @@ func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputK
 		outputs = av.green
 	}
 	for i := range outputs {
-		tc, ok := ao.configs[i].(*totalAggrConfig)
-		if !ok || tc.resetTotalOnFlush {
-			continue
+		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
+			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
 		}
-		ctx.appendSeriesAt(outputKey, tc.getSuffix(), timestamp, 0)
 	}
 }
 
