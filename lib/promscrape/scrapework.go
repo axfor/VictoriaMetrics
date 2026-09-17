@@ -196,7 +196,9 @@ type scrapeWork struct {
 	Config *ScrapeWork
 
 	// ReadData is called for reading the scrape response data into dst.
-	ReadData func(dst *chunkedbuffer.Buffer) (bool, error)
+	//
+	// It returns the Content-Encoding of the read data: "gzip", "zstd" or "" for uncompressed data.
+	ReadData func(dst *chunkedbuffer.Buffer) (string, error)
 
 	// PushData is called for pushing collected data.
 	//
@@ -424,13 +426,13 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
 	cb := chunkedbuffer.Get()
 	defer chunkedbuffer.Put(cb)
 
-	isGzipped, err := sw.ReadData(cb)
+	contentEncoding, err := sw.ReadData(cb)
 	if err != nil {
 		return nil, err
 	}
 
 	var bb bytesutil.ByteBuffer
-	err = readFromBuffer(&bb, cb, isGzipped)
+	err = readFromBuffer(&bb, cb, contentEncoding)
 	return bb.B, err
 }
 
@@ -441,7 +443,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// This also allows measuring the real scrape duration, which doesn't include
 	// the time needed for processing of the read response.
 	cb := chunkedbuffer.Get()
-	isGzipped, err := sw.ReadData(cb)
+	contentEncoding, err := sw.ReadData(cb)
 
 	// Measure scrape duration.
 	endTimestamp := time.Now().UnixMilli()
@@ -458,7 +460,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// the parsed results to remote storage.
 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
 	if err == nil {
-		err = readFromBuffer(body, cb, isGzipped)
+		err = readFromBuffer(body, cb, contentEncoding)
 	}
 	chunkedbuffer.Put(cb)
 
@@ -487,20 +489,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 
 var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
 
-func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, isGzipped bool) error {
-	if !isGzipped {
+func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, contentEncoding string) error {
+	if contentEncoding == "" {
 		src.MustWriteTo(dst)
 		return nil
 	}
 
-	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), "gzip")
+	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), contentEncoding)
 	if err != nil {
 		return fmt.Errorf("cannot decompress response body: %w", err)
 	}
 	_, err = dst.ReadFrom(reader)
 	protoparserutil.PutUncompressedReader(reader)
 	if err != nil {
-		return fmt.Errorf("cannot read gzipped response body: %w", err)
+		return fmt.Errorf("cannot read %s-compressed response body: %w", contentEncoding, err)
 	}
 	return nil
 }

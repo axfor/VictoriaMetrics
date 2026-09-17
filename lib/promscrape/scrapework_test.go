@@ -95,9 +95,9 @@ func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
 	}
 
 	readDataCalls := 0
-	sw.ReadData = func(_ *chunkedbuffer.Buffer) (bool, error) {
+	sw.ReadData = func(_ *chunkedbuffer.Buffer) (string, error) {
 		readDataCalls++
-		return false, fmt.Errorf("error when reading data")
+		return "", fmt.Errorf("error when reading data")
 	}
 
 	pushDataCalls := 0
@@ -158,10 +158,10 @@ func testScrapeWorkScrapeInternalSuccess(t *testing.T, streamParse bool) {
 		sw.Config = cfg
 
 		readDataCalls := 0
-		sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
+		sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
 			readDataCalls++
 			dst.MustWrite([]byte(data))
-			return false, nil
+			return "", nil
 		}
 
 		var pushDataMu sync.Mutex
@@ -610,10 +610,10 @@ func TestScrapeWorkScrapeInternalStreamConcurrency(t *testing.T) {
 		sw.Config = cfg
 
 		readDataCalls := 0
-		sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
+		sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
 			readDataCalls++
 			dst.MustWrite([]byte(data))
-			return false, nil
+			return "", nil
 		}
 
 		var pushDataCalls atomic.Int64
