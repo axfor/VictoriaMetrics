@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/bits"
 	"strings"
@@ -456,6 +457,14 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// without sacrificing the performance.
 	processScrapedDataConcurrencyLimitCh <- struct{}{}
 
+	if err == nil && sw.canStreamWithoutBody(cb.SizeBytes()) {
+		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
+		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)
+		chunkedbuffer.Put(cb)
+		<-processScrapedDataConcurrencyLimitCh
+		return err
+	}
+
 	// Copy the read scrape response to body in order to parse it and send
 	// the parsed results to remote storage.
 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
@@ -488,6 +497,66 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 }
 
 var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
+
+// canStreamWithoutBody returns true if the read response can be decompressed and parsed in stream parsing mode
+// without copying the whole uncompressed response into memory first.
+//
+// The whole uncompressed response is needed only for stale markers and series_limit,
+// which compare it with the previous response.
+func (sw *scrapeWork) canStreamWithoutBody(readSize int) bool {
+	cfg := sw.Config
+	if !cfg.NoStaleMarkers || cfg.SeriesLimit > 0 {
+		return false
+	}
+	if *streamParse || cfg.StreamParse {
+		return true
+	}
+	if minResponseSizeForStreamParse.N <= 0 || !cfg.canSwitchToStreamParseMode() {
+		return false
+	}
+	// The uncompressed size isn't known before decompression. Use the uncompressed size of the previous response
+	// and the size of the read response, which is usually smaller than the uncompressed size.
+	n := minResponseSizeForStreamParse.IntN()
+	return sw.prevBodyLen >= n || readSize >= n
+}
+
+// processReadDataInStreamMode decompresses and parses the read response in stream parsing mode.
+//
+// Unlike processDataInStreamMode, a decompression error in the middle of the response marks the scrape as failed
+// after some samples may have been already pushed. This is the same as for parsing errors in stream parsing mode.
+func (sw *scrapeWork) processReadDataInStreamMode(scrapeTimestamp, realTimestamp int64, cb *chunkedbuffer.Buffer, contentEncoding string, scrapeDurationSeconds float64) error {
+	reader, err := protoparserutil.GetUncompressedReader(cb.NewReader(), contentEncoding)
+	if err != nil {
+		return sw.processDataOneShot(scrapeTimestamp, realTimestamp, nil, scrapeDurationSeconds, fmt.Errorf("cannot decompress response body: %w", err))
+	}
+	rr := &responseReader{r: reader, contentEncoding: contentEncoding}
+	err = sw.processStream(scrapeTimestamp, realTimestamp, rr, "", func() int { return int(rr.n) }, scrapeDurationSeconds)
+	protoparserutil.PutUncompressedReader(reader)
+
+	sw.prevBodyLen = int(rr.n)
+	scrapeResponseSize.Update(float64(rr.n))
+	return err
+}
+
+// responseReader counts the uncompressed bytes of the read response.
+//
+// It also turns io.ErrUnexpectedEOF into an ordinary error: stream parsing treats it as the end of data,
+// which suits network streams, while here the whole response has been already read, so it means broken compressed data.
+// Such a response is rejected in the same way as when it is decompressed at once.
+type responseReader struct {
+	r               io.Reader
+	n               int64
+	contentEncoding string
+}
+
+func (rr *responseReader) Read(p []byte) (int, error) {
+	n, err := rr.r.Read(p)
+	rr.n += int64(n)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		err = fmt.Errorf("cannot read %s-compressed response body: unexpected end of compressed data", rr.contentEncoding)
+	}
+	return n, err
+}
 
 func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, contentEncoding string) error {
 	if contentEncoding == "" {
@@ -603,6 +672,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 }
 
 func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64) error {
+	bodyString := bytesutil.ToUnsafeString(body.B)
+	return sw.processStream(scrapeTimestamp, realTimestamp, body.NewReader(), bodyString, func() int { return len(bodyString) }, scrapeDurationSeconds)
+}
+
+// processStream parses the uncompressed response from r in stream parsing mode.
+//
+// bodyString is the whole response if it is available; it is used for stale markers and series_limit tracking.
+// responseSize returns the uncompressed response size after r is read.
+func (sw *scrapeWork) processStream(scrapeTimestamp, realTimestamp int64, r io.Reader, bodyString string, responseSize func() int, scrapeDurationSeconds float64) error {
 	var samplesScraped atomic.Int64
 	var samplesPostRelabeling atomic.Int64
 	var samplesDroppedTotal atomic.Int64
@@ -614,11 +692,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 	bbLastScrape.B = sw.loadLastScrape(bbLastScrape.B)
 	lastScrapeStr := bytesutil.ToUnsafeString(bbLastScrape.B)
 
-	bodyString := bytesutil.ToUnsafeString(body.B)
 	cfg := sw.Config
 	areIdenticalSeries := areIdenticalSeries(cfg, lastScrapeStr, bodyString)
 
-	r := body.NewReader()
 	err := stream.Parse(r, scrapeTimestamp, "", false, prommetadata.IsEnabled(), func(rows []parser.Row, mms []parser.Metadata) error {
 		labelsLen := maxLabelsLen.Load()
 		wc := writeRequestCtxPool.Get(int(labelsLen))
@@ -679,12 +755,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 		// This is a trade-off between performance and accuracy.
 		seriesAdded = getSeriesAdded(lastScrapeStr, bodyString)
 	}
-	responseSize := len(bodyString)
+	size := 0
+	if up == 1 {
+		size = responseSize()
+	}
 
 	am := &autoMetrics{
 		up:                        up,
 		scrapeDurationSeconds:     scrapeDurationSeconds,
-		scrapeResponseSize:        responseSize,
+		scrapeResponseSize:        size,
 		samplesScraped:            int(samplesScraped.Load()),
 		samplesPostRelabeling:     int(samplesPostRelabeling.Load()),
 		seriesAdded:               seriesAdded,
@@ -701,7 +780,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 	}
 	leveledbytebufferpool.Put(bbLastScrape)
 
-	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), responseSize, int(samplesScraped.Load()), err)
+	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), size, int(samplesScraped.Load()), err)
 	// Do not track active series in streaming mode, since this may need too big amounts of memory
 	// when the target exports too big number of metrics.
 	return err
