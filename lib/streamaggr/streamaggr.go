@@ -909,6 +909,14 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
 	if skipIncompleteFlush || ignoreFirstIntervals > 0 {
 		pf = nil
 	}
+	if pf != nil && a.aggrOutputs.resetMarkerOnStale {
+		if now := time.Now(); flushTime.After(now) {
+			// Don't stamp the incomplete flush on shutdown with the next flush boundary, which is in the future:
+			// a restarted aggregator emits the leading zero of reset_marker_on_stale at its own start,
+			// and increase() would see X → 0 → X for the same series and count X twice.
+			flushTime = now
+		}
+	}
 	a.flush(pf, flushTime, cs, true)
 }
 

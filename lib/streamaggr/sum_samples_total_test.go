@@ -92,3 +92,58 @@ func TestSumSamplesTotalRestart(t *testing.T) {
 		t.Fatalf("without marker the restarted output isn't detected as a reset, so it must undercount; got %v from %v", got, without)
 	}
 }
+
+// flush_on_shutdown emits the incomplete interval on shutdown. Its timestamp must not be in the future:
+// the restarted aggregator emits the leading zero at its own start, and a future timestamp of the last flush lands after it,
+// so increase() sees X → 0 → X and counts X twice.
+func TestSumSamplesTotalFlushOnShutdownRestart(t *testing.T) {
+	config := markerConfig("[sum_samples_total]", true, true) + "  flush_on_shutdown: true\n"
+	var out []markerSample
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var tss []prompb.TimeSeries
+		pushFunc := func(src []prompb.TimeSeries) {
+			mu.Lock()
+			tss = appendClonedTimeseries(tss, src)
+			mu.Unlock()
+		}
+		start := time.Now()
+		sleepUntil := func(d time.Duration) { time.Sleep(start.Add(d).Sub(time.Now())) }
+		push := func(a *Aggregators, s string) {
+			a.Push(prometheus.MustParsePromMetrics(s, time.Now().UnixMilli()), nil)
+		}
+		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
+		if err != nil {
+			t.Fatalf("cannot load config: %s", err)
+		}
+		sleepUntil(30 * time.Second)
+		push(a, `foo{pod="a"} 3`)
+		sleepUntil(90 * time.Second)
+		push(a, `foo{pod="a"} 3`)
+		sleepUntil(150 * time.Second)
+		push(a, `foo{pod="a"} 2`) // only the flush on shutdown emits it
+		sleepUntil(170 * time.Second)
+		a.MustStop()
+		sleepUntil(175 * time.Second) // restart before the next flush boundary of the stopped aggregator
+		b, err := LoadFromData([]byte(config), pushFunc, nil, "test")
+		if err != nil {
+			t.Fatalf("cannot load config: %s", err)
+		}
+		sleepUntil(200 * time.Second)
+		push(b, `foo{pod="b"} 4`)
+		sleepUntil(300 * time.Second)
+		b.MustStop()
+
+		mu.Lock()
+		defer mu.Unlock()
+		for _, ts := range tss {
+			for _, s := range ts.Samples {
+				out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+			}
+		}
+		sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
+	})
+	if got := increasePure(out); got != 12 {
+		t.Fatalf("want increase 12 (8 before the restart including the flush on shutdown, 4 after); got %v from %v", got, out)
+	}
+}
