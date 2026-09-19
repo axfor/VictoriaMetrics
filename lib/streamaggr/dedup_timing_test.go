@@ -2,6 +2,7 @@ package streamaggr
 
 import (
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"sync/atomic"
 	"testing"
 
@@ -65,7 +66,7 @@ func newBenchSamples(count int) []pushSample {
 			Name:  "app",
 			Value: fmt.Sprintf("instance-%d", i),
 		})
-		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:])
+		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:], &promutil.CompressorCache{})
 		sample.key = string(keyBuf)
 		sample.value = float64(i)
 	}

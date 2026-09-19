@@ -1030,7 +1030,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 		}
 
 		bufLen := len(buf)
-		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels)
+		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache)
 		// key remains valid only by the end of this function and can't be reused after
 		// do not intern key because number of unique keys could be too high
 		key := bytesutil.ToUnsafeString(buf[bufLen:])
@@ -1089,13 +1089,13 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	}
 }
 
-func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label) []byte {
+func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache) []byte {
 	bb := bbPool.Get()
-	bb.B = lc.Compress(bb.B, outputLabels)
+	bb.B = lc.CompressCached(bb.B, outputLabels, c)
 	dst = encoding.MarshalVarUint64(dst, uint64(len(bb.B)))
 	dst = append(dst, bb.B...)
 	bbPool.Put(bb)
-	dst = lc.Compress(dst, inputLabels)
+	dst = lc.CompressCached(dst, inputLabels, c)
 	return dst
 }
 
@@ -1110,6 +1110,7 @@ type pushCtx struct {
 	inputLabels  promutil.Labels
 	outputLabels promutil.Labels
 	buf          []byte
+	lcCache      promutil.CompressorCache
 }
 
 func (ctx *pushCtx) reset() {
