@@ -121,7 +121,7 @@ func (d *Deduplicator) Push(tss []prompb.TimeSeries) {
 		labels.Sort()
 
 		bufLen := len(buf)
-		buf = lc.Compress(buf, labels.Labels)
+		buf = lc.CompressCached(buf, labels.Labels, &ctx.lcCache)
 		key := bytesutil.ToUnsafeString(buf[bufLen:])
 		for _, s := range ts.Samples {
 			if d.enableWindows && minDeadline > s.Timestamp {
@@ -247,10 +247,11 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
 }
 
 type deduplicatorPushCtx struct {
-	blue   []pushSample
-	green  []pushSample
-	labels promutil.Labels
-	buf    []byte
+	blue    []pushSample
+	green   []pushSample
+	labels  promutil.Labels
+	buf     []byte
+	lcCache promutil.CompressorCache
 }
 
 func (ctx *deduplicatorPushCtx) reset() {

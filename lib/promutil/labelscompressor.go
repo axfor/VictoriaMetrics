@@ -232,3 +232,61 @@ func (lm *labelsMap) moveMutableToReadOnlyLocked(pReadOnly *[]*prompb.Label) {
 	clear(lm.mutable)
 	lm.readOnly.Store(&labels)
 }
+
+// CompressorCache is a small direct-mapped cache in front of LabelsCompressor.
+//
+// The labels of a scrape repeat heavily: job, instance, namespace and the like are
+// identical on every series, so most lookups answer from here and never touch the
+// shared map. It is not safe for concurrent use; keep one per goroutine.
+type CompressorCache struct {
+	entries [compressorCacheSize]compressorCacheEntry
+}
+
+type compressorCacheEntry struct {
+	name  string
+	value string
+	idx   uint64
+}
+
+// 4096 slots, 160 KB per cache. Going to 1024 costs about 5% on the aggregation
+// push benchmark; going to 16384 buys about 3% more for four times the memory,
+// and that gain is against a synthetic label set. In a real scrape the
+// high-cardinality label misses at any size, while the rest fit either way.
+const compressorCacheSize = 4096
+
+func (c *CompressorCache) slot(label prompb.Label) *compressorCacheEntry {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(label.Name); i++ {
+		h = (h ^ uint64(label.Name[i])) * 1099511628211
+	}
+	for i := 0; i < len(label.Value); i++ {
+		h = (h ^ uint64(label.Value[i])) * 1099511628211
+	}
+	return &c.entries[h%compressorCacheSize]
+}
+
+// CompressCached works like Compress, answering from c where it can.
+func (lc *LabelsCompressor) CompressCached(dst []byte, labels []prompb.Label, c *CompressorCache) []byte {
+	if len(labels) == 0 {
+		return append(dst, 0)
+	}
+	a := encoding.GetUint64s(len(labels) + 1)
+	a.A[0] = uint64(len(labels))
+	out := a.A[1:]
+	for i, label := range labels {
+		e := c.slot(label)
+		if e.idx != 0 && e.name == label.Name && e.value == label.Value {
+			out[i] = e.idx
+			continue
+		}
+		lc.compress(out[i:i+1], labels[i:i+1])
+		idx := out[i]
+		// Keep the interned copy the shared map holds, never the caller's buffer.
+		if stored, ok := lc.idxToLabel.Load(idx); ok {
+			e.name, e.value, e.idx = stored.Name, stored.Value, idx
+		}
+	}
+	dst = encoding.MarshalVarUint64s(dst, a.A)
+	encoding.PutUint64s(a)
+	return dst
+}
