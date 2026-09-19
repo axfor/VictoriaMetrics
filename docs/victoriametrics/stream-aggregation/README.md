@@ -811,6 +811,10 @@ Moved to [stream-aggregation/configuration/#stdvar](https://docs.victoriametrics
 
 Moved to [stream-aggregation/configuration/#sum_samples](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#sum_samples).
 
+###### sum_samples_total
+
+Moved to [stream-aggregation/configuration/#sum_samples_total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#sum_samples_total).
+
 ###### total
 
 Moved to [stream-aggregation/configuration/#total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#total).

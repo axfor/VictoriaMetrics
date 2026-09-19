@@ -110,6 +110,15 @@ specified individually per each `-remoteWrite.url`:
   #
   # flush_on_shutdown: false
 
+  # reset_marker_on_stale instructs to emit a single sample with zero value before a cumulative output
+  # (total, total_prometheus or sum_samples_total) starts a new stretch: when the previous state expired
+  # after staleness_interval, and when the output is created, which happens after a restart or a crash.
+  # Without it, a new stretch starting from a value that is not below the previous one is not recognized
+  # as a counter reset by increase() and the missing amount is silently lost.
+  # It requires one of the cumulative outputs above.
+  #
+  # reset_marker_on_stale: false
+
   # without is an optional list of labels, which must be removed from the output aggregation.
   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
   #
@@ -495,6 +504,30 @@ See also:
 
 - [count_samples](#count_samples)
 - [count_series](#count_series)
+
+### sum_samples_total
+
+`sum_samples_total` sums input [sample values](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#raw-samples)
+like [sum_samples](#sum_samples), but it does not reset the sum on flush, so the output is a cumulative counter.
+
+It is meant for inputs that already are increments, for instance a scrape target that reports only what accrued since
+the last delivered scrape. Compared with [total](#total) on the same data:
+
+- it keeps no state per input series, so memory does not depend on how many inputs are merged into one output;
+- a restart needs no baseline sample, so the first sample after a restart is not dropped.
+
+Use it together with `reset_marker_on_stale` so that a counter reset is visible to the query side.
+
+The results of `sum_samples_total` is equal to the following [MetricsQL](https://docs.victoriametrics.com/victoriametrics/metricsql/) query:
+
+```metricsql
+running_sum(sum(sum_over_time(some_metric[interval])))
+```
+
+See also:
+
+- [sum_samples](#sum_samples)
+- [total](#total)
 
 ### total
 
