@@ -132,8 +132,19 @@ func (x *Labels) Clone() *Labels {
 
 // Sort sorts x labels in alphabetical order of their names.
 func (x *Labels) Sort() {
-	if !sort.IsSorted(x) {
-		sort.Sort(x)
+	labels := x.Labels
+	// Label sets are short and usually already sorted, and this sits on the
+	// stream aggregation push path, once per sample. An insertion sort straight
+	// on the slice pays no interface call per comparison and no second pass to
+	// check whether it is sorted at all.
+	for i := 1; i < len(labels); i++ {
+		l := labels[i]
+		j := i - 1
+		for j >= 0 && labels[j].Name > l.Name {
+			labels[j+1] = labels[j]
+			j--
+		}
+		labels[j+1] = l
 	}
 }
 
