@@ -409,7 +409,17 @@ var (
 	scrapesSkippedBySampleLimit = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_sample_limit_total")
 	scrapesSkippedByLabelLimit  = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_label_limit_total")
 	scrapesFailed               = metrics.NewCounter("vm_promscrape_scrapes_failed_total")
-	pushDataDuration            = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
+
+	// Which path a scrape took through the parser. Whether the uncompressed
+	// response is ever held in memory is decided per scrape from the config and
+	// the response size, and getting it wrong costs memory proportional to the
+	// response rather than failing, so it has to be visible. no_stale_markers
+	// has to be set and neither sample_limit nor series_limit may be, and none
+	// of those says so.
+	scrapesStreamedWithoutBody = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="stream_without_body"}`)
+	scrapesStreamed            = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="stream"}`)
+	scrapesOneShot             = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`)
+	pushDataDuration           = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
 )
 
 func (sw *scrapeWork) needStreamParseMode(responseSize int) bool {
@@ -459,6 +469,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 
 	if err == nil && sw.canStreamWithoutBody(cb.SizeBytes()) {
 		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
+		scrapesStreamedWithoutBody.Inc()
 		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)
 		chunkedbuffer.Put(cb)
 		<-processScrapedDataConcurrencyLimitCh
@@ -481,11 +492,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 		// Process response body from scrape target in streaming manner.
 		// This case is optimized for targets exposing more than ten thousand of metrics per target,
 		// such as kube-state-metrics.
+		scrapesStreamed.Inc()
 		err = sw.processDataInStreamMode(scrapeTimestamp, realTimestamp, body, scrapeDurationSeconds)
 	} else {
 		// Process response body from scrape target at once.
 		// This case should work more optimally than stream parse for common case when scrape target exposes
 		// up to a few thousand metrics.
+		scrapesOneShot.Inc()
 		err = sw.processDataOneShot(scrapeTimestamp, realTimestamp, body.B, scrapeDurationSeconds, err)
 	}
 
