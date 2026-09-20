@@ -656,7 +656,7 @@ func TestStorageDeletePendingSeries(t *testing.T) {
 	assertCountMonthsWithLabels := func(count int) {
 		t.Helper()
 
-		ts := time.Unix(0, 0)
+		ts := time.Unix(0, 0).UTC()
 		n := 0
 		for range numMonths {
 			lns, err := s.SearchLabelNames(nil, nil, TimeRange{ts.UnixMilli(), ts.UnixMilli()}, 1e5, 1e9, noDeadline)
@@ -699,7 +699,12 @@ func TestStorageDeletePendingSeries(t *testing.T) {
 	// Verify no metrics exist
 	assertCountRows(0)
 
-	start := time.Unix(0, 0)
+	// UTC, so that the epoch is the 1st of a month. West of UTC it is the 31st,
+	// and AddDate normalizes the 31st of February to the 3rd of March, which
+	// makes stepping forward a month at a time and stepping back a month at a
+	// time land on different days -- and so in different per-day index entries,
+	// which is what this test reads back.
+	start := time.Unix(0, 0).UTC()
 	middle := start.AddDate(0, (numMonths-1)/2, 0)
 	end := start.AddDate(0, numMonths-1, 0)
 
