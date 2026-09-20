@@ -623,6 +623,23 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		}
 		aggrOutputs.configs[i] = ac
 	}
+	// Narrow useInputKey to what the configured outputs actually read. It is
+	// the labels the aggregation groups away -- pod and instance, typically --
+	// and carrying them costs a hash and two string compares per label per
+	// sample to build a key nothing looks at, plus the length in every key the
+	// state map holds. Only the outputs that keep state per input series need
+	// it; the rest take the sample and nothing else.
+	if useInputKey {
+		useInputKey = false
+		for _, ac := range aggrOutputs.configs {
+			if ac.needsInputKey() {
+				useInputKey = true
+				break
+			}
+		}
+		aggrOutputs.useInputKey = useInputKey
+	}
+
 	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
 		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total`, `total_prometheus` or `sum_samples_total` output")
 	}
@@ -997,6 +1014,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	deleteDeadlineMsec := deleteDeadline.UnixMilli()
 
 	minDeadline := a.minDeadline.Load()
+	useInputKey := a.aggrOutputs.useInputKey
 	dropLabels := a.dropInputLabels
 	ignoreOldSamples := a.ignoreOldSamples
 	enableWindows := a.enableWindows
@@ -1030,7 +1048,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 		}
 
 		bufLen := len(buf)
-		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache)
+		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache, useInputKey)
 		// key remains valid only by the end of this function and can't be reused after
 		// do not intern key because number of unique keys could be too high
 		key := bytesutil.ToUnsafeString(buf[bufLen:])
@@ -1089,13 +1107,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	}
 }
 
-func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache) []byte {
+// compressLabels builds a sample's key: the length of the output part, the
+// output part, and -- only when some configured output keeps state per input
+// series -- the input part. Compressing the input part costs a hash and two
+// string compares per label per sample, so it is left out when nothing will
+// read it. See aggrConfig.needsInputKey.
+func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache, useInputKey bool) []byte {
 	bb := bbPool.Get()
 	bb.B = lc.CompressCached(bb.B, outputLabels, c)
 	dst = encoding.MarshalVarUint64(dst, uint64(len(bb.B)))
 	dst = append(dst, bb.B...)
 	bbPool.Put(bb)
-	dst = lc.CompressCached(dst, inputLabels, c)
+	if useInputKey {
+		dst = lc.CompressCached(dst, inputLabels, c)
+	}
 	return dst
 }
 

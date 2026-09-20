@@ -40,3 +40,7 @@ func (*countSeriesAggrConfig) getValue(_ any) aggrValue {
 		samples: make(map[uint64]struct{}),
 	}
 }
+
+// needsInputKey reports that this output keeps state per input series, so the
+// key has to carry the labels the aggregation groups away.
+func (*countSeriesAggrConfig) needsInputKey() bool { return true }

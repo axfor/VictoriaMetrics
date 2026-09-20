@@ -121,3 +121,7 @@ func (ac *totalAggrConfig) getSuffix() string {
 	}
 	return "total_prometheus"
 }
+
+// needsInputKey reports that this output keeps state per input series, so the
+// key has to carry the labels the aggregation groups away.
+func (*totalAggrConfig) needsInputKey() bool { return true }

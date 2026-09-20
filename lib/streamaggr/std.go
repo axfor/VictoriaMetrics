@@ -61,3 +61,8 @@ type stdAggrConfig struct {
 func (*stdAggrConfig) getValue(_ any) aggrValue {
 	return &stdAggrValue{}
 }
+
+// needsInputKey reports that this output looks only at the sample, so the key
+// need not carry the labels the aggregation groups away -- compressing them
+// costs a hash and two string compares per label per sample, for nothing.
+func (*stdAggrConfig) needsInputKey() bool { return false }

@@ -53,3 +53,8 @@ type quantilesAggrConfig struct {
 func (*quantilesAggrConfig) getValue(_ any) aggrValue {
 	return &quantilesAggrValue{}
 }
+
+// needsInputKey reports that this output looks only at the sample, so the key
+// need not carry the labels the aggregation groups away -- compressing them
+// costs a hash and two string compares per label per sample, for nothing.
+func (*quantilesAggrConfig) needsInputKey() bool { return false }

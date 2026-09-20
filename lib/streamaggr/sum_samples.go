@@ -79,3 +79,13 @@ func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
 	}
 	return &sumSamplesTotalAggrValue{shared: shared}
 }
+
+// needsInputKey reports that this output looks only at the sample, so the key
+// need not carry the labels the aggregation groups away -- compressing them
+// costs a hash and two string compares per label per sample, for nothing.
+func (*sumSamplesAggrConfig) needsInputKey() bool { return false }
+
+// needsInputKey reports that this output looks only at the sample, so the key
+// need not carry the labels the aggregation groups away -- compressing them
+// costs a hash and two string compares per label per sample, for nothing.
+func (*sumSamplesTotalAggrConfig) needsInputKey() bool { return false }

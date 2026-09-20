@@ -198,3 +198,7 @@ func (ac *rateAggrConfig) getSuffix() string {
 	}
 	return "rate_sum"
 }
+
+// needsInputKey reports that this output keeps state per input series, so the
+// key has to carry the labels the aggregation groups away.
+func (*rateAggrConfig) needsInputKey() bool { return true }

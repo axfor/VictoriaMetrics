@@ -32,3 +32,8 @@ func (*uniqueSamplesAggrConfig) getValue(_ any) aggrValue {
 		samples: make(map[float64]struct{}),
 	}
 }
+
+// needsInputKey reports that this output looks only at the sample, so the key
+// need not carry the labels the aggregation groups away -- compressing them
+// costs a hash and two string compares per label per sample, for nothing.
+func (*uniqueSamplesAggrConfig) needsInputKey() bool { return false }

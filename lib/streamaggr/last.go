@@ -32,3 +32,8 @@ type lastAggrConfig struct{}
 func (*lastAggrConfig) getValue(_ any) aggrValue {
 	return &lastAggrValue{}
 }
+
+// needsInputKey reports that this output looks only at the sample, so the key
+// need not carry the labels the aggregation groups away -- compressing them
+// costs a hash and two string compares per label per sample, for nothing.
+func (*lastAggrConfig) needsInputKey() bool { return false }

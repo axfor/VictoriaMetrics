@@ -180,6 +180,12 @@ type aggrValues struct {
 
 type aggrConfig interface {
 	getValue(any) aggrValue
+	// needsInputKey reports whether this output reads the input part of a
+	// sample's key, i.e. whether it keeps state per input series. It is on the
+	// interface so that a new output has to answer it, next to the pushSample
+	// whose signature is the answer: getting this wrong does not fail, it
+	// silently aggregates the wrong thing.
+	needsInputKey() bool
 }
 
 type aggrValue interface {
