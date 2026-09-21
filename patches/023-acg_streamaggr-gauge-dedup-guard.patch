@@ -1,0 +1,96 @@
+From dbfe792c409c3ea2198460b371365203137816bc Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Mon, 21 Sep 2026 04:55:19 -0700
+Subject: [PATCH 20/20] lib/streamaggr: pin that the gauge rule still sums
+ across pods with dedup on
+
+drop_input_labels removes a label before de-duplication; without removes it at
+grouping time, after. For a rule that sums a gauge across the pods of one
+deployment, that ordering decides the answer, and the config we ship had the
+pod labels under drop_input_labels: the deduplicator saw one series where
+there were three, kept one sample per interval, and sum_samples added up a
+single pod. Measured on the shape in the integration doc: three pods each
+reporting 1 gave 1.
+
+The rule needs both halves -- dedup, so a pod scraped twice inside one
+interval is not counted twice, and the pod labels absent from the output, so
+the three higress pods land on one series -- so the labels move to without,
+which is after dedup rather than before.
+
+Two cases: three pods summing to 3, and one of them scraped twice in an
+interval (5 then 7, with two other pods at 1) summing to 9 rather than 12.
+Putting the labels back under drop_input_labels fails both, at 1 and 7.
+
+The code is unchanged; this is the guard on a config trap that does not fail
+loudly, in the same place as the type-label selector test.
+---
+ lib/streamaggr/input_key_test.go | 56 ++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/lib/streamaggr/input_key_test.go b/lib/streamaggr/input_key_test.go
+index 8d834ba71..2a25fa231 100644
+--- a/lib/streamaggr/input_key_test.go
++++ b/lib/streamaggr/input_key_test.go
+@@ -111,3 +111,59 @@ foo{pod="c"} 1`
+ 		})
+ 	}
+ }
++
++// drop_input_labels removes a label before de-duplication, while without
++// removes it at grouping time, after. For a rule that sums a gauge across the
++// pods of one deployment, the difference decides the answer: listing the pod
++// label under drop_input_labels leaves the pods indistinguishable to the
++// deduplicator, which keeps one sample per series per interval, so the sum is
++// taken over a single pod. It does not fail; the value is simply one pod's.
++//
++// This pins the shape ACG deploys (docs/apikey-usage/integration.md, section
++// four), where the same rule needs both: dedup, so a pod scraped twice inside
++// one interval is not counted twice, and the pod labels gone from the output,
++// so the three higress pods land on one series.
++func TestGaugeRuleSumsAcrossPodsWithDedupOn(t *testing.T) {
++	const threePods = `foo{pod="a",instance="a",_metric_type="gauge"} 1
++foo{pod="b",instance="b",_metric_type="gauge"} 1
++foo{pod="c",instance="c",_metric_type="gauge"} 1`
++	// pod a is scraped twice inside one interval: 5 then 7. Dedup has to keep
++	// the later one rather than let sum_samples add both.
++	const podAgain = `foo{pod="a",instance="a",_metric_type="gauge"} 7`
++	const podFirst = `foo{pod="a",instance="a",_metric_type="gauge"} 5
++foo{pod="b",instance="b",_metric_type="gauge"} 1
++foo{pod="c",instance="c",_metric_type="gauge"} 1`
++
++	const rule = `
++- match: '{_metric_type="gauge"}'
++  interval: 1m
++  drop_input_labels: [_metric_type]
++  without: [pod, instance, node]
++  outputs: [sum_samples]
++  keep_metric_names: true
++  dedup_interval: 60s
++`
++	for _, tc := range []struct {
++		name   string
++		pushes []pushAt
++		want   float64
++	}{
++		{"three pods each reporting 1", []pushAt{{at: 0, metrics: threePods}}, 3},
++		{"one of them scraped twice", []pushAt{
++			{at: 0, metrics: podFirst},
++			{at: 10 * time.Second, metrics: podAgain},
++		}, 9},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got := runStaleScenario(t, rule, tc.pushes, 2*time.Minute, 0)["foo"]
++			if len(got) == 0 {
++				t.Fatalf("no output samples")
++			}
++			if got[0].value != tc.want {
++				t.Errorf("sum is %v, want %v -- moving the pod label into "+
++					"drop_input_labels makes the pods one series to the deduplicator",
++					got[0].value, tc.want)
++			}
++		})
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+
