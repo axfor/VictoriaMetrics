@@ -57,11 +57,26 @@
 补丁 `017` 把它变成可观测的。**上线后第一件事**是确认:
 
 ```
-vm_promscrape_scrapes_by_parse_mode_total{mode="stream_without_body"}   # 这个应当在涨
-vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}              # 这个不该涨
+vm_promscrape_scrapes_by_parse_mode_total{mode="stream_without_body"}   # 应持续涨
+vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}              # 应停在 0
 ```
 
-如果涨的是 `one_shot`,回头看上面三个条件。
+2026-09-20 在真 vmagent 上三档实测,同一个边车、209 MiB 的响应、各跑 18 秒:
+
+| 抓取配置 | one_shot | stream | stream_without_body |
+|---|---|---|---|
+| `no_stale_markers: true` | 0 | 1 | **2** |
+| 不设 `no_stale_markers`(默认) | 0 | 4 | **0** |
+| `no_stale_markers` + `sample_limit` | **4** | 0 | **0** |
+
+两点比预想的更要紧:
+
+- **`sample_limit` 不只是丢掉 `stream_without_body`,是一路掉到 `one_shot`** ——
+  连普通流式解析都关了,209 MiB 的 body 当一整块解析。`canSwitchToStreamParseMode()`
+  同时挡住了两条路。
+- **进程启动后第一次抓取必然走较贵的那条**(表里那个 `stream` 1)。判定用
+  `prevBodyLen` 估未压缩大小,首次为 0 估不出来,第二次起才进最省的路。
+  所以 `stream` 停在 1 是正常的,`one_shot` 不为 0 才要回头查上面三个条件。
 
 ## 编号:为什么从 004 起,且是三位
 
