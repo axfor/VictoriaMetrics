@@ -111,3 +111,59 @@ foo{pod="c"} 1`
 		})
 	}
 }
+
+// drop_input_labels removes a label before de-duplication, while without
+// removes it at grouping time, after. For a rule that sums a gauge across the
+// pods of one deployment, the difference decides the answer: listing the pod
+// label under drop_input_labels leaves the pods indistinguishable to the
+// deduplicator, which keeps one sample per series per interval, so the sum is
+// taken over a single pod. It does not fail; the value is simply one pod's.
+//
+// This pins the shape ACG deploys (docs/apikey-usage/integration.md, section
+// four), where the same rule needs both: dedup, so a pod scraped twice inside
+// one interval is not counted twice, and the pod labels gone from the output,
+// so the three higress pods land on one series.
+func TestGaugeRuleSumsAcrossPodsWithDedupOn(t *testing.T) {
+	const threePods = `foo{pod="a",instance="a",_metric_type="gauge"} 1
+foo{pod="b",instance="b",_metric_type="gauge"} 1
+foo{pod="c",instance="c",_metric_type="gauge"} 1`
+	// pod a is scraped twice inside one interval: 5 then 7. Dedup has to keep
+	// the later one rather than let sum_samples add both.
+	const podAgain = `foo{pod="a",instance="a",_metric_type="gauge"} 7`
+	const podFirst = `foo{pod="a",instance="a",_metric_type="gauge"} 5
+foo{pod="b",instance="b",_metric_type="gauge"} 1
+foo{pod="c",instance="c",_metric_type="gauge"} 1`
+
+	const rule = `
+- match: '{_metric_type="gauge"}'
+  interval: 1m
+  drop_input_labels: [_metric_type]
+  without: [pod, instance, node]
+  outputs: [sum_samples]
+  keep_metric_names: true
+  dedup_interval: 60s
+`
+	for _, tc := range []struct {
+		name   string
+		pushes []pushAt
+		want   float64
+	}{
+		{"three pods each reporting 1", []pushAt{{at: 0, metrics: threePods}}, 3},
+		{"one of them scraped twice", []pushAt{
+			{at: 0, metrics: podFirst},
+			{at: 10 * time.Second, metrics: podAgain},
+		}, 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runStaleScenario(t, rule, tc.pushes, 2*time.Minute, 0)["foo"]
+			if len(got) == 0 {
+				t.Fatalf("no output samples")
+			}
+			if got[0].value != tc.want {
+				t.Errorf("sum is %v, want %v -- moving the pod label into "+
+					"drop_input_labels makes the pods one series to the deduplicator",
+					got[0].value, tc.want)
+			}
+		})
+	}
+}
