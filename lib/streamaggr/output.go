@@ -10,9 +10,15 @@ import (
 )
 
 type aggrOutputs struct {
-	m                  sync.Map
-	useSharedState     bool
-	useInputKey        bool
+	m              sync.Map
+	useSharedState bool
+	useInputKey    bool
+	// buildInputKey is whether compressLabels puts the input part into a
+	// sample's key. It is not the same question as useInputKey, which is also
+	// false when dedup is on -- there the key layout still carries the input
+	// part, and the deduplicator keys its own map on it. Conflating the two
+	// collapses every input series in an output group onto one sample.
+	buildInputKey      bool
 	resetMarkerOnStale bool
 	configs            []aggrConfig
 	outputSamples      *metrics.Counter

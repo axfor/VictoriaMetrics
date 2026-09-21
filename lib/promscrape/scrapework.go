@@ -467,7 +467,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// without sacrificing the performance.
 	processScrapedDataConcurrencyLimitCh <- struct{}{}
 
-	if err == nil && sw.canStreamWithoutBody(cb.SizeBytes()) {
+	if err == nil && sw.canStreamWithoutBody(cb.Len()) {
 		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
 		scrapesStreamedWithoutBody.Inc()
 		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)

@@ -2,6 +2,7 @@ package streamaggr
 
 import (
 	"testing"
+	"time"
 )
 
 // The input part of a sample's key carries the labels the aggregation groups
@@ -75,6 +76,37 @@ func TestInputKeyIsKeptWhenAnyOutputNeedsIt(t *testing.T) {
 			defer as.MustStop()
 			if got := as.as[0].aggrOutputs.useInputKey; got != tc.want {
 				t.Errorf("outputs %s: useInputKey = %v, want %v", tc.outputs, got, tc.want)
+			}
+		})
+	}
+}
+
+// Leaving the input part out of a sample's key is only safe when nothing reads
+// it. With dedup_interval set, useInputKey is already false for a different
+// reason -- the deduplicator keys its own map on the full key -- so reading
+// that one flag to decide the key layout collapses every input series in an
+// output group onto a single sample, and the output reads as if only one pod
+// had reported.
+func TestDedupKeepsTheInputPartOfTheKey(t *testing.T) {
+	const threePods = `foo{pod="a"} 1
+foo{pod="b"} 1
+foo{pod="c"} 1`
+
+	for _, tc := range []struct {
+		name  string
+		dedup string
+	}{
+		{"dedup off", ""},
+		{"dedup on", "  dedup_interval: 30s\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := "- match: foo\n  interval: 1m\n" + tc.dedup + "  without: [pod]\n  outputs: [sum_samples]\n  keep_metric_names: true\n"
+			got := runStaleScenario(t, cfg, []pushAt{{at: 0, metrics: threePods}}, 2*time.Minute, 0)["foo"]
+			if len(got) == 0 {
+				t.Fatalf("no output samples")
+			}
+			if got[0].value != 3 {
+				t.Errorf("three pods each reporting 1 summed to %v, want 3 -- the input part of the key was dropped, so they shared one entry", got[0].value)
 			}
 		})
 	}

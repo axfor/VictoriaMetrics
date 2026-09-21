@@ -613,6 +613,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		configs:            make([]aggrConfig, len(cfg.Outputs)),
 		useSharedState:     useSharedState,
 		useInputKey:        useInputKey,
+		buildInputKey:      true,
 		resetMarkerOnStale: cfg.ResetMarkerOnStale != nil && *cfg.ResetMarkerOnStale,
 	}
 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
@@ -638,6 +639,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 			}
 		}
 		aggrOutputs.useInputKey = useInputKey
+		// Only here may the input part be left out of the key: dedup off, and
+		// no configured output reads it.
+		aggrOutputs.buildInputKey = useInputKey
 	}
 
 	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
@@ -1014,7 +1018,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	deleteDeadlineMsec := deleteDeadline.UnixMilli()
 
 	minDeadline := a.minDeadline.Load()
-	useInputKey := a.aggrOutputs.useInputKey
+	useInputKey := a.aggrOutputs.buildInputKey
 	dropLabels := a.dropInputLabels
 	ignoreOldSamples := a.ignoreOldSamples
 	enableWindows := a.enableWindows
