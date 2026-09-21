@@ -1,0 +1,2641 @@
+diff --git a/docs/victoriametrics/stream-aggregation/README.md b/docs/victoriametrics/stream-aggregation/README.md
+index 9fc70b8fb..39f123cd5 100644
+--- a/docs/victoriametrics/stream-aggregation/README.md
++++ b/docs/victoriametrics/stream-aggregation/README.md
+@@ -811,6 +811,10 @@ Moved to [stream-aggregation/configuration/#stdvar](https://docs.victoriametrics
+ 
+ Moved to [stream-aggregation/configuration/#sum_samples](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#sum_samples).
+ 
++###### sum_samples_total
++
++Moved to [stream-aggregation/configuration/#sum_samples_total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#sum_samples_total).
++
+ ###### total
+ 
+ Moved to [stream-aggregation/configuration/#total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#total).
+diff --git a/docs/victoriametrics/stream-aggregation/configuration.md b/docs/victoriametrics/stream-aggregation/configuration.md
+index 18e3f47c4..28204b861 100644
+--- a/docs/victoriametrics/stream-aggregation/configuration.md
++++ b/docs/victoriametrics/stream-aggregation/configuration.md
+@@ -110,6 +110,15 @@ specified individually per each `-remoteWrite.url`:
+   #
+   # flush_on_shutdown: false
+ 
++  # reset_marker_on_stale instructs to emit a single sample with zero value before a cumulative output
++  # (total, total_prometheus or sum_samples_total) starts a new stretch: when the previous state expired
++  # after staleness_interval, and when the output is created, which happens after a restart or a crash.
++  # Without it, a new stretch starting from a value that is not below the previous one is not recognized
++  # as a counter reset by increase() and the missing amount is silently lost.
++  # It requires one of the cumulative outputs above.
++  #
++  # reset_marker_on_stale: false
++
+   # without is an optional list of labels, which must be removed from the output aggregation.
+   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
+   #
+@@ -496,6 +505,30 @@ See also:
+ - [count_samples](#count_samples)
+ - [count_series](#count_series)
+ 
++### sum_samples_total
++
++`sum_samples_total` sums input [sample values](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#raw-samples)
++like [sum_samples](#sum_samples), but it does not reset the sum on flush, so the output is a cumulative counter.
++
++It is meant for inputs that already are increments, for instance a scrape target that reports only what accrued since
++the last delivered scrape. Compared with [total](#total) on the same data:
++
++- it keeps no state per input series, so memory does not depend on how many inputs are merged into one output;
++- a restart needs no baseline sample, so the first sample after a restart is not dropped.
++
++Use it together with `reset_marker_on_stale` so that a counter reset is visible to the query side.
++
++The results of `sum_samples_total` is equal to the following [MetricsQL](https://docs.victoriametrics.com/victoriametrics/metricsql/) query:
++
++```metricsql
++running_sum(sum(sum_over_time(some_metric[interval])))
++```
++
++See also:
++
++- [sum_samples](#sum_samples)
++- [total](#total)
++
+ ### total
+ 
+ `total` generates output [counter](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#counter) by summing the input counters over the given `interval`.
+diff --git a/lib/promscrape/client.go b/lib/promscrape/client.go
+index 8b34adf1d..fdd47767e 100644
+--- a/lib/promscrape/client.go
++++ b/lib/promscrape/client.go
+@@ -23,6 +23,9 @@ var (
+ 	disableCompression     = flag.Bool("promscrape.disableCompression", false, "Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. "+
+ 		"This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. "+
+ 		"It is possible to set 'disable_compression: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control")
++	zstdCompression = flag.Bool("promscrape.zstdCompression", false, "Whether to send 'Accept-Encoding: zstd, gzip' instead of 'Accept-Encoding: gzip' to all the scrape targets. "+
++		"zstd usually needs less CPU on scrape targets than gzip for the same or better compression ratio. "+
++		"Targets without zstd support may keep responding with gzip. This flag has no effect for targets with disabled compression")
+ 	disableKeepAlive = flag.Bool("promscrape.disableKeepAlive", false, "Whether to disable HTTP keep-alive connections when scraping all the targets. "+
+ 		"This may be useful when targets has no support for HTTP keep-alive connection. "+
+ 		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control. "+
+@@ -115,14 +118,14 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
+ 	return c, nil
+ }
+ 
+-func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
++func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ 	deadline := time.Now().Add(c.c.Timeout)
+ 	ctx, cancel := context.WithDeadline(c.ctx, deadline)
+ 	defer cancel()
+ 
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
+ 	if err != nil {
+-		return false, fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
+ 	}
+ 	// The following `Accept` header has been copied from Prometheus sources.
+ 	// See https://github.com/prometheus/prometheus/blob/f9d21f10ecd2a343a381044f131ea4e46381ce09/scrape/scrape.go#L532 .
+@@ -135,13 +138,17 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
+ 	req.Header.Set("User-Agent", "vm_promscrape")
+ 	if err := c.setHeaders(req); err != nil {
+-		return false, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+ 	}
+ 	if err := c.setProxyHeaders(req); err != nil {
+-		return false, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+ 	}
+ 	if !c.disableCompression {
+-		req.Header.Set("Accept-Encoding", "gzip")
++		if *zstdCompression {
++			req.Header.Set("Accept-Encoding", "zstd, gzip")
++		} else {
++			req.Header.Set("Accept-Encoding", "gzip")
++		}
+ 	}
+ 
+ 	scrapeRequests.Inc()
+@@ -150,7 +157,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+ 			scrapesTimedout.Inc()
+ 		}
+-		return false, fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
+ 	}
+ 	defer resp.Body.Close()
+ 
+@@ -160,7 +167,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 		if err != nil {
+ 			respBody = []byte(err.Error())
+ 		}
+-		return false, fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
++		return "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
+ 			c.scrapeURL, resp.StatusCode, http.StatusOK, respBody)
+ 	}
+ 	scrapesOK.Inc()
+@@ -172,17 +179,23 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+ 			scrapesTimedout.Inc()
+ 		}
+-		return false, fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
+ 	}
+ 	if int64(dst.Len()) >= c.maxScrapeSize {
+ 		maxScrapeSizeExceeded.Inc()
+-		return false, fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
++		return "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
+ 			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
+ 			"increase max_scrape_size value in scrape config for the given target", c.scrapeURL, c.maxScrapeSize)
+ 	}
+ 
+-	isGzipped := resp.Header.Get("Content-Encoding") == "gzip"
+-	return isGzipped, nil
++	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
++	// Any other Content-Encoding is treated as uncompressed data, like before.
++	switch ce := resp.Header.Get("Content-Encoding"); ce {
++	case "gzip", "zstd":
++		return ce, nil
++	default:
++		return "", nil
++	}
+ }
+ 
+ var (
+diff --git a/lib/promscrape/client_test.go b/lib/promscrape/client_test.go
+index b4275c0e7..5ee4884be 100644
+--- a/lib/promscrape/client_test.go
++++ b/lib/promscrape/client_test.go
+@@ -160,12 +160,12 @@ func TestClientProxyReadOk(t *testing.T) {
+ 		}
+ 
+ 		var cb chunkedbuffer.Buffer
+-		isGzipped, err := c.ReadData(&cb)
++		contentEncoding, err := c.ReadData(&cb)
+ 		if err != nil {
+ 			t.Fatalf("unexpected error at ReadData: %s", err)
+ 		}
+-		if isGzipped {
+-			t.Fatalf("the response mustn't be gzipped")
++		if contentEncoding != "" {
++			t.Fatalf("the response mustn't be compressed; got Content-Encoding %q", contentEncoding)
+ 		}
+ 		got, err := io.ReadAll(cb.NewReader())
+ 		if err != nil {
+diff --git a/lib/promscrape/client_zstd_test.go b/lib/promscrape/client_zstd_test.go
+new file mode 100644
+index 000000000..6266f9c37
+--- /dev/null
++++ b/lib/promscrape/client_zstd_test.go
+@@ -0,0 +1,108 @@
++package promscrape
++
++import (
++	"compress/gzip"
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/klauspost/compress/zstd"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
++)
++
++// testScrapeBody returns a few MiB of exposition-format text, so zstd and gzip produce multi-block streams.
++func testScrapeBody() string {
++	var sb strings.Builder
++	for i := 0; i < 60000; i++ {
++		fmt.Fprintf(&sb, `acg_requests_total{apikey_id="key-%08d-aaaa-bbbb-cccc",route_model_id="route-%d",business_group_id="bg-%d"} %d`+"\n", i, i%5, i%50, i*7)
++	}
++	return sb.String()
++}
++
++func TestClientReadDataContentEncoding(t *testing.T) {
++	body := testScrapeBody()
++
++	f := func(zstdEnabled bool, respEncoding, wantAcceptEncoding, wantContentEncoding string) {
++		t.Helper()
++
++		origZstd := *zstdCompression
++		*zstdCompression = zstdEnabled
++		defer func() {
++			*zstdCompression = origZstd
++		}()
++
++		var gotAcceptEncoding string
++		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			gotAcceptEncoding = r.Header.Get("Accept-Encoding")
++			if respEncoding != "" {
++				w.Header().Set("Content-Encoding", respEncoding)
++			}
++			switch respEncoding {
++			case "zstd":
++				// The same streaming encoder the scrape targets use.
++				zw, err := zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedFastest))
++				if err != nil {
++					panic(err)
++				}
++				_, _ = zw.Write([]byte(body))
++				_ = zw.Close()
++			case "gzip":
++				zw := gzip.NewWriter(w)
++				_, _ = zw.Write([]byte(body))
++				_ = zw.Close()
++			default:
++				_, _ = w.Write([]byte(body))
++			}
++		}))
++		defer backend.Close()
++
++		c, err := newClient(context.Background(), &ScrapeWork{
++			ScrapeURL:     backend.URL,
++			ScrapeTimeout: 5 * time.Second,
++			AuthConfig:    newTestAuthConfig(t, false, nil),
++			MaxScrapeSize: 64 << 20,
++		})
++		if err != nil {
++			t.Fatalf("cannot create client: %s", err)
++		}
++
++		var cb chunkedbuffer.Buffer
++		contentEncoding, err := c.ReadData(&cb)
++		if err != nil {
++			t.Fatalf("unexpected error at ReadData: %s", err)
++		}
++		if gotAcceptEncoding != wantAcceptEncoding {
++			t.Fatalf("unexpected Accept-Encoding; got %q; want %q", gotAcceptEncoding, wantAcceptEncoding)
++		}
++		if contentEncoding != wantContentEncoding {
++			t.Fatalf("unexpected content encoding; got %q; want %q", contentEncoding, wantContentEncoding)
++		}
++
++		var bb bytesutil.ByteBuffer
++		if err := readFromBuffer(&bb, &cb, contentEncoding); err != nil {
++			t.Fatalf("cannot read response body: %s", err)
++		}
++		if string(bb.B) != body {
++			t.Fatalf("unexpected response body; got %d bytes; want %d bytes", len(bb.B), len(body))
++		}
++	}
++
++	// zstd is disabled by default: the request and the response handling stay as in upstream.
++	f(false, "gzip", "gzip", "gzip")
++	f(false, "", "gzip", "")
++
++	// zstd is enabled and the target supports it.
++	f(true, "zstd", "zstd, gzip", "zstd")
++
++	// zstd is enabled, but the target supports only gzip.
++	f(true, "gzip", "zstd, gzip", "gzip")
++
++	// zstd is enabled, but the target doesn't compress responses.
++	f(true, "", "zstd, gzip", "")
++}
+diff --git a/lib/promscrape/parse_mode_test.go b/lib/promscrape/parse_mode_test.go
+new file mode 100644
+index 000000000..58b66db18
+--- /dev/null
++++ b/lib/promscrape/parse_mode_test.go
+@@ -0,0 +1,38 @@
++package promscrape
++
++import (
++	"testing"
++)
++
++// Whether the uncompressed response is ever held in memory is decided per
++// scrape, from the config and the response size. Three options turn it off and
++// none of them says so: no_stale_markers has to be set, and neither
++// sample_limit nor series_limit may be. Getting it wrong does not fail a
++// scrape, it just costs memory proportional to the response -- on a 30k-key
++// sidecar that was 26.94GiB against 4.03GiB -- so the choice is pinned here and
++// exported as vm_promscrape_scrapes_by_parse_mode_total.
++func TestCanStreamWithoutBodyGates(t *testing.T) {
++	const big = 8 << 20 // well past minResponseSizeForStreamParse
++
++	for _, tc := range []struct {
++		name string
++		cfg  ScrapeWork
++		want bool
++	}{
++		{"the recommended config", ScrapeWork{NoStaleMarkers: true}, true},
++		{"no_stale_markers left at its default", ScrapeWork{}, false},
++		{"sample_limit set", ScrapeWork{NoStaleMarkers: true, SampleLimit: 1e6}, false},
++		{"series_limit set", ScrapeWork{NoStaleMarkers: true, SeriesLimit: 1e6}, false},
++		{"stream_parse forced on, sample_limit still off", ScrapeWork{NoStaleMarkers: true, StreamParse: true}, true},
++		{"stream_parse forced on but series_limit set", ScrapeWork{NoStaleMarkers: true, StreamParse: true, SeriesLimit: 1}, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			sw := &scrapeWork{Config: &tc.cfg}
++			sw.prevBodyLen = big
++			if got := sw.canStreamWithoutBody(big); got != tc.want {
++				t.Errorf("canStreamWithoutBody = %v, want %v -- the uncompressed response %s be held in memory",
++					got, tc.want, map[bool]string{true: "would not", false: "would"}[got])
++			}
++		})
++	}
++}
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index 083b59f70..630ad042f 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"flag"
+ 	"fmt"
++	"io"
+ 	"math"
+ 	"math/bits"
+ 	"strings"
+@@ -196,7 +197,9 @@ type scrapeWork struct {
+ 	Config *ScrapeWork
+ 
+ 	// ReadData is called for reading the scrape response data into dst.
+-	ReadData func(dst *chunkedbuffer.Buffer) (bool, error)
++	//
++	// It returns the Content-Encoding of the read data: "gzip", "zstd" or "" for uncompressed data.
++	ReadData func(dst *chunkedbuffer.Buffer) (string, error)
+ 
+ 	// PushData is called for pushing collected data.
+ 	//
+@@ -406,7 +409,17 @@ var (
+ 	scrapesSkippedBySampleLimit = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_sample_limit_total")
+ 	scrapesSkippedByLabelLimit  = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_label_limit_total")
+ 	scrapesFailed               = metrics.NewCounter("vm_promscrape_scrapes_failed_total")
+-	pushDataDuration            = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
++
++	// Which path a scrape took through the parser. Whether the uncompressed
++	// response is ever held in memory is decided per scrape from the config and
++	// the response size, and getting it wrong costs memory proportional to the
++	// response rather than failing, so it has to be visible. no_stale_markers
++	// has to be set and neither sample_limit nor series_limit may be, and none
++	// of those says so.
++	scrapesStreamedWithoutBody = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="stream_without_body"}`)
++	scrapesStreamed            = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="stream"}`)
++	scrapesOneShot             = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`)
++	pushDataDuration           = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
+ )
+ 
+ func (sw *scrapeWork) needStreamParseMode(responseSize int) bool {
+@@ -424,13 +437,13 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+ 	cb := chunkedbuffer.Get()
+ 	defer chunkedbuffer.Put(cb)
+ 
+-	isGzipped, err := sw.ReadData(cb)
++	contentEncoding, err := sw.ReadData(cb)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	var bb bytesutil.ByteBuffer
+-	err = readFromBuffer(&bb, cb, isGzipped)
++	err = readFromBuffer(&bb, cb, contentEncoding)
+ 	return bb.B, err
+ }
+ 
+@@ -441,7 +454,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 	// This also allows measuring the real scrape duration, which doesn't include
+ 	// the time needed for processing of the read response.
+ 	cb := chunkedbuffer.Get()
+-	isGzipped, err := sw.ReadData(cb)
++	contentEncoding, err := sw.ReadData(cb)
+ 
+ 	// Measure scrape duration.
+ 	endTimestamp := time.Now().UnixMilli()
+@@ -454,11 +467,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 	// without sacrificing the performance.
+ 	processScrapedDataConcurrencyLimitCh <- struct{}{}
+ 
++	if err == nil && sw.canStreamWithoutBody(cb.SizeBytes()) {
++		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
++		scrapesStreamedWithoutBody.Inc()
++		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)
++		chunkedbuffer.Put(cb)
++		<-processScrapedDataConcurrencyLimitCh
++		return err
++	}
++
+ 	// Copy the read scrape response to body in order to parse it and send
+ 	// the parsed results to remote storage.
+ 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
+ 	if err == nil {
+-		err = readFromBuffer(body, cb, isGzipped)
++		err = readFromBuffer(body, cb, contentEncoding)
+ 	}
+ 	chunkedbuffer.Put(cb)
+ 
+@@ -470,11 +492,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 		// Process response body from scrape target in streaming manner.
+ 		// This case is optimized for targets exposing more than ten thousand of metrics per target,
+ 		// such as kube-state-metrics.
++		scrapesStreamed.Inc()
+ 		err = sw.processDataInStreamMode(scrapeTimestamp, realTimestamp, body, scrapeDurationSeconds)
+ 	} else {
+ 		// Process response body from scrape target at once.
+ 		// This case should work more optimally than stream parse for common case when scrape target exposes
+ 		// up to a few thousand metrics.
++		scrapesOneShot.Inc()
+ 		err = sw.processDataOneShot(scrapeTimestamp, realTimestamp, body.B, scrapeDurationSeconds, err)
+ 	}
+ 
+@@ -487,20 +511,80 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 
+ var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
+ 
+-func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, isGzipped bool) error {
+-	if !isGzipped {
++// canStreamWithoutBody returns true if the read response can be decompressed and parsed in stream parsing mode
++// without copying the whole uncompressed response into memory first.
++//
++// The whole uncompressed response is needed only for stale markers and series_limit,
++// which compare it with the previous response.
++func (sw *scrapeWork) canStreamWithoutBody(readSize int) bool {
++	cfg := sw.Config
++	if !cfg.NoStaleMarkers || cfg.SeriesLimit > 0 {
++		return false
++	}
++	if *streamParse || cfg.StreamParse {
++		return true
++	}
++	if minResponseSizeForStreamParse.N <= 0 || !cfg.canSwitchToStreamParseMode() {
++		return false
++	}
++	// The uncompressed size isn't known before decompression. Use the uncompressed size of the previous response
++	// and the size of the read response, which is usually smaller than the uncompressed size.
++	n := minResponseSizeForStreamParse.IntN()
++	return sw.prevBodyLen >= n || readSize >= n
++}
++
++// processReadDataInStreamMode decompresses and parses the read response in stream parsing mode.
++//
++// Unlike processDataInStreamMode, a decompression error in the middle of the response marks the scrape as failed
++// after some samples may have been already pushed. This is the same as for parsing errors in stream parsing mode.
++func (sw *scrapeWork) processReadDataInStreamMode(scrapeTimestamp, realTimestamp int64, cb *chunkedbuffer.Buffer, contentEncoding string, scrapeDurationSeconds float64) error {
++	reader, err := protoparserutil.GetUncompressedReader(cb.NewReader(), contentEncoding)
++	if err != nil {
++		return sw.processDataOneShot(scrapeTimestamp, realTimestamp, nil, scrapeDurationSeconds, fmt.Errorf("cannot decompress response body: %w", err))
++	}
++	rr := &responseReader{r: reader, contentEncoding: contentEncoding}
++	err = sw.processStream(scrapeTimestamp, realTimestamp, rr, "", func() int { return int(rr.n) }, scrapeDurationSeconds)
++	protoparserutil.PutUncompressedReader(reader)
++
++	sw.prevBodyLen = int(rr.n)
++	scrapeResponseSize.Update(float64(rr.n))
++	return err
++}
++
++// responseReader counts the uncompressed bytes of the read response.
++//
++// It also turns io.ErrUnexpectedEOF into an ordinary error: stream parsing treats it as the end of data,
++// which suits network streams, while here the whole response has been already read, so it means broken compressed data.
++// Such a response is rejected in the same way as when it is decompressed at once.
++type responseReader struct {
++	r               io.Reader
++	n               int64
++	contentEncoding string
++}
++
++func (rr *responseReader) Read(p []byte) (int, error) {
++	n, err := rr.r.Read(p)
++	rr.n += int64(n)
++	if errors.Is(err, io.ErrUnexpectedEOF) {
++		err = fmt.Errorf("cannot read %s-compressed response body: unexpected end of compressed data", rr.contentEncoding)
++	}
++	return n, err
++}
++
++func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, contentEncoding string) error {
++	if contentEncoding == "" {
+ 		src.MustWriteTo(dst)
+ 		return nil
+ 	}
+ 
+-	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), "gzip")
++	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), contentEncoding)
+ 	if err != nil {
+ 		return fmt.Errorf("cannot decompress response body: %w", err)
+ 	}
+ 	_, err = dst.ReadFrom(reader)
+ 	protoparserutil.PutUncompressedReader(reader)
+ 	if err != nil {
+-		return fmt.Errorf("cannot read gzipped response body: %w", err)
++		return fmt.Errorf("cannot read %s-compressed response body: %w", contentEncoding, err)
+ 	}
+ 	return nil
+ }
+@@ -601,6 +685,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
+ }
+ 
+ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64) error {
++	bodyString := bytesutil.ToUnsafeString(body.B)
++	return sw.processStream(scrapeTimestamp, realTimestamp, body.NewReader(), bodyString, func() int { return len(bodyString) }, scrapeDurationSeconds)
++}
++
++// processStream parses the uncompressed response from r in stream parsing mode.
++//
++// bodyString is the whole response if it is available; it is used for stale markers and series_limit tracking.
++// responseSize returns the uncompressed response size after r is read.
++func (sw *scrapeWork) processStream(scrapeTimestamp, realTimestamp int64, r io.Reader, bodyString string, responseSize func() int, scrapeDurationSeconds float64) error {
+ 	var samplesScraped atomic.Int64
+ 	var samplesPostRelabeling atomic.Int64
+ 	var samplesDroppedTotal atomic.Int64
+@@ -612,11 +705,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+ 	bbLastScrape.B = sw.loadLastScrape(bbLastScrape.B)
+ 	lastScrapeStr := bytesutil.ToUnsafeString(bbLastScrape.B)
+ 
+-	bodyString := bytesutil.ToUnsafeString(body.B)
+ 	cfg := sw.Config
+ 	areIdenticalSeries := areIdenticalSeries(cfg, lastScrapeStr, bodyString)
+ 
+-	r := body.NewReader()
+ 	err := stream.Parse(r, scrapeTimestamp, "", false, prommetadata.IsEnabled(), func(rows []parser.Row, mms []parser.Metadata) error {
+ 		labelsLen := maxLabelsLen.Load()
+ 		wc := writeRequestCtxPool.Get(int(labelsLen))
+@@ -677,12 +768,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+ 		// This is a trade-off between performance and accuracy.
+ 		seriesAdded = getSeriesAdded(lastScrapeStr, bodyString)
+ 	}
+-	responseSize := len(bodyString)
++	size := 0
++	if up == 1 {
++		size = responseSize()
++	}
+ 
+ 	am := &autoMetrics{
+ 		up:                        up,
+ 		scrapeDurationSeconds:     scrapeDurationSeconds,
+-		scrapeResponseSize:        responseSize,
++		scrapeResponseSize:        size,
+ 		samplesScraped:            int(samplesScraped.Load()),
+ 		samplesPostRelabeling:     int(samplesPostRelabeling.Load()),
+ 		seriesAdded:               seriesAdded,
+@@ -699,7 +793,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+ 	}
+ 	leveledbytebufferpool.Put(bbLastScrape)
+ 
+-	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), responseSize, int(samplesScraped.Load()), err)
++	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), size, int(samplesScraped.Load()), err)
+ 	// Do not track active series in streaming mode, since this may need too big amounts of memory
+ 	// when the target exports too big number of metrics.
+ 	return err
+diff --git a/lib/promscrape/scrapework_stream_test.go b/lib/promscrape/scrapework_stream_test.go
+new file mode 100644
+index 000000000..6de54fa46
+--- /dev/null
++++ b/lib/promscrape/scrapework_stream_test.go
+@@ -0,0 +1,240 @@
++package promscrape
++
++import (
++	"bytes"
++	"compress/gzip"
++	"fmt"
++	"os"
++	"runtime"
++	"runtime/metrics"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/cespare/xxhash/v2"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
++)
++
++// pushSummary summarizes pushed samples as an order-independent hash, since stream parsing pushes blocks concurrently.
++type pushSummary struct {
++	mu      sync.Mutex
++	samples int
++	hashSum uint64
++	auto    map[string]float64
++}
++
++func (ps *pushSummary) push(_ *auth.Token, wr *prompb.WriteRequest) {
++	var buf []byte
++	ps.mu.Lock()
++	defer ps.mu.Unlock()
++	for _, ts := range wr.Timeseries {
++		name := ""
++		buf = buf[:0]
++		for _, l := range ts.Labels {
++			if l.Name == "__name__" {
++				name = l.Value
++			}
++			buf = append(buf, l.Name...)
++			buf = append(buf, '=')
++			buf = append(buf, l.Value...)
++			buf = append(buf, ',')
++		}
++		if name == "up" || strings.HasPrefix(name, "scrape_") {
++			ps.auto[name] = ts.Samples[0].Value
++			continue
++		}
++		for _, s := range ts.Samples {
++			b := strconv.AppendFloat(buf, s.Value, 'g', -1, 64)
++			b = strconv.AppendInt(append(b, '@'), s.Timestamp, 10)
++			ps.hashSum += xxhash.Sum64(b)
++			ps.samples++
++		}
++	}
++}
++
++func scrapeSummary(t testing.TB, compressed []byte, contentEncoding string, cfg *ScrapeWork) (*pushSummary, error) {
++	t.Helper()
++	ps := &pushSummary{auto: map[string]float64{}}
++	var sw scrapeWork
++	sw.Config = cfg
++	sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
++		dst.MustWrite(compressed)
++		return contentEncoding, nil
++	}
++	sw.PushData = ps.push
++	tsmGlobal.Register(&sw)
++	defer tsmGlobal.Unregister(&sw)
++	err := sw.scrapeInternal(123000, 123000)
++	return ps, err
++}
++
++func compressBody(t testing.TB, body []byte, contentEncoding string) []byte {
++	t.Helper()
++	switch contentEncoding {
++	case "zstd":
++		return encoding.CompressZSTDLevel(nil, body, 1)
++	case "gzip":
++		var bb bytes.Buffer
++		zw := gzip.NewWriter(&bb)
++		if _, err := zw.Write(body); err != nil {
++			t.Fatalf("cannot gzip: %s", err)
++		}
++		if err := zw.Close(); err != nil {
++			t.Fatalf("cannot gzip: %s", err)
++		}
++		return bb.Bytes()
++	default:
++		return body
++	}
++}
++
++// The path which decompresses and parses the read response block by block must push the same samples
++// as the path which copies the whole uncompressed response into memory first.
++func TestScrapeWorkStreamWithoutBody(t *testing.T) {
++	protoparserutil.StartUnmarshalWorkers()
++	defer protoparserutil.StopUnmarshalWorkers()
++
++	var sb strings.Builder
++	sb.WriteString("# HELP acg_requests_total requests\n# TYPE acg_requests_total counter\n")
++	for i := range 100_000 {
++		fmt.Fprintf(&sb, "acg_requests_total{apikey_id=\"k%d\",route=\"r%d\"} %d\n", i, i%7, i)
++	}
++	body := []byte(sb.String())
++
++	for _, enc := range []string{"", "gzip", "zstd"} {
++		compressed := compressBody(t, body, enc)
++		// The whole response is kept in memory: stale markers are enabled.
++		want, err := scrapeSummary(t, compressed, enc, &ScrapeWork{StreamParse: true, ScrapeTimeout: time.Minute})
++		if err != nil {
++			t.Fatalf("encoding %q: unexpected error: %s", enc, err)
++		}
++		for _, cfg := range []*ScrapeWork{
++			{NoStaleMarkers: true, ScrapeTimeout: time.Minute},                    // switched by response size
++			{NoStaleMarkers: true, StreamParse: true, ScrapeTimeout: time.Minute}, // forced
++		} {
++			got, err := scrapeSummary(t, compressed, enc, cfg)
++			if err != nil {
++				t.Fatalf("encoding %q: unexpected error: %s", enc, err)
++			}
++			if got.samples != 100_000 || got.samples != want.samples || got.hashSum != want.hashSum {
++				t.Fatalf("encoding %q, StreamParse=%v: pushed samples differ; got %d samples, hash %x; want %d samples, hash %x",
++					enc, cfg.StreamParse, got.samples, got.hashSum, want.samples, want.hashSum)
++			}
++			for _, name := range []string{"up", "scrape_samples_scraped", "scrape_response_size_bytes"} {
++				if got.auto[name] != want.auto[name] {
++					t.Fatalf("encoding %q, StreamParse=%v: %s = %v; want %v", enc, cfg.StreamParse, name, got.auto[name], want.auto[name])
++				}
++			}
++			if got.auto["scrape_response_size_bytes"] != float64(len(body)) {
++				t.Fatalf("encoding %q: scrape_response_size_bytes must be the uncompressed size %d; got %v", enc, len(body), got.auto["scrape_response_size_bytes"])
++			}
++		}
++	}
++}
++
++// A decompression error in the middle of the response marks the scrape as failed.
++// gzip is used, since the zstd reader returns io.EOF for a truncated frame on both paths (upstream behavior).
++func TestScrapeWorkStreamWithoutBodyBrokenData(t *testing.T) {
++	protoparserutil.StartUnmarshalWorkers()
++	defer protoparserutil.StopUnmarshalWorkers()
++
++	body := []byte(strings.Repeat("foo{bar=\"baz\"} 1\n", 100_000))
++	compressed := compressBody(t, body, "gzip")
++	compressed = compressed[:len(compressed)/2]
++	got, err := scrapeSummary(t, compressed, "gzip", &ScrapeWork{NoStaleMarkers: true, StreamParse: true, ScrapeTimeout: time.Minute})
++	if err == nil {
++		t.Fatalf("expecting an error for a truncated gzip response")
++	}
++	if got.auto["up"] != 0 || got.auto["scrape_response_size_bytes"] != 0 {
++		t.Fatalf("a failed scrape must report up=0 and zero response size; got %v", got.auto)
++	}
++}
++
++func TestScrapeWorkCanStreamWithoutBody(t *testing.T) {
++	f := func(cfg *ScrapeWork, prevBodyLen, readSize int, want bool) {
++		t.Helper()
++		sw := &scrapeWork{Config: cfg, prevBodyLen: prevBodyLen}
++		if got := sw.canStreamWithoutBody(readSize); got != want {
++			t.Fatalf("cfg %+v, prevBodyLen=%d, readSize=%d: got %v; want %v", cfg, prevBodyLen, readSize, got, want)
++		}
++	}
++	const big = 2e6
++	// stale markers and series_limit need the whole response
++	f(&ScrapeWork{StreamParse: true}, big, big, false)
++	f(&ScrapeWork{NoStaleMarkers: true, SeriesLimit: 10, StreamParse: true}, big, big, false)
++	// forced stream parsing
++	f(&ScrapeWork{NoStaleMarkers: true, StreamParse: true}, 0, 10, true)
++	// automatic switching by size
++	f(&ScrapeWork{NoStaleMarkers: true}, 0, 10, false)
++	f(&ScrapeWork{NoStaleMarkers: true}, big, 10, true)
++	f(&ScrapeWork{NoStaleMarkers: true}, 0, big, true)
++	f(&ScrapeWork{NoStaleMarkers: true, SampleLimit: 10}, big, big, false)
++}
++
++// TestScrapeWorkStreamWithoutBodyRealResponse compares both paths on a real compressed response and reports peak heap.
++// Set ACG_SCRAPE_BODY to a zstd-compressed /metrics response to run it.
++func TestScrapeWorkStreamWithoutBodyRealResponse(t *testing.T) {
++	path := os.Getenv("ACG_SCRAPE_BODY")
++	if path == "" {
++		t.Skip("ACG_SCRAPE_BODY isn't set")
++	}
++	compressed, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("cannot read %s: %s", path, err)
++	}
++	protoparserutil.StartUnmarshalWorkers()
++	defer protoparserutil.StopUnmarshalWorkers()
++
++	run := func(name string, cfg *ScrapeWork) *pushSummary {
++		runtime.GC()
++		runtime.GC()
++		base := heapBytes()
++		var peak atomic.Uint64
++		stop := make(chan struct{})
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			for {
++				if h := heapBytes(); h > peak.Load() {
++					peak.Store(h)
++				}
++				select {
++				case <-stop:
++					return
++				case <-time.After(2 * time.Millisecond):
++				}
++			}
++		}()
++		start := time.Now()
++		ps, err := scrapeSummary(t, compressed, "zstd", cfg)
++		d := time.Since(start)
++		close(stop)
++		<-done
++		if err != nil {
++			t.Fatalf("%s: unexpected error: %s", name, err)
++		}
++		t.Logf("%s: %d samples, response %.1f MiB, took %s, peak heap above baseline %.0f MiB",
++			name, ps.samples, ps.auto["scrape_response_size_bytes"]/(1<<20), d.Round(time.Millisecond), float64(peak.Load()-min(peak.Load(), base))/(1<<20))
++		return ps
++	}
++	// Run the new path first, so pools warmed up by the old path don't hide its allocations.
++	got := run("stream without body", &ScrapeWork{NoStaleMarkers: true, ScrapeTimeout: time.Minute})
++	want := run("copy whole body", &ScrapeWork{NoStaleMarkers: false, StreamParse: true, ScrapeTimeout: time.Minute})
++	if got.samples != want.samples || got.hashSum != want.hashSum || got.auto["scrape_response_size_bytes"] != want.auto["scrape_response_size_bytes"] {
++		t.Fatalf("pushed samples differ; got %d samples, hash %x; want %d samples, hash %x", got.samples, got.hashSum, want.samples, want.hashSum)
++	}
++}
++
++func heapBytes() uint64 {
++	s := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
++	metrics.Read(s)
++	return s[0].Value.Uint64()
++}
+diff --git a/lib/promscrape/scrapework_test.go b/lib/promscrape/scrapework_test.go
+index dedb92385..bfdcd525f 100644
+--- a/lib/promscrape/scrapework_test.go
++++ b/lib/promscrape/scrapework_test.go
+@@ -95,9 +95,9 @@ func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
+ 	}
+ 
+ 	readDataCalls := 0
+-	sw.ReadData = func(_ *chunkedbuffer.Buffer) (bool, error) {
++	sw.ReadData = func(_ *chunkedbuffer.Buffer) (string, error) {
+ 		readDataCalls++
+-		return false, fmt.Errorf("error when reading data")
++		return "", fmt.Errorf("error when reading data")
+ 	}
+ 
+ 	pushDataCalls := 0
+@@ -158,10 +158,10 @@ func testScrapeWorkScrapeInternalSuccess(t *testing.T, streamParse bool) {
+ 		sw.Config = cfg
+ 
+ 		readDataCalls := 0
+-		sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
++		sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
+ 			readDataCalls++
+ 			dst.MustWrite([]byte(data))
+-			return false, nil
++			return "", nil
+ 		}
+ 
+ 		var pushDataMu sync.Mutex
+@@ -610,10 +610,10 @@ func TestScrapeWorkScrapeInternalStreamConcurrency(t *testing.T) {
+ 		sw.Config = cfg
+ 
+ 		readDataCalls := 0
+-		sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
++		sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
+ 			readDataCalls++
+ 			dst.MustWrite([]byte(data))
+-			return false, nil
++			return "", nil
+ 		}
+ 
+ 		var pushDataCalls atomic.Int64
+diff --git a/lib/promscrape/scrapework_timing_test.go b/lib/promscrape/scrapework_timing_test.go
+index fa0454b52..d8177b414 100644
+--- a/lib/promscrape/scrapework_timing_test.go
++++ b/lib/promscrape/scrapework_timing_test.go
+@@ -205,9 +205,9 @@ func benchmarkScrapeWorkScrapeInternal(b *testing.B, data []byte, streamParse bo
+ 	protoparserutil.StartUnmarshalWorkers()
+ 	defer protoparserutil.StopUnmarshalWorkers()
+ 
+-	readData := func(dst *chunkedbuffer.Buffer) (bool, error) {
++	readData := func(dst *chunkedbuffer.Buffer) (string, error) {
+ 		dst.MustWrite(data)
+-		return false, nil
++		return "", nil
+ 	}
+ 
+ 	b.ReportAllocs()
+diff --git a/lib/promutil/labels.go b/lib/promutil/labels.go
+index 411e46715..cbc35f6f4 100644
+--- a/lib/promutil/labels.go
++++ b/lib/promutil/labels.go
+@@ -132,8 +132,19 @@ func (x *Labels) Clone() *Labels {
+ 
+ // Sort sorts x labels in alphabetical order of their names.
+ func (x *Labels) Sort() {
+-	if !sort.IsSorted(x) {
+-		sort.Sort(x)
++	labels := x.Labels
++	// Label sets are short and usually already sorted, and this sits on the
++	// stream aggregation push path, once per sample. An insertion sort straight
++	// on the slice pays no interface call per comparison and no second pass to
++	// check whether it is sorted at all.
++	for i := 1; i < len(labels); i++ {
++		l := labels[i]
++		j := i - 1
++		for j >= 0 && labels[j].Name > l.Name {
++			labels[j+1] = labels[j]
++			j--
++		}
++		labels[j+1] = l
+ 	}
+ }
+ 
+diff --git a/lib/promutil/labels_sort_order_test.go b/lib/promutil/labels_sort_order_test.go
+new file mode 100644
+index 000000000..18c51163b
+--- /dev/null
++++ b/lib/promutil/labels_sort_order_test.go
+@@ -0,0 +1,59 @@
++package promutil
++
++import (
++	"math/rand"
++	"sort"
++	"strconv"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// Sort is hand-written rather than going through sort.Interface, and nothing
++// checked that it orders the same way. It sits on the stream aggregation push
++// path where a wrong order does not fail: it changes the key a sample groups
++// under, so the samples land in the wrong output series and the numbers are
++// quietly wrong. So the order is checked against the standard library on names
++// built to hit the edges -- shared prefixes, one name extending another, and
++// names differing only in their tail.
++func TestSortMatchesStandardSort(t *testing.T) {
++	names := []string{
++		"a", "ab", "abc", "abcdefg", "abcdefgh", "abcdefghi", "abcdefghj",
++		"abcdefgh0", "abcdefgh_", "label1", "label2", "label3", "label10",
++		"__name__", "__name___", "_", "z", "job", "instance", "pod", "namespace",
++		"node", "environment", "path", "some_other_label", "A", "Z", "aZ", "a_",
++	}
++	rng := rand.New(rand.NewSource(20260920))
++
++	for round := range 20000 {
++		n := 1 + rng.Intn(20)
++		labels := make([]prompb.Label, n)
++		seen := map[string]bool{}
++		for i := range labels {
++			var name string
++			for {
++				name = names[rng.Intn(len(names))]
++				if rng.Intn(4) == 0 {
++					name += strconv.Itoa(rng.Intn(3))
++				}
++				if !seen[name] {
++					break
++				}
++			}
++			seen[name] = true
++			labels[i] = prompb.Label{Name: name, Value: "v" + strconv.Itoa(i)}
++		}
++
++		want := append([]prompb.Label(nil), labels...)
++		sort.SliceStable(want, func(i, j int) bool { return want[i].Name < want[j].Name })
++
++		x := &Labels{Labels: append([]prompb.Label(nil), labels...)}
++		x.Sort()
++
++		for i := range want {
++			if x.Labels[i].Name != want[i].Name {
++				t.Fatalf("round %d: at %d got %q, want %q\n  input %v", round, i, x.Labels[i].Name, want[i].Name, labels)
++			}
++		}
++	}
++}
+diff --git a/lib/promutil/labels_sort_test.go b/lib/promutil/labels_sort_test.go
+new file mode 100644
+index 000000000..74e50802e
+--- /dev/null
++++ b/lib/promutil/labels_sort_test.go
+@@ -0,0 +1,92 @@
++package promutil
++
++import (
++	"math/rand"
++	"sort"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// Sort has to order labels exactly as sorting by name does, including when names repeat.
++func TestLabelsSortMatchesSortSlice(t *testing.T) {
++	rnd := rand.New(rand.NewSource(1))
++	names := []string{"a", "b", "c", "instance", "job", "pod", "__name__", "a"}
++	for i := 0; i < 2000; i++ {
++		n := rnd.Intn(len(names) + 1)
++		labels := make([]prompb.Label, 0, n)
++		for j := 0; j < n; j++ {
++			labels = append(labels, prompb.Label{
++				Name:  names[rnd.Intn(len(names))],
++				Value: string(rune('A' + rnd.Intn(4))),
++			})
++		}
++		want := append([]prompb.Label{}, labels...)
++		sort.SliceStable(want, func(i, j int) bool { return want[i].Name < want[j].Name })
++
++		x := &Labels{Labels: append([]prompb.Label{}, labels...)}
++		x.Sort()
++		if len(x.Labels) != len(want) {
++			t.Fatalf("length changed: got %d, want %d", len(x.Labels), len(want))
++		}
++		for j := range want {
++			if x.Labels[j] != want[j] {
++				t.Fatalf("input %v: got %v, want %v", labels, x.Labels, want)
++			}
++		}
++	}
++}
++
++// What an exposer's label ordering costs the ingest path. A sidecar that renders
++// its generation label after the metric's own labels leaves one name out of
++// place at the end of every series; rendering it where it sorts leaves nothing
++// to move. The label set is the one the API-key sidecars produce.
++func BenchmarkLabelsSortExposerOrdering(b *testing.B) {
++	own := []prompb.Label{
++		{Name: "__name__", Value: "acg_requests_total"},
++		{Name: "apikey_id", Value: "7ab2d570-b30d-51c9-aa87-637cbb99a8f2"},
++		{Name: "business_group", Value: "bg-045"},
++		{Name: "business_group_id", Value: "595c8d9b-d0f9-51cd-881e-aac13083337b"},
++		{Name: "provider_id", Value: "provider-00"},
++		{Name: "provider_model", Value: "provider-00-model-0"},
++		{Name: "provider_model_id", Value: "2b4e65c3-600d-58ae-b382-7b84a5c71e2d"},
++		{Name: "route_model", Value: "model-000"},
++		{Name: "route_model_id", Value: "0f74c5ca-55cb-5fff-a37f-30782cf25609"},
++	}
++	gen := prompb.Label{Name: "gen", Value: "1789837285"}
++
++	appended := append(append([]prompb.Label{}, own...), gen)
++	inPlace := append([]prompb.Label{}, own...)
++	inPlace = append(inPlace, prompb.Label{})
++	copy(inPlace[5:], inPlace[4:])
++	inPlace[4] = gen
++
++	sorted := func(labels []prompb.Label) bool {
++		for i := 1; i < len(labels); i++ {
++			if labels[i-1].Name > labels[i].Name {
++				return false
++			}
++		}
++		return true
++	}
++	if !sorted(inPlace) || sorted(appended) {
++		b.Fatalf("the two orderings are not what this benchmark compares:\n%v\n%v", inPlace, appended)
++	}
++
++	for _, tc := range []struct {
++		name string
++		in   []prompb.Label
++	}{
++		{"generation_appended", appended},
++		{"generation_sorted", inPlace},
++	} {
++		b.Run(tc.name, func(b *testing.B) {
++			x := &Labels{Labels: make([]prompb.Label, len(tc.in))}
++			b.ReportAllocs()
++			for b.Loop() {
++				copy(x.Labels, tc.in)
++				x.Sort()
++			}
++		})
++	}
++}
+diff --git a/lib/promutil/labelscompressor.go b/lib/promutil/labelscompressor.go
+index a9aabb3de..6495fe959 100644
+--- a/lib/promutil/labelscompressor.go
++++ b/lib/promutil/labelscompressor.go
+@@ -232,3 +232,61 @@ func (lm *labelsMap) moveMutableToReadOnlyLocked(pReadOnly *[]*prompb.Label) {
+ 	clear(lm.mutable)
+ 	lm.readOnly.Store(&labels)
+ }
++
++// CompressorCache is a small direct-mapped cache in front of LabelsCompressor.
++//
++// The labels of a scrape repeat heavily: job, instance, namespace and the like are
++// identical on every series, so most lookups answer from here and never touch the
++// shared map. It is not safe for concurrent use; keep one per goroutine.
++type CompressorCache struct {
++	entries [compressorCacheSize]compressorCacheEntry
++}
++
++type compressorCacheEntry struct {
++	name  string
++	value string
++	idx   uint64
++}
++
++// 4096 slots, 160 KB per cache. Going to 1024 costs about 5% on the aggregation
++// push benchmark; going to 16384 buys about 3% more for four times the memory,
++// and that gain is against a synthetic label set. In a real scrape the
++// high-cardinality label misses at any size, while the rest fit either way.
++const compressorCacheSize = 4096
++
++func (c *CompressorCache) slot(label prompb.Label) *compressorCacheEntry {
++	h := uint64(14695981039346656037)
++	for i := 0; i < len(label.Name); i++ {
++		h = (h ^ uint64(label.Name[i])) * 1099511628211
++	}
++	for i := 0; i < len(label.Value); i++ {
++		h = (h ^ uint64(label.Value[i])) * 1099511628211
++	}
++	return &c.entries[h%compressorCacheSize]
++}
++
++// CompressCached works like Compress, answering from c where it can.
++func (lc *LabelsCompressor) CompressCached(dst []byte, labels []prompb.Label, c *CompressorCache) []byte {
++	if len(labels) == 0 {
++		return append(dst, 0)
++	}
++	a := encoding.GetUint64s(len(labels) + 1)
++	a.A[0] = uint64(len(labels))
++	out := a.A[1:]
++	for i, label := range labels {
++		e := c.slot(label)
++		if e.idx != 0 && e.name == label.Name && e.value == label.Value {
++			out[i] = e.idx
++			continue
++		}
++		lc.compress(out[i:i+1], labels[i:i+1])
++		idx := out[i]
++		// Keep the interned copy the shared map holds, never the caller's buffer.
++		if stored, ok := lc.idxToLabel.Load(idx); ok {
++			e.name, e.value, e.idx = stored.Name, stored.Value, idx
++		}
++	}
++	dst = encoding.MarshalVarUint64s(dst, a.A)
++	encoding.PutUint64s(a)
++	return dst
++}
+diff --git a/lib/promutil/labelscompressor_cache_test.go b/lib/promutil/labelscompressor_cache_test.go
+new file mode 100644
+index 000000000..8b7d770b1
+--- /dev/null
++++ b/lib/promutil/labelscompressor_cache_test.go
+@@ -0,0 +1,101 @@
++package promutil
++
++import (
++	"fmt"
++	"math/rand"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// CompressCached has to produce exactly what Compress produces, whether the cache
++// hits, misses or collides.
++func TestCompressCachedMatchesCompress(t *testing.T) {
++	var lc LabelsCompressor
++	var c CompressorCache
++	rnd := rand.New(rand.NewSource(7))
++
++	// More distinct labels than the cache has slots, so entries are evicted and reused.
++	//
++	// Names and values are drawn from small sets that cross over, so the same value
++	// shows up under several names: a cache that compared only the value would hand
++	// back the wrong index. The empty label is in there too, since an unused slot
++	// holds exactly that and must not be taken for a hit.
++	var pool []prompb.Label
++	pool = append(pool, prompb.Label{})
++	for i := 0; i < 4*compressorCacheSize; i++ {
++		pool = append(pool, prompb.Label{
++			Name:  fmt.Sprintf("name_%d", i%97),
++			Value: fmt.Sprintf("value_%d", i%89),
++		})
++	}
++
++	for round := 0; round < 3; round++ {
++		for i := 0; i < 20000; i++ {
++			n := rnd.Intn(9)
++			labels := make([]prompb.Label, 0, n)
++			for j := 0; j < n; j++ {
++				labels = append(labels, pool[rnd.Intn(len(pool))])
++			}
++			want := lc.Compress(nil, labels)
++			got := lc.CompressCached(nil, labels, &c)
++			if string(got) != string(want) {
++				t.Fatalf("round %d labels %v: cached %v, uncached %v", round, labels, got, want)
++			}
++			// and the result still decompresses back to the same labels
++			back := lc.Decompress(nil, got)
++			if len(back) != len(labels) {
++				t.Fatalf("decompressed %v, want %v", back, labels)
++			}
++			for j := range labels {
++				if back[j].Name != labels[j].Name || back[j].Value != labels[j].Value {
++					t.Fatalf("decompressed %v, want %v", back, labels)
++				}
++			}
++		}
++	}
++}
++
++// A cache slot is chosen by hashing name and value together, so two labels can land
++// in the same slot. When they also share a value, only the name tells them apart:
++// this builds exactly that pair and checks both still compress correctly.
++func TestCompressCachedSlotCollision(t *testing.T) {
++	const value = "shared-value"
++	var c CompressorCache
++
++	var a, b prompb.Label
++	found := false
++	for i := 0; i < 1<<20 && !found; i++ {
++		a = prompb.Label{Name: fmt.Sprintf("n%d", i), Value: value}
++		for j := i + 1; j < i+4096; j++ {
++			b = prompb.Label{Name: fmt.Sprintf("n%d", j), Value: value}
++			if c.slot(a) == c.slot(b) {
++				found = true
++				break
++			}
++		}
++	}
++	if !found {
++		t.Fatal("no colliding pair found")
++	}
++	t.Logf("colliding labels: %q and %q", a.Name, b.Name)
++
++	var lc LabelsCompressor
++	wantA := lc.Compress(nil, []prompb.Label{a})
++	wantB := lc.Compress(nil, []prompb.Label{b})
++	if string(wantA) == string(wantB) {
++		t.Fatal("two distinct labels must not compress to the same bytes")
++	}
++	// Prime the slot with a, then ask for b: the slot is taken by a label with the
++	// same value and a different name.
++	if got := lc.CompressCached(nil, []prompb.Label{a}, &c); string(got) != string(wantA) {
++		t.Fatalf("a: got %v, want %v", got, wantA)
++	}
++	if got := lc.CompressCached(nil, []prompb.Label{b}, &c); string(got) != string(wantB) {
++		t.Fatalf("b: got %v, want %v", got, wantB)
++	}
++	// and back to a, whose slot b has just taken over
++	if got := lc.CompressCached(nil, []prompb.Label{a}, &c); string(got) != string(wantA) {
++		t.Fatalf("a again: got %v, want %v", got, wantA)
++	}
++}
+diff --git a/lib/storage/storage_test.go b/lib/storage/storage_test.go
+index 52de8323e..217183937 100644
+--- a/lib/storage/storage_test.go
++++ b/lib/storage/storage_test.go
+@@ -740,7 +740,7 @@ func TestStorageDeletePendingSeries(t *testing.T) {
+ 	assertCountMonthsWithLabels := func(count int) {
+ 		t.Helper()
+ 
+-		ts := time.Unix(0, 0)
++		ts := time.Unix(0, 0).UTC()
+ 		n := 0
+ 		for range numMonths {
+ 			lns, err := s.SearchLabelNames(nil, 0, 0, nil, TimeRange{ts.UnixMilli(), ts.UnixMilli()}, 1e5, 1e9, noDeadline)
+@@ -783,7 +783,12 @@ func TestStorageDeletePendingSeries(t *testing.T) {
+ 	// Verify no metrics exist
+ 	assertCountRows(0)
+ 
+-	start := time.Unix(0, 0)
++	// UTC, so that the epoch is the 1st of a month. West of UTC it is the 31st,
++	// and AddDate normalizes the 31st of February to the 3rd of March, which
++	// makes stepping forward a month at a time and stepping back a month at a
++	// time land on different days -- and so in different per-day index entries,
++	// which is what this test reads back.
++	start := time.Unix(0, 0).UTC()
+ 	middle := start.AddDate(0, (numMonths-1)/2, 0)
+ 	end := start.AddDate(0, numMonths-1, 0)
+ 
+diff --git a/lib/streamaggr/avg.go b/lib/streamaggr/avg.go
+index 28f1561b2..38130dea2 100644
+--- a/lib/streamaggr/avg.go
++++ b/lib/streamaggr/avg.go
+@@ -32,3 +32,8 @@ type avgAggrConfig struct{}
+ func (*avgAggrConfig) getValue(_ any) aggrValue {
+ 	return &avgAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*avgAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/count_samples.go b/lib/streamaggr/count_samples.go
+index da2db7126..3469c6d18 100644
+--- a/lib/streamaggr/count_samples.go
++++ b/lib/streamaggr/count_samples.go
+@@ -28,3 +28,8 @@ type countSamplesAggrConfig struct{}
+ func (*countSamplesAggrConfig) getValue(_ any) aggrValue {
+ 	return &countSamplesAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*countSamplesAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/count_series.go b/lib/streamaggr/count_series.go
+index c577be0ac..60b7fd36f 100644
+--- a/lib/streamaggr/count_series.go
++++ b/lib/streamaggr/count_series.go
+@@ -40,3 +40,7 @@ func (*countSeriesAggrConfig) getValue(_ any) aggrValue {
+ 		samples: make(map[uint64]struct{}),
+ 	}
+ }
++
++// needsInputKey reports that this output keeps state per input series, so the
++// key has to carry the labels the aggregation groups away.
++func (*countSeriesAggrConfig) needsInputKey() bool { return true }
+diff --git a/lib/streamaggr/dedup_timing_test.go b/lib/streamaggr/dedup_timing_test.go
+index 4299daca6..da580671a 100644
+--- a/lib/streamaggr/dedup_timing_test.go
++++ b/lib/streamaggr/dedup_timing_test.go
+@@ -2,6 +2,7 @@ package streamaggr
+ 
+ import (
+ 	"fmt"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
+ 	"sync/atomic"
+ 	"testing"
+ 
+@@ -65,7 +66,7 @@ func newBenchSamples(count int) []pushSample {
+ 			Name:  "app",
+ 			Value: fmt.Sprintf("instance-%d", i),
+ 		})
+-		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:])
++		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:], &promutil.CompressorCache{}, true)
+ 		sample.key = string(keyBuf)
+ 		sample.value = float64(i)
+ 	}
+diff --git a/lib/streamaggr/deduplicator.go b/lib/streamaggr/deduplicator.go
+index 5f7bd7f0f..70e53f904 100644
+--- a/lib/streamaggr/deduplicator.go
++++ b/lib/streamaggr/deduplicator.go
+@@ -121,7 +121,7 @@ func (d *Deduplicator) Push(tss []prompb.TimeSeries) {
+ 		labels.Sort()
+ 
+ 		bufLen := len(buf)
+-		buf = lc.Compress(buf, labels.Labels)
++		buf = lc.CompressCached(buf, labels.Labels, &ctx.lcCache)
+ 		key := bytesutil.ToUnsafeString(buf[bufLen:])
+ 		for _, s := range ts.Samples {
+ 			if d.enableWindows && minDeadline > s.Timestamp {
+@@ -247,10 +247,11 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
+ }
+ 
+ type deduplicatorPushCtx struct {
+-	blue   []pushSample
+-	green  []pushSample
+-	labels promutil.Labels
+-	buf    []byte
++	blue    []pushSample
++	green   []pushSample
++	labels  promutil.Labels
++	buf     []byte
++	lcCache promutil.CompressorCache
+ }
+ 
+ func (ctx *deduplicatorPushCtx) reset() {
+diff --git a/lib/streamaggr/histogram_bucket.go b/lib/streamaggr/histogram_bucket.go
+index f1fa23669..b07b742ca 100644
+--- a/lib/streamaggr/histogram_bucket.go
++++ b/lib/streamaggr/histogram_bucket.go
+@@ -55,3 +55,8 @@ func (ac *histogramBucketAggrConfig) getValue(s any) aggrValue {
+ 		shared: shared,
+ 	}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*histogramBucketAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/input_key_test.go b/lib/streamaggr/input_key_test.go
+new file mode 100644
+index 000000000..50ac1027c
+--- /dev/null
++++ b/lib/streamaggr/input_key_test.go
+@@ -0,0 +1,81 @@
++package streamaggr
++
++import (
++	"testing"
++)
++
++// The input part of a sample's key carries the labels the aggregation groups
++// away, and it is left out when no configured output reads it. Getting that
++// wrong does not fail: an output that keeps state per input series would see
++// every input as the same one and quietly aggregate the wrong thing. So the
++// answer each output gives has to match the pushSample it is paired with --
++// the ones taking a named key parameter need it, the ones taking _ do not.
++func TestOutputsDeclareWhetherTheyNeedTheInputKey(t *testing.T) {
++	for _, tc := range []struct {
++		output string
++		want   bool
++	}{
++		{"count_series", true},
++		{"increase", true},
++		{"increase_prometheus", true},
++		{"rate_avg", true},
++		{"rate_sum", true},
++		{"total", true},
++		{"total_prometheus", true},
++
++		{"avg", false},
++		{"count_samples", false},
++		{"histogram_bucket", false},
++		{"last", false},
++		{"max", false},
++		{"min", false},
++		{"quantiles(0.5)", false},
++		{"stddev", false},
++		{"stdvar", false},
++		{"sum_samples", false},
++		{"sum_samples_total", false},
++		{"unique_samples", false},
++	} {
++		t.Run(tc.output, func(t *testing.T) {
++			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0)
++			if err != nil {
++				t.Fatalf("%s: %v", tc.output, err)
++			}
++			if got := ac.needsInputKey(); got != tc.want {
++				t.Errorf("%s needsInputKey = %v, want %v", tc.output, got, tc.want)
++			}
++		})
++	}
++}
++
++// And the aggregator has to take the union: one output that needs the input
++// key is enough to keep it for the whole rule.
++func TestInputKeyIsKeptWhenAnyOutputNeedsIt(t *testing.T) {
++	for _, tc := range []struct {
++		outputs string
++		want    bool
++	}{
++		{"[sum_samples_total]", false},
++		{"[sum_samples, last, max]", false},
++		{"[total]", true},
++		{"[sum_samples_total, count_series]", true},
++		{"[count_series, sum_samples]", true},
++	} {
++		t.Run(tc.outputs, func(t *testing.T) {
++			cfg := `
++- match: '{__name__="m"}'
++  interval: 10s
++  without: [pod]
++  outputs: ` + tc.outputs + `
++`
++			as, err := LoadFromData([]byte(cfg), nil, &Options{}, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %v", err)
++			}
++			defer as.MustStop()
++			if got := as.as[0].aggrOutputs.useInputKey; got != tc.want {
++				t.Errorf("outputs %s: useInputKey = %v, want %v", tc.outputs, got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/lib/streamaggr/last.go b/lib/streamaggr/last.go
+index 0ff0fd901..b9cd91935 100644
+--- a/lib/streamaggr/last.go
++++ b/lib/streamaggr/last.go
+@@ -32,3 +32,8 @@ type lastAggrConfig struct{}
+ func (*lastAggrConfig) getValue(_ any) aggrValue {
+ 	return &lastAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*lastAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/max.go b/lib/streamaggr/max.go
+index d8f7d6e58..3ed93a50a 100644
+--- a/lib/streamaggr/max.go
++++ b/lib/streamaggr/max.go
+@@ -35,3 +35,8 @@ type maxAggrConfig struct{}
+ func (*maxAggrConfig) getValue(_ any) aggrValue {
+ 	return &maxAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*maxAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/min.go b/lib/streamaggr/min.go
+index d2223ea24..c0b375393 100644
+--- a/lib/streamaggr/min.go
++++ b/lib/streamaggr/min.go
+@@ -35,3 +35,8 @@ type minAggrConfig struct{}
+ func (*minAggrConfig) getValue(_ any) aggrValue {
+ 	return &minAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*minAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/outage_test.go b/lib/streamaggr/outage_test.go
+new file mode 100644
+index 000000000..df96d560f
+--- /dev/null
++++ b/lib/streamaggr/outage_test.go
+@@ -0,0 +1,105 @@
++package streamaggr
++
++import (
++	"fmt"
++	"testing"
++	"time"
++)
++
++// increasePure mimics VM increase_pure over the whole output series: a drop is treated as a counter reset
++// and the new value is counted in full.
++func increasePure(samples []markerSample) float64 {
++	var sum, prev float64
++	for _, s := range samples {
++		if s.value >= prev {
++			sum += s.value - prev
++		} else {
++			sum += s.value
++		}
++		prev = s.value
++	}
++	return sum
++}
++
++// Where reset_marker_on_stale is right and where it isn't.
++//
++// The aggregator forgets an input series after staleness_interval without samples and then counts the first sample
++// of a returning series in full. That is correct only if the scrape target also dropped the counter and restarted it from zero.
++// If the target kept the counter and only the scrapes failed, the part counted before the gap is counted again.
++func TestResetMarkerOnStaleScrapeOutage(t *testing.T) {
++	every := func(from, to time.Duration, pod string, start float64) []pushAt {
++		var ps []pushAt
++		v := start
++		for at := from; at <= to; at += time.Minute {
++			ps = append(ps, pushAt{at, fmt.Sprintf(`foo{pod=%q} %v`, pod, v)})
++			v++
++		}
++		return ps
++	}
++	cases := []struct {
++		name   string
++		pushes []pushAt
++		real   float64
++		// what increase_pure over the output gives without and with the marker
++		want [2]float64
++	}{
++		// The target deleted the idle counter and recreated it from zero; 60 + 60 requests.
++		{"recreated from zero", []pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a"} 60`}}, 120, [2]float64{60, 120}},
++		// All scrapes failed for 10 minutes while the target kept counting: 60 before, 100 after, 100 requests in total.
++		// Known limitation: with the marker the 60 counted before the gap is counted again.
++		{"all pods scrape outage", []pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a"} 100`}}, 100, [2]float64{100, 160}},
++		// Same, but only pod a was unreachable; pod b kept reporting 1, 2, ... 12 every minute, so the output never expired.
++		{"one pod scrape outage", append([]pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a"} 100`}},
++			every(0, 11*time.Minute, "b", 1)...), 100 + 12, [2]float64{172, 172}}, // counted again with or without the marker
++		// The same outages when the target handles them (ACG sidecar RebaseAfterGap): after a long gap it reports only
++		// the increase that was never delivered, as a new series (another gen; a different pod value stands in for it here).
++		// All pods, 60 before and 70 new ones after: the marker is still needed, since 70 >= 60.
++		{"all pods outage, rebased", []pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a-gen2"} 70`}}, 130, [2]float64{70, 130}},
++		{"one pod outage, rebased", append([]pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a-gen2"} 40`}},
++			every(0, 11*time.Minute, "b", 1)...), 100 + 12, [2]float64{112, 112}},
++		// Rebased although the aggregator still remembers the old series: the old one just stops, nothing is counted twice.
++		{"short outage, rebased", []pushAt{{0, `foo{pod="a"} 60`}, {90 * time.Second, `foo{pod="a-gen2"} 40`}}, 100, [2]float64{100, 100}},
++		// Gap shorter than staleness_interval: nothing is forgotten.
++		{"short scrape outage", []pushAt{{0, `foo{pod="a"} 60`}, {90 * time.Second, `foo{pod="a"} 100`}}, 100, [2]float64{100, 100}},
++	}
++	for _, c := range cases {
++		for i, marker := range []bool{false, true} {
++			out := runStaleScenario(t, markerConfig("[total]", true, marker), sortPushes(c.pushes), 20*time.Minute, 18*time.Minute)["foo"]
++			if got := increasePure(out); got != c.want[i] {
++				t.Fatalf("%s, marker=%v: real %v; want increase %v; got %v from %v", c.name, marker, c.real, c.want[i], got, collapse(out))
++			}
++		}
++	}
++}
++
++func sortPushes(ps []pushAt) []pushAt {
++	out := append([]pushAt(nil), ps...)
++	for i := 1; i < len(out); i++ {
++		for j := i; j > 0 && out[j].at < out[j-1].at; j-- {
++			out[j], out[j-1] = out[j-1], out[j]
++		}
++	}
++	return out
++}
++
++// The flusher advances the flush timestamp only while time.Now() is strictly after it.
++// A tick landing exactly on (or, with real clocks, slightly before) the aligned boundary leaves it in place,
++// so the next flush reuses the same timestamp. The scrape phase doesn't take part in this.
++func TestFlushTimestampOnBoundary(t *testing.T) {
++	for _, offset := range []time.Duration{0, 30 * time.Second} {
++		var pushes []pushAt
++		for i := 0; i < 10; i++ {
++			pushes = append(pushes, pushAt{time.Duration(i)*time.Minute + offset, fmt.Sprintf(`foo{pod="a"} %d`, (i+1)*10)})
++		}
++		out := runStaleScenario(t, markerConfig("[total]", true, false), pushes, 12*time.Minute, 11*time.Minute)["foo"]
++		var dups []string
++		for i := 1; i < len(out); i++ {
++			if out[i].at == out[i-1].at {
++				dups = append(dups, fmt.Sprintf("%v: %v,%v", out[i].at, out[i-1].value, out[i].value))
++			}
++		}
++		if len(dups) > 0 {
++			t.Fatalf("scrape offset %v: flush timestamps must not repeat; duplicated %v", offset, dups)
++		}
++	}
++}
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index 3fcb9f6a3..c5909b485 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -10,11 +10,33 @@ import (
+ )
+ 
+ type aggrOutputs struct {
+-	m              sync.Map
+-	useSharedState bool
+-	useInputKey    bool
+-	configs        []aggrConfig
+-	outputSamples  *metrics.Counter
++	m                  sync.Map
++	useSharedState     bool
++	useInputKey        bool
++	resetMarkerOnStale bool
++	configs            []aggrConfig
++	outputSamples      *metrics.Counter
++}
++
++// hasCumulativeTotal returns true if ao has total, total_prometheus or sum_samples_total output.
++func (ao *aggrOutputs) hasCumulativeTotal() bool {
++	for _, c := range ao.configs {
++		if _, ok := cumulativeSuffix(c); ok {
++			return true
++		}
++	}
++	return false
++}
++
++// cumulativeSuffix returns the output suffix for outputs producing a cumulative counter.
++func cumulativeSuffix(c aggrConfig) (string, bool) {
++	switch t := c.(type) {
++	case *totalAggrConfig:
++		return t.getSuffix(), !t.resetTotalOnFlush
++	case *sumSamplesTotalAggrConfig:
++		return "sum_samples_total", true
++	}
++	return "", false
+ }
+ 
+ func (ao *aggrOutputs) getInputOutputKey(key string) (string, string) {
+@@ -99,6 +121,9 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 		// check for stale entries
+ 		deleted := ctx.flushTimestamp > av.deleteDeadline
+ 		if deleted {
++			if ao.resetMarkerOnStale {
++				ao.appendResetMarkers(ctx, av, k.(string), ctx.flushTimestamp)
++			}
+ 			// Mark the current entry as deleted
+ 			av.deleteDeadline = -1
+ 			av.mu.Unlock()
+@@ -106,6 +131,11 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 			return true
+ 		}
+ 		outputKey := k.(string)
++		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
++			// The first visible flush of a new output entry: emit a zero one interval earlier.
++			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
++			av.started = true
++		}
+ 		if ctx.isGreen {
+ 			outputs = av.green
+ 		} else {
+@@ -122,15 +152,40 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 	})
+ }
+ 
++// appendResetMarkers emits a zero sample at the given timestamp for every total, total_prometheus and sum_samples_total output of av.
++//
++// It is called for an entry which is going to be dropped because of staleness, and before the first visible flush
++// of a new entry. The latter covers entries lost without a marker, e.g. on vmagent restart or crash:
++// the previous output ends at some value X, and the new output restarts from a small value,
++// which increase() cannot detect as a counter reset if it isn't smaller than X.
++func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputKey string, timestamp int64) {
++	outputs := av.blue
++	if ctx.isGreen {
++		outputs = av.green
++	}
++	for i := range outputs {
++		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
++			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
++		}
++	}
++}
++
+ type aggrValues struct {
+ 	mu             sync.Mutex
+ 	blue           []aggrValue
+ 	green          []aggrValue
+ 	deleteDeadline int64
++	started        bool // a zero sample has been emitted before the first visible flush (reset_marker_on_stale)
+ }
+ 
+ type aggrConfig interface {
+ 	getValue(any) aggrValue
++	// needsInputKey reports whether this output reads the input part of a
++	// sample's key, i.e. whether it keeps state per input series. It is on the
++	// interface so that a new output has to answer it, next to the pushSample
++	// whose signature is the answer: getting this wrong does not fail, it
++	// silently aggregates the wrong thing.
++	needsInputKey() bool
+ }
+ 
+ type aggrValue interface {
+diff --git a/lib/streamaggr/quantiles.go b/lib/streamaggr/quantiles.go
+index c351b63fc..630e1a925 100644
+--- a/lib/streamaggr/quantiles.go
++++ b/lib/streamaggr/quantiles.go
+@@ -53,3 +53,8 @@ type quantilesAggrConfig struct {
+ func (*quantilesAggrConfig) getValue(_ any) aggrValue {
+ 	return &quantilesAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*quantilesAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/rate.go b/lib/streamaggr/rate.go
+index bd471df23..c070293c0 100644
+--- a/lib/streamaggr/rate.go
++++ b/lib/streamaggr/rate.go
+@@ -198,3 +198,7 @@ func (ac *rateAggrConfig) getSuffix() string {
+ 	}
+ 	return "rate_sum"
+ }
++
++// needsInputKey reports that this output keeps state per input series, so the
++// key has to carry the labels the aggregation groups away.
++func (*rateAggrConfig) needsInputKey() bool { return true }
+diff --git a/lib/streamaggr/reset_marker_test.go b/lib/streamaggr/reset_marker_test.go
+new file mode 100644
+index 000000000..788e1649d
+--- /dev/null
++++ b/lib/streamaggr/reset_marker_test.go
+@@ -0,0 +1,281 @@
++package streamaggr
++
++import (
++	"sort"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++type pushAt struct {
++	at      time.Duration
++	metrics string
++}
++
++type markerSample struct {
++	at    time.Duration // offset from the start of the scenario
++	value float64
++}
++
++// runStaleScenario pushes the given metrics at the given offsets on a fake clock and returns output samples per metric name,
++// ordered by timestamp.
++//
++// How many flushes an alive period produces depends on goroutine scheduling around interval boundaries,
++// so the assertions below check the shape of the output instead of exact sample counts.
++// Samples at or after settledBefore are dropped when settledBefore > 0, since the final flush at shutdown isn't deterministic.
++func runStaleScenario(t *testing.T, config string, pushes []pushAt, until, settledBefore time.Duration) map[string][]markerSample {
++	t.Helper()
++	out := map[string][]markerSample{}
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var tss []prompb.TimeSeries
++		pushFunc := func(src []prompb.TimeSeries) {
++			mu.Lock()
++			tss = appendClonedTimeseries(tss, src)
++			mu.Unlock()
++		}
++		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		start := time.Now()
++		for _, p := range pushes {
++			time.Sleep(start.Add(p.at).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(p.metrics, time.Now().UnixMilli()), nil)
++		}
++		time.Sleep(start.Add(until).Sub(time.Now()))
++		a.MustStop()
++
++		mu.Lock()
++		defer mu.Unlock()
++		for _, ts := range tss {
++			name := ""
++			for _, l := range ts.Labels {
++				if l.Name == "__name__" {
++					name = l.Value
++				}
++			}
++			for _, s := range ts.Samples {
++				at := time.UnixMilli(s.Timestamp).Sub(start)
++				if settledBefore > 0 && at >= settledBefore {
++					continue
++				}
++				out[name] = append(out[name], markerSample{at, s.Value})
++			}
++		}
++		for name := range out {
++			sort.SliceStable(out[name], func(i, j int) bool { return out[name][i].at < out[name][j].at })
++		}
++	})
++	return out
++}
++
++// collapse removes consecutive duplicate values.
++func collapse(samples []markerSample) []float64 {
++	var vs []float64
++	for _, s := range samples {
++		if n := len(vs); n == 0 || vs[n-1] != s.value {
++			vs = append(vs, s.value)
++		}
++	}
++	return vs
++}
++
++func equalFloats(a, b []float64) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++// Two alive periods of the same counter with a gap longer than staleness_interval between them.
++// The scrape target deleted the idle counter and recreated it from zero, so the second period reaches 5 again.
++var twoPeriods = []pushAt{
++	{0, `foo{pod="a"} 5`},
++	{10 * time.Minute, `foo{pod="b"} 5`},
++}
++
++func markerConfig(outputs string, keepMetricNames, marker bool) string {
++	s := `
++- interval: 1m
++  staleness_interval: 2m
++  ignore_first_sample_interval: 0s
++  without: [pod]
++  outputs: ` + outputs + "\n"
++	if keepMetricNames {
++		s += "  keep_metric_names: true\n"
++	}
++	if marker {
++		s += "  reset_marker_on_stale: true\n"
++	}
++	return s
++}
++
++// Without a marker the output is 5 → gap → 5, so increase() over the gap is 0 while the real increase is 5.
++// With the marker a zero sample is emitted right after each alive period and one interval before each one,
++// which makes the reset explicit.
++func TestResetMarkerOnStale(t *testing.T) {
++	without := runStaleScenario(t, markerConfig("[total]", true, false), twoPeriods, 20*time.Minute, 18*time.Minute)["foo"]
++	if got := collapse(without); !equalFloats(got, []float64{5}) {
++		t.Fatalf("without marker the output must never drop to zero; got %v", without)
++	}
++
++	with := runStaleScenario(t, markerConfig("[total]", true, true), twoPeriods, 20*time.Minute, 18*time.Minute)["foo"]
++	if got := collapse(with); !equalFloats(got, []float64{0, 5, 0, 5, 0}) {
++		t.Fatalf("with marker: got %v; want the shape [0 5 0 5 0]", with)
++	}
++	for i, s := range with {
++		if s.value != 0 {
++			continue
++		}
++		leading := i+1 < len(with) && with[i+1].value == 5 && with[i+1].at-s.at == time.Minute
++		trailing := i > 0 && with[i-1].value == 5 && s.at-with[i-1].at == time.Minute
++		if leading == trailing {
++			t.Fatalf("a marker must either precede the first flush or follow the last flush of an alive period by one interval; got %v", with)
++		}
++		if trailing && i+1 < len(with) && with[i+1].at < 10*time.Minute-time.Minute {
++			t.Fatalf("nothing must be emitted during the gap after a marker; got %v", with)
++		}
++	}
++}
++
++// vmagent restart (or crash) drops the aggregation state without any marker: the output ends at 1, and after the restart
++// a new low-frequency request makes it 1 again. Without the leading zero increase() over both sees no reset.
++//
++// ignore_first_sample_interval is 0s: lib/fasttime reads the real clock outside of goexperiment.synctest builds,
++// so the interval can't elapse on the fake clock. It doesn't take part in the problem anyway.
++func TestResetMarkerOnRestart(t *testing.T) {
++	const config = `
++- interval: 1m
++  staleness_interval: 2m
++  ignore_first_sample_interval: 0s
++  without: [pod]
++  outputs: [total]
++  keep_metric_names: true
++`
++	for _, c := range []struct {
++		marker bool
++		want   float64
++	}{{false, 1}, {true, 2}} {
++		cfg := config
++		if c.marker {
++			cfg += "  reset_marker_on_stale: true\n"
++		}
++		synctest.Test(t, func(t *testing.T) {
++			var mu sync.Mutex
++			var tss []prompb.TimeSeries
++			pushFunc := func(src []prompb.TimeSeries) {
++				mu.Lock()
++				tss = appendClonedTimeseries(tss, src)
++				mu.Unlock()
++			}
++			start := time.Now()
++			a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(30 * time.Second)
++			a.Push(prometheus.MustParsePromMetrics(`foo{pod="a"} 1`, time.Now().UnixMilli()), nil)
++			time.Sleep(90 * time.Second)
++			a.MustStop() // restart while the output is alive
++			time.Sleep(30 * time.Second)
++			b, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(10 * time.Minute)
++			b.Push(prometheus.MustParsePromMetrics(`foo{pod="b"} 1`, time.Now().UnixMilli()), nil)
++			time.Sleep(90 * time.Second)
++			b.MustStop()
++
++			mu.Lock()
++			defer mu.Unlock()
++			var out []markerSample
++			for _, ts := range tss {
++				for _, s := range ts.Samples {
++					out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++				}
++			}
++			sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
++			if got := increasePure(out); got != c.want {
++				t.Fatalf("marker=%v: want increase %v; got %v from %v", c.marker, c.want, got, out)
++			}
++		})
++	}
++}
++
++// The marker is emitted only for cumulative total outputs; increase output isn't affected.
++//
++// total and increase are flushed together, so within the same run increase must have exactly the flushes of total
++// except the markers. (Comparing two separate runs isn't reliable: the number of flushes per alive period depends on scheduling.)
++func TestResetMarkerOnStaleOnlyCumulativeTotal(t *testing.T) {
++	const total, increase = "foo:1m_without_pod_total", "foo:1m_without_pod_increase"
++	for range 5 {
++		out := runStaleScenario(t, markerConfig("[total, increase]", false, true), twoPeriods, 20*time.Minute, 18*time.Minute)
++		if got := collapse(out[total]); !equalFloats(got, []float64{0, 5, 0, 5, 0}) {
++			t.Fatalf("total output: got %v; want the shape [0 5 0 5 0]", out[total])
++		}
++		var totalFlushes []time.Duration
++		for _, s := range out[total] {
++			if s.value != 0 {
++				totalFlushes = append(totalFlushes, s.at)
++			}
++		}
++		if len(out[increase]) != len(totalFlushes) {
++			t.Fatalf("increase output must have the flushes of total without markers; total %v; increase %v", out[total], out[increase])
++		}
++		for i, s := range out[increase] {
++			if s.at != totalFlushes[i] {
++				t.Fatalf("increase output must have the flushes of total without markers; total %v; increase %v", out[total], out[increase])
++			}
++		}
++	}
++}
++
++// No marker is emitted at shutdown for series which are still alive.
++// flush_on_shutdown is needed to observe the final flush at all: by default its output is dropped.
++func TestResetMarkerOnStaleNotOnShutdown(t *testing.T) {
++	config := markerConfig("[total]", true, true) + "  flush_on_shutdown: true\n"
++	for range 5 {
++		// Stop 90 seconds after the second push, while the series is still alive.
++		// (A leading zero before the second alive period is expected; only the tail matters here.)
++		alive := runStaleScenario(t, config, twoPeriods, 11*time.Minute+30*time.Second, 0)["foo"]
++		if n := len(alive); n == 0 || alive[n-1].value != 5 {
++			t.Fatalf("no marker is expected at shutdown for alive series; got %v", alive)
++		}
++	}
++}
++
++func TestResetMarkerOnStaleRequiresCumulativeTotal(t *testing.T) {
++	for _, outputs := range []string{"[increase]", "[increase_prometheus]", "[sum_samples]"} {
++		config := `
++- interval: 1m
++  outputs: ` + outputs + `
++  reset_marker_on_stale: true
++`
++		if _, err := LoadFromData([]byte(config), func([]prompb.TimeSeries) {}, nil, "test"); err == nil {
++			t.Fatalf("expecting an error for outputs %s", outputs)
++		}
++	}
++	for _, outputs := range []string{"[total]", "[total_prometheus]", "[increase, total]", "[sum_samples_total]"} {
++		config := `
++- interval: 1m
++  outputs: ` + outputs + `
++  reset_marker_on_stale: true
++`
++		a, err := LoadFromData([]byte(config), func([]prompb.TimeSeries) {}, nil, "test")
++		if err != nil {
++			t.Fatalf("unexpected error for outputs %s: %s", outputs, err)
++		}
++		a.MustStop()
++	}
++}
+diff --git a/lib/streamaggr/restart_collision_test.go b/lib/streamaggr/restart_collision_test.go
+new file mode 100644
+index 000000000..db2faecaf
+--- /dev/null
++++ b/lib/streamaggr/restart_collision_test.go
+@@ -0,0 +1,79 @@
++package streamaggr
++
++import (
++	"sort"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// The leading zero of a new output lands one interval before its first flush, which is close to
++// where the process that died may have flushed a real value. Two samples of the same series at the
++// same timestamp are resolved by keeping the larger one, which would swallow the zero and hide the
++// reset, so they must never collide.
++//
++// They cannot: the first incomplete interval after a start is not flushed, which leaves at least one
++// interval between the last flush of the old process and the leading zero of the new one. This pins
++// that down with the tightest restart there is, one that lives through a boundary and comes back
++// within the same interval.
++func TestLeadingZeroAfterShortRestart(t *testing.T) {
++	const config = `
++- interval: 1m
++  staleness_interval: 5m
++  ignore_first_sample_interval: 0s
++  without: [pod]
++  outputs: [total]
++  keep_metric_names: true
++  reset_marker_on_stale: true
++`
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var tss []prompb.TimeSeries
++		pushFunc := func(src []prompb.TimeSeries) {
++			mu.Lock()
++			tss = appendClonedTimeseries(tss, src)
++			mu.Unlock()
++		}
++		start := time.Now()
++		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		time.Sleep(10 * time.Second)
++		a.Push(prometheus.MustParsePromMetrics(`foo{pod="a"} 5`, time.Now().UnixMilli()), nil)
++		time.Sleep(175 * time.Second) // live through the 180s boundary, then die just after it
++		a.MustStop()
++
++		time.Sleep(5 * time.Second) // a short restart, well under one interval
++		b, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		b.Push(prometheus.MustParsePromMetrics(`foo{pod="b"} 5`, time.Now().UnixMilli()), nil)
++		time.Sleep(150 * time.Second)
++		b.MustStop()
++
++		mu.Lock()
++		defer mu.Unlock()
++		var out []markerSample
++		for _, ts := range tss {
++			for _, s := range ts.Samples {
++				out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++			}
++		}
++		sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
++		t.Logf("samples: %v", out)
++
++		// look for two samples of the same series at the same timestamp with different values
++		for i := 1; i < len(out); i++ {
++			if out[i].at == out[i-1].at && out[i].value != out[i-1].value {
++				t.Fatalf("two values at the same timestamp %v: %v and %v; the smaller one is dropped by deduplication: %v",
++					out[i].at, out[i-1].value, out[i].value, out)
++			}
++		}
++	})
++}
+diff --git a/lib/streamaggr/std.go b/lib/streamaggr/std.go
+index af259b8c0..2128494f6 100644
+--- a/lib/streamaggr/std.go
++++ b/lib/streamaggr/std.go
+@@ -61,3 +61,8 @@ type stdAggrConfig struct {
+ func (*stdAggrConfig) getValue(_ any) aggrValue {
+ 	return &stdAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*stdAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 2c9ccc38d..bbe6c79d9 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -47,6 +47,7 @@ var supportedOutputs = []string{
+ 	"stddev",
+ 	"stdvar",
+ 	"sum_samples",
++	"sum_samples_total",
+ 	"total",
+ 	"total_prometheus",
+ 	"unique_samples",
+@@ -184,6 +185,20 @@ type Config struct {
+ 	// This parameter is relevant only for the following outputs: total, total_prometheus, increase, increase_prometheus, and histogram_bucket.
+ 	IgnoreFirstSampleInterval string `yaml:"ignore_first_sample_interval,omitempty"`
+ 
++	// ResetMarkerOnStale instructs to emit a single sample with zero value for total, total_prometheus and sum_samples_total outputs
++	// when their state is dropped because no input samples were received during staleness_interval,
++	// and one interval before the first sample of a newly created output state.
++	//
++	// Without the marker the output restarts from a small value after the state is dropped, and query functions
++	// such as increase() cannot detect the counter reset if the new value isn't smaller than the last value before the gap.
++	// The zero sample makes the reset explicit. The leading zero also covers state lost without a marker,
++	// e.g. on vmagent restart or crash.
++	//
++	// The marker is correct only if the inputs themselves restart from zero after the gap, e.g. when the scrape targets
++	// delete idle series. If inputs stop reporting for longer than staleness_interval without restarting
++	// (for example, because of a scrape outage), the marker makes the values before the gap to be counted twice.
++	ResetMarkerOnStale *bool `yaml:"reset_marker_on_stale,omitempty"`
++
+ 	// Outputs is a list of output aggregate functions to produce.
+ 	//
+ 	// The following names are allowed:
+@@ -595,9 +610,10 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 	useInputKey := dedupInterval <= 0
+ 	useSharedState := enableWindows && useInputKey
+ 	aggrOutputs := &aggrOutputs{
+-		configs:        make([]aggrConfig, len(cfg.Outputs)),
+-		useSharedState: useSharedState,
+-		useInputKey:    useInputKey,
++		configs:            make([]aggrConfig, len(cfg.Outputs)),
++		useSharedState:     useSharedState,
++		useInputKey:        useInputKey,
++		resetMarkerOnStale: cfg.ResetMarkerOnStale != nil && *cfg.ResetMarkerOnStale,
+ 	}
+ 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
+ 	for i, output := range cfg.Outputs {
+@@ -607,6 +623,26 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		}
+ 		aggrOutputs.configs[i] = ac
+ 	}
++	// Narrow useInputKey to what the configured outputs actually read. It is
++	// the labels the aggregation groups away -- pod and instance, typically --
++	// and carrying them costs a hash and two string compares per label per
++	// sample to build a key nothing looks at, plus the length in every key the
++	// state map holds. Only the outputs that keep state per input series need
++	// it; the rest take the sample and nothing else.
++	if useInputKey {
++		useInputKey = false
++		for _, ac := range aggrOutputs.configs {
++			if ac.needsInputKey() {
++				useInputKey = true
++				break
++			}
++		}
++		aggrOutputs.useInputKey = useInputKey
++	}
++
++	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
++		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total`, `total_prometheus` or `sum_samples_total` output")
++	}
+ 	outputsLabels := make([]string, 0, len(outputsSeen))
+ 	for o := range outputsSeen {
+ 		outputsLabels = append(outputsLabels, o)
+@@ -778,6 +814,8 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+ 		return newStdvarAggrConfig(), nil
+ 	case "sum_samples":
+ 		return newSumSamplesAggrConfig(), nil
++	case "sum_samples_total":
++		return newSumSamplesTotalAggrConfig(), nil
+ 	case "total":
+ 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
+ 	case "total_prometheus":
+@@ -848,6 +886,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+ 			} else {
+ 				a.flush(pf, flushTime, cs, false)
+ 			}
++			// Always move past the timestamp just used: a tick landing on or slightly before the boundary
++			// would otherwise leave flushTime in place, and the next flush would reuse the same timestamp.
++			flushTime = flushTime.Add(a.interval)
+ 			for time.Now().After(flushTime) {
+ 				flushTime = flushTime.Add(a.interval)
+ 			}
+@@ -885,6 +926,14 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+ 	if skipIncompleteFlush || ignoreFirstIntervals > 0 {
+ 		pf = nil
+ 	}
++	if pf != nil && a.aggrOutputs.resetMarkerOnStale {
++		if now := time.Now(); flushTime.After(now) {
++			// Don't stamp the incomplete flush on shutdown with the next flush boundary, which is in the future:
++			// a restarted aggregator emits the leading zero of reset_marker_on_stale at its own start,
++			// and increase() would see X → 0 → X for the same series and count X twice.
++			flushTime = now
++		}
++	}
+ 	a.flush(pf, flushTime, cs, true)
+ }
+ 
+@@ -965,6 +1014,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	deleteDeadlineMsec := deleteDeadline.UnixMilli()
+ 
+ 	minDeadline := a.minDeadline.Load()
++	useInputKey := a.aggrOutputs.useInputKey
+ 	dropLabels := a.dropInputLabels
+ 	ignoreOldSamples := a.ignoreOldSamples
+ 	enableWindows := a.enableWindows
+@@ -998,7 +1048,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 		}
+ 
+ 		bufLen := len(buf)
+-		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels)
++		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache, useInputKey)
+ 		// key remains valid only by the end of this function and can't be reused after
+ 		// do not intern key because number of unique keys could be too high
+ 		key := bytesutil.ToUnsafeString(buf[bufLen:])
+@@ -1057,13 +1107,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	}
+ }
+ 
+-func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label) []byte {
++// compressLabels builds a sample's key: the length of the output part, the
++// output part, and -- only when some configured output keeps state per input
++// series -- the input part. Compressing the input part costs a hash and two
++// string compares per label per sample, so it is left out when nothing will
++// read it. See aggrConfig.needsInputKey.
++func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache, useInputKey bool) []byte {
+ 	bb := bbPool.Get()
+-	bb.B = lc.Compress(bb.B, outputLabels)
++	bb.B = lc.CompressCached(bb.B, outputLabels, c)
+ 	dst = encoding.MarshalVarUint64(dst, uint64(len(bb.B)))
+ 	dst = append(dst, bb.B...)
+ 	bbPool.Put(bb)
+-	dst = lc.Compress(dst, inputLabels)
++	if useInputKey {
++		dst = lc.CompressCached(dst, inputLabels, c)
++	}
+ 	return dst
+ }
+ 
+@@ -1078,6 +1135,7 @@ type pushCtx struct {
+ 	inputLabels  promutil.Labels
+ 	outputLabels promutil.Labels
+ 	buf          []byte
++	lcCache      promutil.CompressorCache
+ }
+ 
+ func (ctx *pushCtx) reset() {
+@@ -1230,6 +1288,10 @@ func (ctx *flushCtx) flushSeries() {
+ }
+ 
+ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
++	ctx.appendSeriesAt(key, suffix, ctx.flushTimestamp, value)
++}
++
++func (ctx *flushCtx) appendSeriesAt(key, suffix string, timestamp int64, value float64) {
+ 	labelsLen := len(ctx.labels)
+ 	samplesLen := len(ctx.samples)
+ 	ctx.labels = decompressLabels(ctx.labels, key)
+@@ -1237,7 +1299,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+ 		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
+ 	}
+ 	ctx.samples = append(ctx.samples, prompb.Sample{
+-		Timestamp: ctx.flushTimestamp,
++		Timestamp: timestamp,
+ 		Value:     value,
+ 	})
+ 	ctx.tss = append(ctx.tss, prompb.TimeSeries{
+diff --git a/lib/streamaggr/streamaggr_timing_test.go b/lib/streamaggr/streamaggr_timing_test.go
+index 01a4f5423..0fe01bcf7 100644
+--- a/lib/streamaggr/streamaggr_timing_test.go
++++ b/lib/streamaggr/streamaggr_timing_test.go
+@@ -27,6 +27,7 @@ var benchOutputs = []string{
+ 	"stddev",
+ 	"stdvar",
+ 	"sum_samples",
++	"sum_samples_total",
+ 	"total",
+ 	"total_prometheus",
+ 	"unique_samples",
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index 8ec63e679..ec583f88f 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -1,5 +1,9 @@
+ package streamaggr
+ 
++import (
++	"math"
++)
++
+ type sumSamplesAggrValue struct {
+ 	sum float64
+ }
+@@ -26,3 +30,62 @@ type sumSamplesAggrConfig struct{}
+ func (*sumSamplesAggrConfig) getValue(_ any) aggrValue {
+ 	return &sumSamplesAggrValue{}
+ }
++
++// sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
++// so the output is a cumulative counter.
++//
++// It is intended for inputs which already are increments, e.g. scrape targets exposing the increase since the last
++// delivered scrape. Unlike total, it keeps no state per input series, so its memory usage doesn't depend on
++// the number of inputs merged into every output, and a restart doesn't need a baseline sample per input.
++type sumSamplesTotalAggrValue struct {
++	sum    float64
++	shared *sumSamplesTotalShared
++}
++
++type sumSamplesTotalShared struct {
++	total float64
++}
++
++func (av *sumSamplesTotalAggrValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
++	av.sum += sample.value
++}
++
++func (av *sumSamplesTotalAggrValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	total := av.shared.total + av.sum
++	av.sum = 0
++	if math.Abs(total) >= (1 << 53) {
++		// It is time to reset the entry, since it starts losing float64 precision
++		av.shared.total = 0
++	} else {
++		av.shared.total = total
++	}
++	ctx.appendSeries(key, "sum_samples_total", total)
++}
++
++func (av *sumSamplesTotalAggrValue) state() any {
++	return av.shared
++}
++
++func newSumSamplesTotalAggrConfig() aggrConfig {
++	return &sumSamplesTotalAggrConfig{}
++}
++
++type sumSamplesTotalAggrConfig struct{}
++
++func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
++	shared, ok := s.(*sumSamplesTotalShared)
++	if !ok {
++		shared = &sumSamplesTotalShared{}
++	}
++	return &sumSamplesTotalAggrValue{shared: shared}
++}
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*sumSamplesAggrConfig) needsInputKey() bool { return false }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*sumSamplesTotalAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/sum_samples_total_test.go b/lib/streamaggr/sum_samples_total_test.go
+new file mode 100644
+index 000000000..7a460a8b3
+--- /dev/null
++++ b/lib/streamaggr/sum_samples_total_test.go
+@@ -0,0 +1,149 @@
++package streamaggr
++
++import (
++	"sort"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// Inputs are increments since the previous delivered scrape; the output is their cumulative sum across flushes and pods.
++func TestSumSamplesTotalAccumulates(t *testing.T) {
++	pushes := []pushAt{
++		{0, `foo{pod="a"} 2`},
++		{30 * time.Second, `foo{pod="b"} 3`},
++		{70 * time.Second, `foo{pod="a"} 1`},
++		{130 * time.Second, `foo{pod="b"} 4`},
++	}
++	out := runStaleScenario(t, markerConfig("[sum_samples_total]", true, false), pushes, 4*time.Minute, 0)["foo"]
++	if n := len(out); n == 0 || out[n-1].value != 10 {
++		t.Fatalf("the output must be the cumulative sum 10 of all increments; got %v", out)
++	}
++	for i := 1; i < len(out); i++ {
++		if out[i].value < out[i-1].value {
++			t.Fatalf("the output must never decrease without a marker; got %v", out)
++		}
++	}
++}
++
++// A restart loses no increments pushed after it: there is no baseline sample per input to skip.
++// With the marker the restarted output starts from an explicit zero, so increase() over both parts is exact.
++func TestSumSamplesTotalRestart(t *testing.T) {
++	config := func(marker bool) string {
++		return markerConfig("[sum_samples_total]", true, marker)
++	}
++	run := func(marker bool) []markerSample {
++		var out []markerSample
++		synctest.Test(t, func(t *testing.T) {
++			var mu sync.Mutex
++			var tss []prompb.TimeSeries
++			pushFunc := func(src []prompb.TimeSeries) {
++				mu.Lock()
++				tss = appendClonedTimeseries(tss, src)
++				mu.Unlock()
++			}
++			start := time.Now()
++			push := func(a *Aggregators, s string) {
++				a.Push(prometheus.MustParsePromMetrics(s, time.Now().UnixMilli()), nil)
++			}
++			a, err := LoadFromData([]byte(config(marker)), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(30 * time.Second)
++			push(a, `foo{pod="a"} 3`)
++			time.Sleep(time.Minute)
++			push(a, `foo{pod="a"} 3`)
++			time.Sleep(time.Minute)
++			a.MustStop() // restart while the output is alive: 6 so far
++			time.Sleep(30 * time.Second)
++			b, err := LoadFromData([]byte(config(marker)), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(30 * time.Second)
++			push(b, `foo{pod="b"} 2`) // right after the restart
++			time.Sleep(9 * time.Minute)
++			push(b, `foo{pod="a"} 4`) // after the output expired
++			time.Sleep(90 * time.Second)
++			b.MustStop()
++
++			mu.Lock()
++			defer mu.Unlock()
++			for _, ts := range tss {
++				for _, s := range ts.Samples {
++					out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++				}
++			}
++			sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
++		})
++		return out
++	}
++	with := run(true)
++	if got := increasePure(with); got != 12 {
++		t.Fatalf("with marker: want increase 12 (6 before the restart, 2 and 4 after); got %v from %v", got, with)
++	}
++	without := run(false)
++	if got := increasePure(without); got >= 12 {
++		t.Fatalf("without marker the restarted output isn't detected as a reset, so it must undercount; got %v from %v", got, without)
++	}
++}
++
++// flush_on_shutdown emits the incomplete interval on shutdown. Its timestamp must not be in the future:
++// the restarted aggregator emits the leading zero at its own start, and a future timestamp of the last flush lands after it,
++// so increase() sees X → 0 → X and counts X twice.
++func TestSumSamplesTotalFlushOnShutdownRestart(t *testing.T) {
++	config := markerConfig("[sum_samples_total]", true, true) + "  flush_on_shutdown: true\n"
++	var out []markerSample
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var tss []prompb.TimeSeries
++		pushFunc := func(src []prompb.TimeSeries) {
++			mu.Lock()
++			tss = appendClonedTimeseries(tss, src)
++			mu.Unlock()
++		}
++		start := time.Now()
++		sleepUntil := func(d time.Duration) { time.Sleep(start.Add(d).Sub(time.Now())) }
++		push := func(a *Aggregators, s string) {
++			a.Push(prometheus.MustParsePromMetrics(s, time.Now().UnixMilli()), nil)
++		}
++		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		sleepUntil(30 * time.Second)
++		push(a, `foo{pod="a"} 3`)
++		sleepUntil(90 * time.Second)
++		push(a, `foo{pod="a"} 3`)
++		sleepUntil(150 * time.Second)
++		push(a, `foo{pod="a"} 2`) // only the flush on shutdown emits it
++		sleepUntil(170 * time.Second)
++		a.MustStop()
++		sleepUntil(175 * time.Second) // restart before the next flush boundary of the stopped aggregator
++		b, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		sleepUntil(200 * time.Second)
++		push(b, `foo{pod="b"} 4`)
++		sleepUntil(300 * time.Second)
++		b.MustStop()
++
++		mu.Lock()
++		defer mu.Unlock()
++		for _, ts := range tss {
++			for _, s := range ts.Samples {
++				out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++			}
++		}
++		sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
++	})
++	if got := increasePure(out); got != 12 {
++		t.Fatalf("want increase 12 (8 before the restart including the flush on shutdown, 4 after); got %v from %v", got, out)
++	}
++}
+diff --git a/lib/streamaggr/total.go b/lib/streamaggr/total.go
+index f1afc9f65..20a384b1f 100644
+--- a/lib/streamaggr/total.go
++++ b/lib/streamaggr/total.go
+@@ -121,3 +121,7 @@ func (ac *totalAggrConfig) getSuffix() string {
+ 	}
+ 	return "total_prometheus"
+ }
++
++// needsInputKey reports that this output keeps state per input series, so the
++// key has to carry the labels the aggregation groups away.
++func (*totalAggrConfig) needsInputKey() bool { return true }
+diff --git a/lib/streamaggr/type_label_match_test.go b/lib/streamaggr/type_label_match_test.go
+new file mode 100644
+index 000000000..0131b47a2
+--- /dev/null
++++ b/lib/streamaggr/type_label_match_test.go
+@@ -0,0 +1,57 @@
++// Copyright 2026 The VictoriaMetrics Authors
++// Licensed under the Apache License, Version 2.0
++
++package streamaggr
++
++import (
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
++)
++
++// The aggregation config recommended for the delta SDK selects on a label
++// carrying the metric's type, so that a metric added later needs no change to
++// the config. That rests on one selector detail: a matcher reads an absent label
++// as empty, so a negative match on the type also takes every sample that carries
++// no type at all -- the plain endpoints on the same aggregator, and every other
++// target it scrapes -- which sum_samples_total would then add up as if each
++// cumulative value were an increment. Pin it, so the config keeps the emptiness
++// condition that stops that.
++func TestTypeLabelSelectorTakesOnlyTypedSamples(t *testing.T) {
++	ls := func(pairs ...string) []prompb.Label {
++		out := make([]prompb.Label, 0, len(pairs)/2)
++		for i := 0; i < len(pairs); i += 2 {
++			out = append(out, prompb.Label{Name: pairs[i], Value: pairs[i+1]})
++		}
++		return out
++	}
++	counter := ls("__name__", "m", "_metric_type", "counter")
++	gauge := ls("__name__", "m", "_metric_type", "gauge")
++	untyped := ls("__name__", "m")
++
++	for _, tc := range []struct {
++		selector                       string
++		wantCounter, wantGauge, wantUn bool
++	}{
++		// What the config must not be: it takes the untyped sample too.
++		{`{_metric_type!="gauge"}`, true, false, true},
++		// What the config is.
++		{`{_metric_type!="gauge",_metric_type!=""}`, true, false, false},
++		{`{_metric_type="gauge"}`, false, true, false},
++	} {
++		var ie promrelabel.IfExpression
++		if err := ie.Parse(tc.selector); err != nil {
++			t.Fatalf("%s: %v", tc.selector, err)
++		}
++		if got := ie.Match(counter); got != tc.wantCounter {
++			t.Errorf("%s on a counter: %v, want %v", tc.selector, got, tc.wantCounter)
++		}
++		if got := ie.Match(gauge); got != tc.wantGauge {
++			t.Errorf("%s on a gauge: %v, want %v", tc.selector, got, tc.wantGauge)
++		}
++		if got := ie.Match(untyped); got != tc.wantUn {
++			t.Errorf("%s on a sample with no type label: %v, want %v", tc.selector, got, tc.wantUn)
++		}
++	}
++}
+diff --git a/lib/streamaggr/unique_samples.go b/lib/streamaggr/unique_samples.go
+index 362162e9a..5c27a6d8c 100644
+--- a/lib/streamaggr/unique_samples.go
++++ b/lib/streamaggr/unique_samples.go
+@@ -32,3 +32,8 @@ func (*uniqueSamplesAggrConfig) getValue(_ any) aggrValue {
+ 		samples: make(map[float64]struct{}),
+ 	}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*uniqueSamplesAggrConfig) needsInputKey() bool { return false }

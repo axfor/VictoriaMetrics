@@ -1,0 +1,115 @@
+From dae3fce81b38b73603b0d2d039e5ce2257dbb009 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 20 Sep 2026 10:32:28 -0700
+Subject: [PATCH 14/16] promscrape: report which parse mode each scrape took
+
+Whether the uncompressed response is ever held in memory is decided per
+scrape, and three config options turn the cheap path off without saying so:
+no_stale_markers has to be set -- it is off by default -- and neither
+sample_limit nor series_limit may be. Nothing fails when one of them is
+there. The scrape succeeds, the numbers are right, and the process holds the
+whole uncompressed response instead: on a sidecar exposing 30k keys that was
+26.94GiB against 4.03GiB.
+
+vm_promscrape_scrapes_by_parse_mode_total counts each scrape under
+stream_without_body, stream or one_shot, so a deployment can be checked
+rather than assumed. The test pins all three gates, including that forcing
+stream_parse gets past sample_limit but not past series_limit.
+---
+ lib/promscrape/parse_mode_test.go | 38 +++++++++++++++++++++++++++++++
+ lib/promscrape/scrapework.go      | 15 +++++++++++-
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+ create mode 100644 lib/promscrape/parse_mode_test.go
+
+diff --git a/lib/promscrape/parse_mode_test.go b/lib/promscrape/parse_mode_test.go
+new file mode 100644
+index 000000000..58b66db18
+--- /dev/null
++++ b/lib/promscrape/parse_mode_test.go
+@@ -0,0 +1,38 @@
++package promscrape
++
++import (
++	"testing"
++)
++
++// Whether the uncompressed response is ever held in memory is decided per
++// scrape, from the config and the response size. Three options turn it off and
++// none of them says so: no_stale_markers has to be set, and neither
++// sample_limit nor series_limit may be. Getting it wrong does not fail a
++// scrape, it just costs memory proportional to the response -- on a 30k-key
++// sidecar that was 26.94GiB against 4.03GiB -- so the choice is pinned here and
++// exported as vm_promscrape_scrapes_by_parse_mode_total.
++func TestCanStreamWithoutBodyGates(t *testing.T) {
++	const big = 8 << 20 // well past minResponseSizeForStreamParse
++
++	for _, tc := range []struct {
++		name string
++		cfg  ScrapeWork
++		want bool
++	}{
++		{"the recommended config", ScrapeWork{NoStaleMarkers: true}, true},
++		{"no_stale_markers left at its default", ScrapeWork{}, false},
++		{"sample_limit set", ScrapeWork{NoStaleMarkers: true, SampleLimit: 1e6}, false},
++		{"series_limit set", ScrapeWork{NoStaleMarkers: true, SeriesLimit: 1e6}, false},
++		{"stream_parse forced on, sample_limit still off", ScrapeWork{NoStaleMarkers: true, StreamParse: true}, true},
++		{"stream_parse forced on but series_limit set", ScrapeWork{NoStaleMarkers: true, StreamParse: true, SeriesLimit: 1}, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			sw := &scrapeWork{Config: &tc.cfg}
++			sw.prevBodyLen = big
++			if got := sw.canStreamWithoutBody(big); got != tc.want {
++				t.Errorf("canStreamWithoutBody = %v, want %v -- the uncompressed response %s be held in memory",
++					got, tc.want, map[bool]string{true: "would not", false: "would"}[got])
++			}
++		})
++	}
++}
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index b6cc4cb00..630ad042f 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -409,7 +409,17 @@ var (
+ 	scrapesSkippedBySampleLimit = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_sample_limit_total")
+ 	scrapesSkippedByLabelLimit  = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_label_limit_total")
+ 	scrapesFailed               = metrics.NewCounter("vm_promscrape_scrapes_failed_total")
+-	pushDataDuration            = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
++
++	// Which path a scrape took through the parser. Whether the uncompressed
++	// response is ever held in memory is decided per scrape from the config and
++	// the response size, and getting it wrong costs memory proportional to the
++	// response rather than failing, so it has to be visible. no_stale_markers
++	// has to be set and neither sample_limit nor series_limit may be, and none
++	// of those says so.
++	scrapesStreamedWithoutBody = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="stream_without_body"}`)
++	scrapesStreamed            = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="stream"}`)
++	scrapesOneShot             = metrics.NewCounter(`vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`)
++	pushDataDuration           = metrics.NewHistogram("vm_promscrape_push_data_duration_seconds")
+ )
+ 
+ func (sw *scrapeWork) needStreamParseMode(responseSize int) bool {
+@@ -459,6 +469,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 
+ 	if err == nil && sw.canStreamWithoutBody(cb.SizeBytes()) {
+ 		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
++		scrapesStreamedWithoutBody.Inc()
+ 		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)
+ 		chunkedbuffer.Put(cb)
+ 		<-processScrapedDataConcurrencyLimitCh
+@@ -481,11 +492,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 		// Process response body from scrape target in streaming manner.
+ 		// This case is optimized for targets exposing more than ten thousand of metrics per target,
+ 		// such as kube-state-metrics.
++		scrapesStreamed.Inc()
+ 		err = sw.processDataInStreamMode(scrapeTimestamp, realTimestamp, body, scrapeDurationSeconds)
+ 	} else {
+ 		// Process response body from scrape target at once.
+ 		// This case should work more optimally than stream parse for common case when scrape target exposes
+ 		// up to a few thousand metrics.
++		scrapesOneShot.Inc()
+ 		err = sw.processDataOneShot(scrapeTimestamp, realTimestamp, body.B, scrapeDurationSeconds, err)
+ 	}
+ 
+-- 
+2.50.1 (Apple Git-155)
+

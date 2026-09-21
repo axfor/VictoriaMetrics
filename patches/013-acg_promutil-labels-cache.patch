@@ -1,0 +1,327 @@
+From de22abbb4577297c36fcbeeadbdacbe1605c11de Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sat, 19 Sep 2026 04:35:05 -0700
+Subject: [PATCH 10/16] promutil, streamaggr: cache the most recent label
+ lookups
+
+Compressing the labels of a sample looks every label up in a shared
+sync.Map, which was 46% of the stream aggregation push profile. The labels
+of a scrape repeat heavily -- job, instance, namespace, the metric name
+and any low-cardinality dimension are identical across huge numbers of
+series -- so most of those lookups ask the same question again.
+
+CompressCached answers from a small direct-mapped cache in front of the
+map, one per push context and therefore one per goroutine, so it needs no
+synchronisation of its own. A hit compares the name and value against the
+entry the slot holds; anything else falls through to the shared map and
+refills the slot. What the slot keeps is the interned copy the compressor
+already holds, never the caller's buffer, so a cached entry cannot outlive
+its strings.
+
+It is safe because an index, once assigned to a label, never changes:
+LoadOrStore resolves the race between two goroutines interning the same
+label and every caller ends up with the winner.
+
+Both paths that compress labels use it: the aggregator and the
+deduplicator, which an aggregation config reaches through dedup_interval.
+
+Measured, alternating the versions in one tree and taking medians:
+
+  BenchmarkAggregatorsPush/output=total
+    before the sorting change  202.9 ms/op
+    with sorting               179.4 ms/op   -11.6%
+    with sorting and this      147.4 ms/op   -27.4%
+
+  BenchmarkDeduplicatorPush
+    without this               1.068 ms/op
+    with this                  0.775 ms/op   -27.4%
+
+Two cheaper hashes were tried and both lost: hash/maphash over the label
+struct came out 2.6% slower, and hashing only the ends of a long value
+7.5% slower, because the weaker hash collides more and every extra miss
+costs a shared-map lookup, which is far more than the hashing it saved.
+Hash quality matters more than hash cost here.
+
+TestCompressCachedMatchesCompress compares the output against the
+uncached path over sixty thousand random label sets drawn from more
+distinct labels than the cache has slots, so entries are evicted and
+reused, including the empty label that an unused slot looks like.
+TestCompressCachedSlotCollision builds two labels that hash to the same
+slot and share a value, where only the name tells them apart.
+
+The random test alone did not catch dropping the name comparison: with
+values unique per label, no collision can produce a wrong hit. The
+collision test exists because of that.
+---
+ lib/promutil/labelscompressor.go            |  58 +++++++++++
+ lib/promutil/labelscompressor_cache_test.go | 101 ++++++++++++++++++++
+ lib/streamaggr/dedup_timing_test.go         |   3 +-
+ lib/streamaggr/deduplicator.go              |  11 ++-
+ lib/streamaggr/streamaggr.go                |   9 +-
+ 5 files changed, 172 insertions(+), 10 deletions(-)
+ create mode 100644 lib/promutil/labelscompressor_cache_test.go
+
+diff --git a/lib/promutil/labelscompressor.go b/lib/promutil/labelscompressor.go
+index a9aabb3de..6495fe959 100644
+--- a/lib/promutil/labelscompressor.go
++++ b/lib/promutil/labelscompressor.go
+@@ -232,3 +232,61 @@ func (lm *labelsMap) moveMutableToReadOnlyLocked(pReadOnly *[]*prompb.Label) {
+ 	clear(lm.mutable)
+ 	lm.readOnly.Store(&labels)
+ }
++
++// CompressorCache is a small direct-mapped cache in front of LabelsCompressor.
++//
++// The labels of a scrape repeat heavily: job, instance, namespace and the like are
++// identical on every series, so most lookups answer from here and never touch the
++// shared map. It is not safe for concurrent use; keep one per goroutine.
++type CompressorCache struct {
++	entries [compressorCacheSize]compressorCacheEntry
++}
++
++type compressorCacheEntry struct {
++	name  string
++	value string
++	idx   uint64
++}
++
++// 4096 slots, 160 KB per cache. Going to 1024 costs about 5% on the aggregation
++// push benchmark; going to 16384 buys about 3% more for four times the memory,
++// and that gain is against a synthetic label set. In a real scrape the
++// high-cardinality label misses at any size, while the rest fit either way.
++const compressorCacheSize = 4096
++
++func (c *CompressorCache) slot(label prompb.Label) *compressorCacheEntry {
++	h := uint64(14695981039346656037)
++	for i := 0; i < len(label.Name); i++ {
++		h = (h ^ uint64(label.Name[i])) * 1099511628211
++	}
++	for i := 0; i < len(label.Value); i++ {
++		h = (h ^ uint64(label.Value[i])) * 1099511628211
++	}
++	return &c.entries[h%compressorCacheSize]
++}
++
++// CompressCached works like Compress, answering from c where it can.
++func (lc *LabelsCompressor) CompressCached(dst []byte, labels []prompb.Label, c *CompressorCache) []byte {
++	if len(labels) == 0 {
++		return append(dst, 0)
++	}
++	a := encoding.GetUint64s(len(labels) + 1)
++	a.A[0] = uint64(len(labels))
++	out := a.A[1:]
++	for i, label := range labels {
++		e := c.slot(label)
++		if e.idx != 0 && e.name == label.Name && e.value == label.Value {
++			out[i] = e.idx
++			continue
++		}
++		lc.compress(out[i:i+1], labels[i:i+1])
++		idx := out[i]
++		// Keep the interned copy the shared map holds, never the caller's buffer.
++		if stored, ok := lc.idxToLabel.Load(idx); ok {
++			e.name, e.value, e.idx = stored.Name, stored.Value, idx
++		}
++	}
++	dst = encoding.MarshalVarUint64s(dst, a.A)
++	encoding.PutUint64s(a)
++	return dst
++}
+diff --git a/lib/promutil/labelscompressor_cache_test.go b/lib/promutil/labelscompressor_cache_test.go
+new file mode 100644
+index 000000000..8b7d770b1
+--- /dev/null
++++ b/lib/promutil/labelscompressor_cache_test.go
+@@ -0,0 +1,101 @@
++package promutil
++
++import (
++	"fmt"
++	"math/rand"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// CompressCached has to produce exactly what Compress produces, whether the cache
++// hits, misses or collides.
++func TestCompressCachedMatchesCompress(t *testing.T) {
++	var lc LabelsCompressor
++	var c CompressorCache
++	rnd := rand.New(rand.NewSource(7))
++
++	// More distinct labels than the cache has slots, so entries are evicted and reused.
++	//
++	// Names and values are drawn from small sets that cross over, so the same value
++	// shows up under several names: a cache that compared only the value would hand
++	// back the wrong index. The empty label is in there too, since an unused slot
++	// holds exactly that and must not be taken for a hit.
++	var pool []prompb.Label
++	pool = append(pool, prompb.Label{})
++	for i := 0; i < 4*compressorCacheSize; i++ {
++		pool = append(pool, prompb.Label{
++			Name:  fmt.Sprintf("name_%d", i%97),
++			Value: fmt.Sprintf("value_%d", i%89),
++		})
++	}
++
++	for round := 0; round < 3; round++ {
++		for i := 0; i < 20000; i++ {
++			n := rnd.Intn(9)
++			labels := make([]prompb.Label, 0, n)
++			for j := 0; j < n; j++ {
++				labels = append(labels, pool[rnd.Intn(len(pool))])
++			}
++			want := lc.Compress(nil, labels)
++			got := lc.CompressCached(nil, labels, &c)
++			if string(got) != string(want) {
++				t.Fatalf("round %d labels %v: cached %v, uncached %v", round, labels, got, want)
++			}
++			// and the result still decompresses back to the same labels
++			back := lc.Decompress(nil, got)
++			if len(back) != len(labels) {
++				t.Fatalf("decompressed %v, want %v", back, labels)
++			}
++			for j := range labels {
++				if back[j].Name != labels[j].Name || back[j].Value != labels[j].Value {
++					t.Fatalf("decompressed %v, want %v", back, labels)
++				}
++			}
++		}
++	}
++}
++
++// A cache slot is chosen by hashing name and value together, so two labels can land
++// in the same slot. When they also share a value, only the name tells them apart:
++// this builds exactly that pair and checks both still compress correctly.
++func TestCompressCachedSlotCollision(t *testing.T) {
++	const value = "shared-value"
++	var c CompressorCache
++
++	var a, b prompb.Label
++	found := false
++	for i := 0; i < 1<<20 && !found; i++ {
++		a = prompb.Label{Name: fmt.Sprintf("n%d", i), Value: value}
++		for j := i + 1; j < i+4096; j++ {
++			b = prompb.Label{Name: fmt.Sprintf("n%d", j), Value: value}
++			if c.slot(a) == c.slot(b) {
++				found = true
++				break
++			}
++		}
++	}
++	if !found {
++		t.Fatal("no colliding pair found")
++	}
++	t.Logf("colliding labels: %q and %q", a.Name, b.Name)
++
++	var lc LabelsCompressor
++	wantA := lc.Compress(nil, []prompb.Label{a})
++	wantB := lc.Compress(nil, []prompb.Label{b})
++	if string(wantA) == string(wantB) {
++		t.Fatal("two distinct labels must not compress to the same bytes")
++	}
++	// Prime the slot with a, then ask for b: the slot is taken by a label with the
++	// same value and a different name.
++	if got := lc.CompressCached(nil, []prompb.Label{a}, &c); string(got) != string(wantA) {
++		t.Fatalf("a: got %v, want %v", got, wantA)
++	}
++	if got := lc.CompressCached(nil, []prompb.Label{b}, &c); string(got) != string(wantB) {
++		t.Fatalf("b: got %v, want %v", got, wantB)
++	}
++	// and back to a, whose slot b has just taken over
++	if got := lc.CompressCached(nil, []prompb.Label{a}, &c); string(got) != string(wantA) {
++		t.Fatalf("a again: got %v, want %v", got, wantA)
++	}
++}
+diff --git a/lib/streamaggr/dedup_timing_test.go b/lib/streamaggr/dedup_timing_test.go
+index 4299daca6..3ef2f84e2 100644
+--- a/lib/streamaggr/dedup_timing_test.go
++++ b/lib/streamaggr/dedup_timing_test.go
+@@ -2,6 +2,7 @@ package streamaggr
+ 
+ import (
+ 	"fmt"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
+ 	"sync/atomic"
+ 	"testing"
+ 
+@@ -65,7 +66,7 @@ func newBenchSamples(count int) []pushSample {
+ 			Name:  "app",
+ 			Value: fmt.Sprintf("instance-%d", i),
+ 		})
+-		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:])
++		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:], &promutil.CompressorCache{})
+ 		sample.key = string(keyBuf)
+ 		sample.value = float64(i)
+ 	}
+diff --git a/lib/streamaggr/deduplicator.go b/lib/streamaggr/deduplicator.go
+index 5f7bd7f0f..70e53f904 100644
+--- a/lib/streamaggr/deduplicator.go
++++ b/lib/streamaggr/deduplicator.go
+@@ -121,7 +121,7 @@ func (d *Deduplicator) Push(tss []prompb.TimeSeries) {
+ 		labels.Sort()
+ 
+ 		bufLen := len(buf)
+-		buf = lc.Compress(buf, labels.Labels)
++		buf = lc.CompressCached(buf, labels.Labels, &ctx.lcCache)
+ 		key := bytesutil.ToUnsafeString(buf[bufLen:])
+ 		for _, s := range ts.Samples {
+ 			if d.enableWindows && minDeadline > s.Timestamp {
+@@ -247,10 +247,11 @@ func (d *Deduplicator) flush(pushFunc PushFunc) {
+ }
+ 
+ type deduplicatorPushCtx struct {
+-	blue   []pushSample
+-	green  []pushSample
+-	labels promutil.Labels
+-	buf    []byte
++	blue    []pushSample
++	green   []pushSample
++	labels  promutil.Labels
++	buf     []byte
++	lcCache promutil.CompressorCache
+ }
+ 
+ func (ctx *deduplicatorPushCtx) reset() {
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 1de84c9da..503ce916e 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -1030,7 +1030,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 		}
+ 
+ 		bufLen := len(buf)
+-		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels)
++		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache)
+ 		// key remains valid only by the end of this function and can't be reused after
+ 		// do not intern key because number of unique keys could be too high
+ 		key := bytesutil.ToUnsafeString(buf[bufLen:])
+@@ -1089,13 +1089,13 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	}
+ }
+ 
+-func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label) []byte {
++func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache) []byte {
+ 	bb := bbPool.Get()
+-	bb.B = lc.Compress(bb.B, outputLabels)
++	bb.B = lc.CompressCached(bb.B, outputLabels, c)
+ 	dst = encoding.MarshalVarUint64(dst, uint64(len(bb.B)))
+ 	dst = append(dst, bb.B...)
+ 	bbPool.Put(bb)
+-	dst = lc.Compress(dst, inputLabels)
++	dst = lc.CompressCached(dst, inputLabels, c)
+ 	return dst
+ }
+ 
+@@ -1110,6 +1110,7 @@ type pushCtx struct {
+ 	inputLabels  promutil.Labels
+ 	outputLabels promutil.Labels
+ 	buf          []byte
++	lcCache      promutil.CompressorCache
+ }
+ 
+ func (ctx *pushCtx) reset() {
+-- 
+2.50.1 (Apple Git-155)
+

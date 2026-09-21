@@ -1,0 +1,437 @@
+From 3d1541eefd935d66be9fb4e2597cd1030cd8120a Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Thu, 17 Sep 2026 06:03:23 -0700
+Subject: [PATCH 05/16] promscrape: stop decompressing the whole response
+ before stream parsing
+
+scrapeInternal decompressed the entire response into memory before
+deciding whether to stream-parse it, so stream parsing only saved the
+parsed rows while the full decompressed response stayed resident: a
+higress with 30k keys is 67 MiB compressed and 1.5 GiB decompressed, so
+three targets scraped at once start at 4.5 GiB.
+
+The full decompressed response is only needed for staleness markers and
+series_limit, both of which compare against the previous response. With
+staleness markers disabled and no series_limit configured, the compressed
+response is now handed to the stream parser directly, decompressed and
+parsed in chunks and pushed to the aggregator as it goes, with the
+response size counted while reading. Whether to stream is still decided by
+-promscrape.minResponseSizeForStreamParse; since the decompressed size is
+unknown beforehand, the previous response size and the bytes read so far
+are used instead.
+
+Stream reading treats io.ErrUnexpectedEOF as a normal end of input. Here
+the response has already been read into memory in full, so seeing it means
+the compressed data is corrupt; it is turned into an ordinary error and
+fails the scrape, as whole-response decompression does. (A truncated zstd
+frame returns io.EOF on both paths, which is existing behaviour.)
+
+Measured on a real 30k-key response, three targets scraped at once with
+the production aggregation config: vmagent peak RSS 11.6 GiB -> 4.2 GiB
+with identical sample counts, and 0.88 GiB with aggregation off. Hashing
+all 4,415,000 samples in-process gives identical results, and a single
+parse goes from 15.5s to 1.2s.
+---
+ lib/promscrape/scrapework.go             |  89 ++++++++-
+ lib/promscrape/scrapework_stream_test.go | 240 +++++++++++++++++++++++
+ 2 files changed, 324 insertions(+), 5 deletions(-)
+ create mode 100644 lib/promscrape/scrapework_stream_test.go
+
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index ac87b63dc..b6cc4cb00 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"flag"
+ 	"fmt"
++	"io"
+ 	"math"
+ 	"math/bits"
+ 	"strings"
+@@ -456,6 +457,14 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 	// without sacrificing the performance.
+ 	processScrapedDataConcurrencyLimitCh <- struct{}{}
+ 
++	if err == nil && sw.canStreamWithoutBody(cb.SizeBytes()) {
++		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
++		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)
++		chunkedbuffer.Put(cb)
++		<-processScrapedDataConcurrencyLimitCh
++		return err
++	}
++
+ 	// Copy the read scrape response to body in order to parse it and send
+ 	// the parsed results to remote storage.
+ 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
+@@ -489,6 +498,66 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 
+ var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
+ 
++// canStreamWithoutBody returns true if the read response can be decompressed and parsed in stream parsing mode
++// without copying the whole uncompressed response into memory first.
++//
++// The whole uncompressed response is needed only for stale markers and series_limit,
++// which compare it with the previous response.
++func (sw *scrapeWork) canStreamWithoutBody(readSize int) bool {
++	cfg := sw.Config
++	if !cfg.NoStaleMarkers || cfg.SeriesLimit > 0 {
++		return false
++	}
++	if *streamParse || cfg.StreamParse {
++		return true
++	}
++	if minResponseSizeForStreamParse.N <= 0 || !cfg.canSwitchToStreamParseMode() {
++		return false
++	}
++	// The uncompressed size isn't known before decompression. Use the uncompressed size of the previous response
++	// and the size of the read response, which is usually smaller than the uncompressed size.
++	n := minResponseSizeForStreamParse.IntN()
++	return sw.prevBodyLen >= n || readSize >= n
++}
++
++// processReadDataInStreamMode decompresses and parses the read response in stream parsing mode.
++//
++// Unlike processDataInStreamMode, a decompression error in the middle of the response marks the scrape as failed
++// after some samples may have been already pushed. This is the same as for parsing errors in stream parsing mode.
++func (sw *scrapeWork) processReadDataInStreamMode(scrapeTimestamp, realTimestamp int64, cb *chunkedbuffer.Buffer, contentEncoding string, scrapeDurationSeconds float64) error {
++	reader, err := protoparserutil.GetUncompressedReader(cb.NewReader(), contentEncoding)
++	if err != nil {
++		return sw.processDataOneShot(scrapeTimestamp, realTimestamp, nil, scrapeDurationSeconds, fmt.Errorf("cannot decompress response body: %w", err))
++	}
++	rr := &responseReader{r: reader, contentEncoding: contentEncoding}
++	err = sw.processStream(scrapeTimestamp, realTimestamp, rr, "", func() int { return int(rr.n) }, scrapeDurationSeconds)
++	protoparserutil.PutUncompressedReader(reader)
++
++	sw.prevBodyLen = int(rr.n)
++	scrapeResponseSize.Update(float64(rr.n))
++	return err
++}
++
++// responseReader counts the uncompressed bytes of the read response.
++//
++// It also turns io.ErrUnexpectedEOF into an ordinary error: stream parsing treats it as the end of data,
++// which suits network streams, while here the whole response has been already read, so it means broken compressed data.
++// Such a response is rejected in the same way as when it is decompressed at once.
++type responseReader struct {
++	r               io.Reader
++	n               int64
++	contentEncoding string
++}
++
++func (rr *responseReader) Read(p []byte) (int, error) {
++	n, err := rr.r.Read(p)
++	rr.n += int64(n)
++	if errors.Is(err, io.ErrUnexpectedEOF) {
++		err = fmt.Errorf("cannot read %s-compressed response body: unexpected end of compressed data", rr.contentEncoding)
++	}
++	return n, err
++}
++
+ func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, contentEncoding string) error {
+ 	if contentEncoding == "" {
+ 		src.MustWriteTo(dst)
+@@ -603,6 +672,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
+ }
+ 
+ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64) error {
++	bodyString := bytesutil.ToUnsafeString(body.B)
++	return sw.processStream(scrapeTimestamp, realTimestamp, body.NewReader(), bodyString, func() int { return len(bodyString) }, scrapeDurationSeconds)
++}
++
++// processStream parses the uncompressed response from r in stream parsing mode.
++//
++// bodyString is the whole response if it is available; it is used for stale markers and series_limit tracking.
++// responseSize returns the uncompressed response size after r is read.
++func (sw *scrapeWork) processStream(scrapeTimestamp, realTimestamp int64, r io.Reader, bodyString string, responseSize func() int, scrapeDurationSeconds float64) error {
+ 	var samplesScraped atomic.Int64
+ 	var samplesPostRelabeling atomic.Int64
+ 	var samplesDroppedTotal atomic.Int64
+@@ -614,11 +692,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+ 	bbLastScrape.B = sw.loadLastScrape(bbLastScrape.B)
+ 	lastScrapeStr := bytesutil.ToUnsafeString(bbLastScrape.B)
+ 
+-	bodyString := bytesutil.ToUnsafeString(body.B)
+ 	cfg := sw.Config
+ 	areIdenticalSeries := areIdenticalSeries(cfg, lastScrapeStr, bodyString)
+ 
+-	r := body.NewReader()
+ 	err := stream.Parse(r, scrapeTimestamp, "", false, prommetadata.IsEnabled(), func(rows []parser.Row, mms []parser.Metadata) error {
+ 		labelsLen := maxLabelsLen.Load()
+ 		wc := writeRequestCtxPool.Get(int(labelsLen))
+@@ -679,12 +755,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+ 		// This is a trade-off between performance and accuracy.
+ 		seriesAdded = getSeriesAdded(lastScrapeStr, bodyString)
+ 	}
+-	responseSize := len(bodyString)
++	size := 0
++	if up == 1 {
++		size = responseSize()
++	}
+ 
+ 	am := &autoMetrics{
+ 		up:                        up,
+ 		scrapeDurationSeconds:     scrapeDurationSeconds,
+-		scrapeResponseSize:        responseSize,
++		scrapeResponseSize:        size,
+ 		samplesScraped:            int(samplesScraped.Load()),
+ 		samplesPostRelabeling:     int(samplesPostRelabeling.Load()),
+ 		seriesAdded:               seriesAdded,
+@@ -701,7 +780,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+ 	}
+ 	leveledbytebufferpool.Put(bbLastScrape)
+ 
+-	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), responseSize, int(samplesScraped.Load()), err)
++	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), size, int(samplesScraped.Load()), err)
+ 	// Do not track active series in streaming mode, since this may need too big amounts of memory
+ 	// when the target exports too big number of metrics.
+ 	return err
+diff --git a/lib/promscrape/scrapework_stream_test.go b/lib/promscrape/scrapework_stream_test.go
+new file mode 100644
+index 000000000..6de54fa46
+--- /dev/null
++++ b/lib/promscrape/scrapework_stream_test.go
+@@ -0,0 +1,240 @@
++package promscrape
++
++import (
++	"bytes"
++	"compress/gzip"
++	"fmt"
++	"os"
++	"runtime"
++	"runtime/metrics"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/cespare/xxhash/v2"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
++)
++
++// pushSummary summarizes pushed samples as an order-independent hash, since stream parsing pushes blocks concurrently.
++type pushSummary struct {
++	mu      sync.Mutex
++	samples int
++	hashSum uint64
++	auto    map[string]float64
++}
++
++func (ps *pushSummary) push(_ *auth.Token, wr *prompb.WriteRequest) {
++	var buf []byte
++	ps.mu.Lock()
++	defer ps.mu.Unlock()
++	for _, ts := range wr.Timeseries {
++		name := ""
++		buf = buf[:0]
++		for _, l := range ts.Labels {
++			if l.Name == "__name__" {
++				name = l.Value
++			}
++			buf = append(buf, l.Name...)
++			buf = append(buf, '=')
++			buf = append(buf, l.Value...)
++			buf = append(buf, ',')
++		}
++		if name == "up" || strings.HasPrefix(name, "scrape_") {
++			ps.auto[name] = ts.Samples[0].Value
++			continue
++		}
++		for _, s := range ts.Samples {
++			b := strconv.AppendFloat(buf, s.Value, 'g', -1, 64)
++			b = strconv.AppendInt(append(b, '@'), s.Timestamp, 10)
++			ps.hashSum += xxhash.Sum64(b)
++			ps.samples++
++		}
++	}
++}
++
++func scrapeSummary(t testing.TB, compressed []byte, contentEncoding string, cfg *ScrapeWork) (*pushSummary, error) {
++	t.Helper()
++	ps := &pushSummary{auto: map[string]float64{}}
++	var sw scrapeWork
++	sw.Config = cfg
++	sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
++		dst.MustWrite(compressed)
++		return contentEncoding, nil
++	}
++	sw.PushData = ps.push
++	tsmGlobal.Register(&sw)
++	defer tsmGlobal.Unregister(&sw)
++	err := sw.scrapeInternal(123000, 123000)
++	return ps, err
++}
++
++func compressBody(t testing.TB, body []byte, contentEncoding string) []byte {
++	t.Helper()
++	switch contentEncoding {
++	case "zstd":
++		return encoding.CompressZSTDLevel(nil, body, 1)
++	case "gzip":
++		var bb bytes.Buffer
++		zw := gzip.NewWriter(&bb)
++		if _, err := zw.Write(body); err != nil {
++			t.Fatalf("cannot gzip: %s", err)
++		}
++		if err := zw.Close(); err != nil {
++			t.Fatalf("cannot gzip: %s", err)
++		}
++		return bb.Bytes()
++	default:
++		return body
++	}
++}
++
++// The path which decompresses and parses the read response block by block must push the same samples
++// as the path which copies the whole uncompressed response into memory first.
++func TestScrapeWorkStreamWithoutBody(t *testing.T) {
++	protoparserutil.StartUnmarshalWorkers()
++	defer protoparserutil.StopUnmarshalWorkers()
++
++	var sb strings.Builder
++	sb.WriteString("# HELP acg_requests_total requests\n# TYPE acg_requests_total counter\n")
++	for i := range 100_000 {
++		fmt.Fprintf(&sb, "acg_requests_total{apikey_id=\"k%d\",route=\"r%d\"} %d\n", i, i%7, i)
++	}
++	body := []byte(sb.String())
++
++	for _, enc := range []string{"", "gzip", "zstd"} {
++		compressed := compressBody(t, body, enc)
++		// The whole response is kept in memory: stale markers are enabled.
++		want, err := scrapeSummary(t, compressed, enc, &ScrapeWork{StreamParse: true, ScrapeTimeout: time.Minute})
++		if err != nil {
++			t.Fatalf("encoding %q: unexpected error: %s", enc, err)
++		}
++		for _, cfg := range []*ScrapeWork{
++			{NoStaleMarkers: true, ScrapeTimeout: time.Minute},                    // switched by response size
++			{NoStaleMarkers: true, StreamParse: true, ScrapeTimeout: time.Minute}, // forced
++		} {
++			got, err := scrapeSummary(t, compressed, enc, cfg)
++			if err != nil {
++				t.Fatalf("encoding %q: unexpected error: %s", enc, err)
++			}
++			if got.samples != 100_000 || got.samples != want.samples || got.hashSum != want.hashSum {
++				t.Fatalf("encoding %q, StreamParse=%v: pushed samples differ; got %d samples, hash %x; want %d samples, hash %x",
++					enc, cfg.StreamParse, got.samples, got.hashSum, want.samples, want.hashSum)
++			}
++			for _, name := range []string{"up", "scrape_samples_scraped", "scrape_response_size_bytes"} {
++				if got.auto[name] != want.auto[name] {
++					t.Fatalf("encoding %q, StreamParse=%v: %s = %v; want %v", enc, cfg.StreamParse, name, got.auto[name], want.auto[name])
++				}
++			}
++			if got.auto["scrape_response_size_bytes"] != float64(len(body)) {
++				t.Fatalf("encoding %q: scrape_response_size_bytes must be the uncompressed size %d; got %v", enc, len(body), got.auto["scrape_response_size_bytes"])
++			}
++		}
++	}
++}
++
++// A decompression error in the middle of the response marks the scrape as failed.
++// gzip is used, since the zstd reader returns io.EOF for a truncated frame on both paths (upstream behavior).
++func TestScrapeWorkStreamWithoutBodyBrokenData(t *testing.T) {
++	protoparserutil.StartUnmarshalWorkers()
++	defer protoparserutil.StopUnmarshalWorkers()
++
++	body := []byte(strings.Repeat("foo{bar=\"baz\"} 1\n", 100_000))
++	compressed := compressBody(t, body, "gzip")
++	compressed = compressed[:len(compressed)/2]
++	got, err := scrapeSummary(t, compressed, "gzip", &ScrapeWork{NoStaleMarkers: true, StreamParse: true, ScrapeTimeout: time.Minute})
++	if err == nil {
++		t.Fatalf("expecting an error for a truncated gzip response")
++	}
++	if got.auto["up"] != 0 || got.auto["scrape_response_size_bytes"] != 0 {
++		t.Fatalf("a failed scrape must report up=0 and zero response size; got %v", got.auto)
++	}
++}
++
++func TestScrapeWorkCanStreamWithoutBody(t *testing.T) {
++	f := func(cfg *ScrapeWork, prevBodyLen, readSize int, want bool) {
++		t.Helper()
++		sw := &scrapeWork{Config: cfg, prevBodyLen: prevBodyLen}
++		if got := sw.canStreamWithoutBody(readSize); got != want {
++			t.Fatalf("cfg %+v, prevBodyLen=%d, readSize=%d: got %v; want %v", cfg, prevBodyLen, readSize, got, want)
++		}
++	}
++	const big = 2e6
++	// stale markers and series_limit need the whole response
++	f(&ScrapeWork{StreamParse: true}, big, big, false)
++	f(&ScrapeWork{NoStaleMarkers: true, SeriesLimit: 10, StreamParse: true}, big, big, false)
++	// forced stream parsing
++	f(&ScrapeWork{NoStaleMarkers: true, StreamParse: true}, 0, 10, true)
++	// automatic switching by size
++	f(&ScrapeWork{NoStaleMarkers: true}, 0, 10, false)
++	f(&ScrapeWork{NoStaleMarkers: true}, big, 10, true)
++	f(&ScrapeWork{NoStaleMarkers: true}, 0, big, true)
++	f(&ScrapeWork{NoStaleMarkers: true, SampleLimit: 10}, big, big, false)
++}
++
++// TestScrapeWorkStreamWithoutBodyRealResponse compares both paths on a real compressed response and reports peak heap.
++// Set ACG_SCRAPE_BODY to a zstd-compressed /metrics response to run it.
++func TestScrapeWorkStreamWithoutBodyRealResponse(t *testing.T) {
++	path := os.Getenv("ACG_SCRAPE_BODY")
++	if path == "" {
++		t.Skip("ACG_SCRAPE_BODY isn't set")
++	}
++	compressed, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("cannot read %s: %s", path, err)
++	}
++	protoparserutil.StartUnmarshalWorkers()
++	defer protoparserutil.StopUnmarshalWorkers()
++
++	run := func(name string, cfg *ScrapeWork) *pushSummary {
++		runtime.GC()
++		runtime.GC()
++		base := heapBytes()
++		var peak atomic.Uint64
++		stop := make(chan struct{})
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			for {
++				if h := heapBytes(); h > peak.Load() {
++					peak.Store(h)
++				}
++				select {
++				case <-stop:
++					return
++				case <-time.After(2 * time.Millisecond):
++				}
++			}
++		}()
++		start := time.Now()
++		ps, err := scrapeSummary(t, compressed, "zstd", cfg)
++		d := time.Since(start)
++		close(stop)
++		<-done
++		if err != nil {
++			t.Fatalf("%s: unexpected error: %s", name, err)
++		}
++		t.Logf("%s: %d samples, response %.1f MiB, took %s, peak heap above baseline %.0f MiB",
++			name, ps.samples, ps.auto["scrape_response_size_bytes"]/(1<<20), d.Round(time.Millisecond), float64(peak.Load()-min(peak.Load(), base))/(1<<20))
++		return ps
++	}
++	// Run the new path first, so pools warmed up by the old path don't hide its allocations.
++	got := run("stream without body", &ScrapeWork{NoStaleMarkers: true, ScrapeTimeout: time.Minute})
++	want := run("copy whole body", &ScrapeWork{NoStaleMarkers: false, StreamParse: true, ScrapeTimeout: time.Minute})
++	if got.samples != want.samples || got.hashSum != want.hashSum || got.auto["scrape_response_size_bytes"] != want.auto["scrape_response_size_bytes"] {
++		t.Fatalf("pushed samples differ; got %d samples, hash %x; want %d samples, hash %x", got.samples, got.hashSum, want.samples, want.hashSum)
++	}
++}
++
++func heapBytes() uint64 {
++	s := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
++	metrics.Read(s)
++	return s[0].Value.Uint64()
++}
+-- 
+2.50.1 (Apple Git-155)
+

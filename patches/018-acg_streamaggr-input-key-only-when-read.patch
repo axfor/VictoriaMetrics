@@ -1,0 +1,417 @@
+From 08f4b377d894f1d3b0b0cfe79ed281382a4fc530 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 20 Sep 2026 10:41:40 -0700
+Subject: [PATCH 15/16] lib/streamaggr: build the input part of a key only when
+ an output reads it
+
+A sample's key is the output part -- what the aggregation groups by -- followed
+by the input part, the labels it groups away. The input part exists for outputs
+that keep state per input series: total, increase, rate_avg, rate_sum and
+count_series. The other eleven take the sample and nothing else; their
+pushSample signatures say so by taking the key as _.
+
+Building it anyway costs a hash and two string compares per label per sample,
+for a `without: [pod, instance, node]` rule three of about eleven labels, plus
+the length in every key the state map holds and hashes.
+
+useInputKey already existed and getInputOutputKey already handled its being
+off, but it was set from dedup alone, and compressLabels never looked at it. It
+is now narrowed to what the configured outputs answer, and compressLabels
+leaves the input part out when nothing will read it.
+
+BenchmarkAggregatorsPush/output=sum_samples_total, run on its own:
+
+  before  119.9ms/op   8.34 MB/s  13030 B/op  40 allocs/op
+  after    69.7ms/op  14.35 MB/s   6332 B/op  19 allocs/op
+
+Run on its own because this package's benchmarks share one LabelsCompressor:
+in a combined run total reported 84955 B/op against 1760197 B/op alone, warmed
+by whatever ran before it. total is unaffected by this change either way, as it
+needs the input key and keeps it.
+
+needsInputKey is on the aggrConfig interface so that a new output has to answer
+it, next to the pushSample whose signature is the answer. Getting it wrong does
+not fail: count_series would see every input as the same one and count 1. The
+tests pin each output's answer against its signature and the union rule across
+several outputs; removing one output's true makes them fail, and ten existing
+tests in this package fail with it.
+---
+ lib/streamaggr/avg.go               |  5 ++
+ lib/streamaggr/count_samples.go     |  5 ++
+ lib/streamaggr/count_series.go      |  4 ++
+ lib/streamaggr/dedup_timing_test.go |  2 +-
+ lib/streamaggr/histogram_bucket.go  |  5 ++
+ lib/streamaggr/input_key_test.go    | 81 +++++++++++++++++++++++++++++
+ lib/streamaggr/last.go              |  5 ++
+ lib/streamaggr/max.go               |  5 ++
+ lib/streamaggr/min.go               |  5 ++
+ lib/streamaggr/output.go            |  6 +++
+ lib/streamaggr/quantiles.go         |  5 ++
+ lib/streamaggr/rate.go              |  4 ++
+ lib/streamaggr/std.go               |  5 ++
+ lib/streamaggr/streamaggr.go        | 31 +++++++++--
+ lib/streamaggr/sum_samples.go       | 10 ++++
+ lib/streamaggr/total.go             |  4 ++
+ lib/streamaggr/unique_samples.go    |  5 ++
+ 17 files changed, 183 insertions(+), 4 deletions(-)
+ create mode 100644 lib/streamaggr/input_key_test.go
+
+diff --git a/lib/streamaggr/avg.go b/lib/streamaggr/avg.go
+index 28f1561b2..38130dea2 100644
+--- a/lib/streamaggr/avg.go
++++ b/lib/streamaggr/avg.go
+@@ -32,3 +32,8 @@ type avgAggrConfig struct{}
+ func (*avgAggrConfig) getValue(_ any) aggrValue {
+ 	return &avgAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*avgAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/count_samples.go b/lib/streamaggr/count_samples.go
+index da2db7126..3469c6d18 100644
+--- a/lib/streamaggr/count_samples.go
++++ b/lib/streamaggr/count_samples.go
+@@ -28,3 +28,8 @@ type countSamplesAggrConfig struct{}
+ func (*countSamplesAggrConfig) getValue(_ any) aggrValue {
+ 	return &countSamplesAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*countSamplesAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/count_series.go b/lib/streamaggr/count_series.go
+index c577be0ac..60b7fd36f 100644
+--- a/lib/streamaggr/count_series.go
++++ b/lib/streamaggr/count_series.go
+@@ -40,3 +40,7 @@ func (*countSeriesAggrConfig) getValue(_ any) aggrValue {
+ 		samples: make(map[uint64]struct{}),
+ 	}
+ }
++
++// needsInputKey reports that this output keeps state per input series, so the
++// key has to carry the labels the aggregation groups away.
++func (*countSeriesAggrConfig) needsInputKey() bool { return true }
+diff --git a/lib/streamaggr/dedup_timing_test.go b/lib/streamaggr/dedup_timing_test.go
+index 3ef2f84e2..da580671a 100644
+--- a/lib/streamaggr/dedup_timing_test.go
++++ b/lib/streamaggr/dedup_timing_test.go
+@@ -66,7 +66,7 @@ func newBenchSamples(count int) []pushSample {
+ 			Name:  "app",
+ 			Value: fmt.Sprintf("instance-%d", i),
+ 		})
+-		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:], &promutil.CompressorCache{})
++		keyBuf = compressLabels(keyBuf[:0], labels[:labelsLen], labels[labelsLen:], &promutil.CompressorCache{}, true)
+ 		sample.key = string(keyBuf)
+ 		sample.value = float64(i)
+ 	}
+diff --git a/lib/streamaggr/histogram_bucket.go b/lib/streamaggr/histogram_bucket.go
+index f1fa23669..b07b742ca 100644
+--- a/lib/streamaggr/histogram_bucket.go
++++ b/lib/streamaggr/histogram_bucket.go
+@@ -55,3 +55,8 @@ func (ac *histogramBucketAggrConfig) getValue(s any) aggrValue {
+ 		shared: shared,
+ 	}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*histogramBucketAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/input_key_test.go b/lib/streamaggr/input_key_test.go
+new file mode 100644
+index 000000000..50ac1027c
+--- /dev/null
++++ b/lib/streamaggr/input_key_test.go
+@@ -0,0 +1,81 @@
++package streamaggr
++
++import (
++	"testing"
++)
++
++// The input part of a sample's key carries the labels the aggregation groups
++// away, and it is left out when no configured output reads it. Getting that
++// wrong does not fail: an output that keeps state per input series would see
++// every input as the same one and quietly aggregate the wrong thing. So the
++// answer each output gives has to match the pushSample it is paired with --
++// the ones taking a named key parameter need it, the ones taking _ do not.
++func TestOutputsDeclareWhetherTheyNeedTheInputKey(t *testing.T) {
++	for _, tc := range []struct {
++		output string
++		want   bool
++	}{
++		{"count_series", true},
++		{"increase", true},
++		{"increase_prometheus", true},
++		{"rate_avg", true},
++		{"rate_sum", true},
++		{"total", true},
++		{"total_prometheus", true},
++
++		{"avg", false},
++		{"count_samples", false},
++		{"histogram_bucket", false},
++		{"last", false},
++		{"max", false},
++		{"min", false},
++		{"quantiles(0.5)", false},
++		{"stddev", false},
++		{"stdvar", false},
++		{"sum_samples", false},
++		{"sum_samples_total", false},
++		{"unique_samples", false},
++	} {
++		t.Run(tc.output, func(t *testing.T) {
++			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0)
++			if err != nil {
++				t.Fatalf("%s: %v", tc.output, err)
++			}
++			if got := ac.needsInputKey(); got != tc.want {
++				t.Errorf("%s needsInputKey = %v, want %v", tc.output, got, tc.want)
++			}
++		})
++	}
++}
++
++// And the aggregator has to take the union: one output that needs the input
++// key is enough to keep it for the whole rule.
++func TestInputKeyIsKeptWhenAnyOutputNeedsIt(t *testing.T) {
++	for _, tc := range []struct {
++		outputs string
++		want    bool
++	}{
++		{"[sum_samples_total]", false},
++		{"[sum_samples, last, max]", false},
++		{"[total]", true},
++		{"[sum_samples_total, count_series]", true},
++		{"[count_series, sum_samples]", true},
++	} {
++		t.Run(tc.outputs, func(t *testing.T) {
++			cfg := `
++- match: '{__name__="m"}'
++  interval: 10s
++  without: [pod]
++  outputs: ` + tc.outputs + `
++`
++			as, err := LoadFromData([]byte(cfg), nil, &Options{}, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %v", err)
++			}
++			defer as.MustStop()
++			if got := as.as[0].aggrOutputs.useInputKey; got != tc.want {
++				t.Errorf("outputs %s: useInputKey = %v, want %v", tc.outputs, got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/lib/streamaggr/last.go b/lib/streamaggr/last.go
+index 0ff0fd901..b9cd91935 100644
+--- a/lib/streamaggr/last.go
++++ b/lib/streamaggr/last.go
+@@ -32,3 +32,8 @@ type lastAggrConfig struct{}
+ func (*lastAggrConfig) getValue(_ any) aggrValue {
+ 	return &lastAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*lastAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/max.go b/lib/streamaggr/max.go
+index d8f7d6e58..3ed93a50a 100644
+--- a/lib/streamaggr/max.go
++++ b/lib/streamaggr/max.go
+@@ -35,3 +35,8 @@ type maxAggrConfig struct{}
+ func (*maxAggrConfig) getValue(_ any) aggrValue {
+ 	return &maxAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*maxAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/min.go b/lib/streamaggr/min.go
+index d2223ea24..c0b375393 100644
+--- a/lib/streamaggr/min.go
++++ b/lib/streamaggr/min.go
+@@ -35,3 +35,8 @@ type minAggrConfig struct{}
+ func (*minAggrConfig) getValue(_ any) aggrValue {
+ 	return &minAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*minAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index d004f8698..c5909b485 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -180,6 +180,12 @@ type aggrValues struct {
+ 
+ type aggrConfig interface {
+ 	getValue(any) aggrValue
++	// needsInputKey reports whether this output reads the input part of a
++	// sample's key, i.e. whether it keeps state per input series. It is on the
++	// interface so that a new output has to answer it, next to the pushSample
++	// whose signature is the answer: getting this wrong does not fail, it
++	// silently aggregates the wrong thing.
++	needsInputKey() bool
+ }
+ 
+ type aggrValue interface {
+diff --git a/lib/streamaggr/quantiles.go b/lib/streamaggr/quantiles.go
+index c351b63fc..630e1a925 100644
+--- a/lib/streamaggr/quantiles.go
++++ b/lib/streamaggr/quantiles.go
+@@ -53,3 +53,8 @@ type quantilesAggrConfig struct {
+ func (*quantilesAggrConfig) getValue(_ any) aggrValue {
+ 	return &quantilesAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*quantilesAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/rate.go b/lib/streamaggr/rate.go
+index bd471df23..c070293c0 100644
+--- a/lib/streamaggr/rate.go
++++ b/lib/streamaggr/rate.go
+@@ -198,3 +198,7 @@ func (ac *rateAggrConfig) getSuffix() string {
+ 	}
+ 	return "rate_sum"
+ }
++
++// needsInputKey reports that this output keeps state per input series, so the
++// key has to carry the labels the aggregation groups away.
++func (*rateAggrConfig) needsInputKey() bool { return true }
+diff --git a/lib/streamaggr/std.go b/lib/streamaggr/std.go
+index af259b8c0..2128494f6 100644
+--- a/lib/streamaggr/std.go
++++ b/lib/streamaggr/std.go
+@@ -61,3 +61,8 @@ type stdAggrConfig struct {
+ func (*stdAggrConfig) getValue(_ any) aggrValue {
+ 	return &stdAggrValue{}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*stdAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 503ce916e..bbe6c79d9 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -623,6 +623,23 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		}
+ 		aggrOutputs.configs[i] = ac
+ 	}
++	// Narrow useInputKey to what the configured outputs actually read. It is
++	// the labels the aggregation groups away -- pod and instance, typically --
++	// and carrying them costs a hash and two string compares per label per
++	// sample to build a key nothing looks at, plus the length in every key the
++	// state map holds. Only the outputs that keep state per input series need
++	// it; the rest take the sample and nothing else.
++	if useInputKey {
++		useInputKey = false
++		for _, ac := range aggrOutputs.configs {
++			if ac.needsInputKey() {
++				useInputKey = true
++				break
++			}
++		}
++		aggrOutputs.useInputKey = useInputKey
++	}
++
+ 	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
+ 		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total`, `total_prometheus` or `sum_samples_total` output")
+ 	}
+@@ -997,6 +1014,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	deleteDeadlineMsec := deleteDeadline.UnixMilli()
+ 
+ 	minDeadline := a.minDeadline.Load()
++	useInputKey := a.aggrOutputs.useInputKey
+ 	dropLabels := a.dropInputLabels
+ 	ignoreOldSamples := a.ignoreOldSamples
+ 	enableWindows := a.enableWindows
+@@ -1030,7 +1048,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 		}
+ 
+ 		bufLen := len(buf)
+-		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache)
++		buf = compressLabels(buf, inputLabels.Labels, outputLabels.Labels, &ctx.lcCache, useInputKey)
+ 		// key remains valid only by the end of this function and can't be reused after
+ 		// do not intern key because number of unique keys could be too high
+ 		key := bytesutil.ToUnsafeString(buf[bufLen:])
+@@ -1089,13 +1107,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	}
+ }
+ 
+-func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache) []byte {
++// compressLabels builds a sample's key: the length of the output part, the
++// output part, and -- only when some configured output keeps state per input
++// series -- the input part. Compressing the input part costs a hash and two
++// string compares per label per sample, so it is left out when nothing will
++// read it. See aggrConfig.needsInputKey.
++func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label, c *promutil.CompressorCache, useInputKey bool) []byte {
+ 	bb := bbPool.Get()
+ 	bb.B = lc.CompressCached(bb.B, outputLabels, c)
+ 	dst = encoding.MarshalVarUint64(dst, uint64(len(bb.B)))
+ 	dst = append(dst, bb.B...)
+ 	bbPool.Put(bb)
+-	dst = lc.CompressCached(dst, inputLabels, c)
++	if useInputKey {
++		dst = lc.CompressCached(dst, inputLabels, c)
++	}
+ 	return dst
+ }
+ 
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index e65fb963f..ec583f88f 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -79,3 +79,13 @@ func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+ 	}
+ 	return &sumSamplesTotalAggrValue{shared: shared}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*sumSamplesAggrConfig) needsInputKey() bool { return false }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*sumSamplesTotalAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/total.go b/lib/streamaggr/total.go
+index f1afc9f65..20a384b1f 100644
+--- a/lib/streamaggr/total.go
++++ b/lib/streamaggr/total.go
+@@ -121,3 +121,7 @@ func (ac *totalAggrConfig) getSuffix() string {
+ 	}
+ 	return "total_prometheus"
+ }
++
++// needsInputKey reports that this output keeps state per input series, so the
++// key has to carry the labels the aggregation groups away.
++func (*totalAggrConfig) needsInputKey() bool { return true }
+diff --git a/lib/streamaggr/unique_samples.go b/lib/streamaggr/unique_samples.go
+index 362162e9a..5c27a6d8c 100644
+--- a/lib/streamaggr/unique_samples.go
++++ b/lib/streamaggr/unique_samples.go
+@@ -32,3 +32,8 @@ func (*uniqueSamplesAggrConfig) getValue(_ any) aggrValue {
+ 		samples: make(map[float64]struct{}),
+ 	}
+ }
++
++// needsInputKey reports that this output looks only at the sample, so the key
++// need not carry the labels the aggregation groups away -- compressing them
++// costs a hash and two string compares per label per sample, for nothing.
++func (*uniqueSamplesAggrConfig) needsInputKey() bool { return false }
+-- 
+2.50.1 (Apple Git-155)
+

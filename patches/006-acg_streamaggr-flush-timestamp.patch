@@ -1,0 +1,159 @@
+From a6d8a942cff22e7fe946f998c10669b8fca222aa Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Thu, 17 Sep 2026 04:27:53 -0700
+Subject: [PATCH 03/16] streamaggr: stop reusing the same flush timestamp
+
+runFlusher only advanced flushTime when time.Now() was strictly after it.
+When the ticker landed exactly on an alignment boundary, which in real
+time means slightly before it, flushTime stayed put and the next flush
+reused the same timestamp. Without deduplication, VM sees the two values
+in the wrong order, reads it as a counter reset and overcounts; with
+deduplication on, the larger value wins for a given timestamp, so a zero
+emitted for a reset is dropped if it collides with the next flush.
+flushTime now advances by at least one interval after a flush.
+
+This has nothing to do with scrape phase, so staggering scrape_offset does
+not avoid it.
+
+Also adds tests recording what happens across a scrape outage longer than
+staleness_interval: once the aggregator has forgotten an input, it counts
+the whole cumulative value present at recovery. With every pod out, the
+emitted zero causes double counting; with a single pod out, it is counted
+twice whether or not the zero is emitted. All three cases add up correctly
+when the target reports only the never-delivered increment under a new
+series after a long gap, which is what the ACG sidecar's RebaseAfterGap
+does.
+---
+ lib/streamaggr/outage_test.go | 105 ++++++++++++++++++++++++++++++++++
+ lib/streamaggr/streamaggr.go  |   3 +
+ 2 files changed, 108 insertions(+)
+ create mode 100644 lib/streamaggr/outage_test.go
+
+diff --git a/lib/streamaggr/outage_test.go b/lib/streamaggr/outage_test.go
+new file mode 100644
+index 000000000..df96d560f
+--- /dev/null
++++ b/lib/streamaggr/outage_test.go
+@@ -0,0 +1,105 @@
++package streamaggr
++
++import (
++	"fmt"
++	"testing"
++	"time"
++)
++
++// increasePure mimics VM increase_pure over the whole output series: a drop is treated as a counter reset
++// and the new value is counted in full.
++func increasePure(samples []markerSample) float64 {
++	var sum, prev float64
++	for _, s := range samples {
++		if s.value >= prev {
++			sum += s.value - prev
++		} else {
++			sum += s.value
++		}
++		prev = s.value
++	}
++	return sum
++}
++
++// Where reset_marker_on_stale is right and where it isn't.
++//
++// The aggregator forgets an input series after staleness_interval without samples and then counts the first sample
++// of a returning series in full. That is correct only if the scrape target also dropped the counter and restarted it from zero.
++// If the target kept the counter and only the scrapes failed, the part counted before the gap is counted again.
++func TestResetMarkerOnStaleScrapeOutage(t *testing.T) {
++	every := func(from, to time.Duration, pod string, start float64) []pushAt {
++		var ps []pushAt
++		v := start
++		for at := from; at <= to; at += time.Minute {
++			ps = append(ps, pushAt{at, fmt.Sprintf(`foo{pod=%q} %v`, pod, v)})
++			v++
++		}
++		return ps
++	}
++	cases := []struct {
++		name   string
++		pushes []pushAt
++		real   float64
++		// what increase_pure over the output gives without and with the marker
++		want [2]float64
++	}{
++		// The target deleted the idle counter and recreated it from zero; 60 + 60 requests.
++		{"recreated from zero", []pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a"} 60`}}, 120, [2]float64{60, 120}},
++		// All scrapes failed for 10 minutes while the target kept counting: 60 before, 100 after, 100 requests in total.
++		// Known limitation: with the marker the 60 counted before the gap is counted again.
++		{"all pods scrape outage", []pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a"} 100`}}, 100, [2]float64{100, 160}},
++		// Same, but only pod a was unreachable; pod b kept reporting 1, 2, ... 12 every minute, so the output never expired.
++		{"one pod scrape outage", append([]pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a"} 100`}},
++			every(0, 11*time.Minute, "b", 1)...), 100 + 12, [2]float64{172, 172}}, // counted again with or without the marker
++		// The same outages when the target handles them (ACG sidecar RebaseAfterGap): after a long gap it reports only
++		// the increase that was never delivered, as a new series (another gen; a different pod value stands in for it here).
++		// All pods, 60 before and 70 new ones after: the marker is still needed, since 70 >= 60.
++		{"all pods outage, rebased", []pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a-gen2"} 70`}}, 130, [2]float64{70, 130}},
++		{"one pod outage, rebased", append([]pushAt{{0, `foo{pod="a"} 60`}, {10 * time.Minute, `foo{pod="a-gen2"} 40`}},
++			every(0, 11*time.Minute, "b", 1)...), 100 + 12, [2]float64{112, 112}},
++		// Rebased although the aggregator still remembers the old series: the old one just stops, nothing is counted twice.
++		{"short outage, rebased", []pushAt{{0, `foo{pod="a"} 60`}, {90 * time.Second, `foo{pod="a-gen2"} 40`}}, 100, [2]float64{100, 100}},
++		// Gap shorter than staleness_interval: nothing is forgotten.
++		{"short scrape outage", []pushAt{{0, `foo{pod="a"} 60`}, {90 * time.Second, `foo{pod="a"} 100`}}, 100, [2]float64{100, 100}},
++	}
++	for _, c := range cases {
++		for i, marker := range []bool{false, true} {
++			out := runStaleScenario(t, markerConfig("[total]", true, marker), sortPushes(c.pushes), 20*time.Minute, 18*time.Minute)["foo"]
++			if got := increasePure(out); got != c.want[i] {
++				t.Fatalf("%s, marker=%v: real %v; want increase %v; got %v from %v", c.name, marker, c.real, c.want[i], got, collapse(out))
++			}
++		}
++	}
++}
++
++func sortPushes(ps []pushAt) []pushAt {
++	out := append([]pushAt(nil), ps...)
++	for i := 1; i < len(out); i++ {
++		for j := i; j > 0 && out[j].at < out[j-1].at; j-- {
++			out[j], out[j-1] = out[j-1], out[j]
++		}
++	}
++	return out
++}
++
++// The flusher advances the flush timestamp only while time.Now() is strictly after it.
++// A tick landing exactly on (or, with real clocks, slightly before) the aligned boundary leaves it in place,
++// so the next flush reuses the same timestamp. The scrape phase doesn't take part in this.
++func TestFlushTimestampOnBoundary(t *testing.T) {
++	for _, offset := range []time.Duration{0, 30 * time.Second} {
++		var pushes []pushAt
++		for i := 0; i < 10; i++ {
++			pushes = append(pushes, pushAt{time.Duration(i)*time.Minute + offset, fmt.Sprintf(`foo{pod="a"} %d`, (i+1)*10)})
++		}
++		out := runStaleScenario(t, markerConfig("[total]", true, false), pushes, 12*time.Minute, 11*time.Minute)["foo"]
++		var dups []string
++		for i := 1; i < len(out); i++ {
++			if out[i].at == out[i-1].at {
++				dups = append(dups, fmt.Sprintf("%v: %v,%v", out[i].at, out[i-1].value, out[i].value))
++			}
++		}
++		if len(dups) > 0 {
++			t.Fatalf("scrape offset %v: flush timestamps must not repeat; duplicated %v", offset, dups)
++		}
++	}
++}
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index d021fd0b7..bfa4aed72 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -864,6 +864,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+ 			} else {
+ 				a.flush(pf, flushTime, cs, false)
+ 			}
++			// Always move past the timestamp just used: a tick landing on or slightly before the boundary
++			// would otherwise leave flushTime in place, and the next flush would reuse the same timestamp.
++			flushTime = flushTime.Add(a.interval)
+ 			for time.Now().After(flushTime) {
+ 				flushTime = flushTime.Add(a.interval)
+ 			}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,110 @@
+From d2a3202b1a622a923e41ebafbf8c1e3d909809e2 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sat, 19 Sep 2026 04:03:59 -0700
+Subject: [PATCH 09/16] promutil: sort labels without going through
+ sort.Interface
+
+Sorting the labels of every sample is a large share of the stream
+aggregation push path: sort.insertionSort was around a quarter of the
+profile, and every comparison and swap there is an interface call.
+
+Label sets are short, a handful of labels, and usually close to sorted,
+which is what insertion sort is good at. Doing it straight on the slice
+costs no interface call per comparison and no separate sort.IsSorted pass
+to decide whether to sort at all. It is also stable, where sort.Sort was
+not, so the result is defined when two labels share a name.
+
+Measured on BenchmarkAggregatorsPush/output=total, alternating the two
+versions in one tree over five rounds and taking the median:
+
+  before  212.2 ms/op   [205.1, 211.9, 212.2, 225.7, 243.2]
+  after   176.4 ms/op   [164.6, 175.7, 176.4, 177.5, 203.5]
+
+which is 17% off the whole push path.
+
+slices.SortFunc was tried first and came out 12% slower than the original:
+pdqsort carries more setup than an insertion sort earns back on eight
+elements, and it needs the IsSorted pass as well.
+
+TestLabelsSortMatchesSortSlice compares the result against sorting by name
+over two thousand random label sets, including repeated names. Reversing
+the comparison and dropping the last element both fail it.
+---
+ lib/promutil/labels.go           | 15 +++++++++++--
+ lib/promutil/labels_sort_test.go | 38 ++++++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+ create mode 100644 lib/promutil/labels_sort_test.go
+
+diff --git a/lib/promutil/labels.go b/lib/promutil/labels.go
+index 411e46715..cbc35f6f4 100644
+--- a/lib/promutil/labels.go
++++ b/lib/promutil/labels.go
+@@ -132,8 +132,19 @@ func (x *Labels) Clone() *Labels {
+ 
+ // Sort sorts x labels in alphabetical order of their names.
+ func (x *Labels) Sort() {
+-	if !sort.IsSorted(x) {
+-		sort.Sort(x)
++	labels := x.Labels
++	// Label sets are short and usually already sorted, and this sits on the
++	// stream aggregation push path, once per sample. An insertion sort straight
++	// on the slice pays no interface call per comparison and no second pass to
++	// check whether it is sorted at all.
++	for i := 1; i < len(labels); i++ {
++		l := labels[i]
++		j := i - 1
++		for j >= 0 && labels[j].Name > l.Name {
++			labels[j+1] = labels[j]
++			j--
++		}
++		labels[j+1] = l
+ 	}
+ }
+ 
+diff --git a/lib/promutil/labels_sort_test.go b/lib/promutil/labels_sort_test.go
+new file mode 100644
+index 000000000..599f11170
+--- /dev/null
++++ b/lib/promutil/labels_sort_test.go
+@@ -0,0 +1,38 @@
++package promutil
++
++import (
++	"math/rand"
++	"sort"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// Sort has to order labels exactly as sorting by name does, including when names repeat.
++func TestLabelsSortMatchesSortSlice(t *testing.T) {
++	rnd := rand.New(rand.NewSource(1))
++	names := []string{"a", "b", "c", "instance", "job", "pod", "__name__", "a"}
++	for i := 0; i < 2000; i++ {
++		n := rnd.Intn(len(names) + 1)
++		labels := make([]prompb.Label, 0, n)
++		for j := 0; j < n; j++ {
++			labels = append(labels, prompb.Label{
++				Name:  names[rnd.Intn(len(names))],
++				Value: string(rune('A' + rnd.Intn(4))),
++			})
++		}
++		want := append([]prompb.Label{}, labels...)
++		sort.SliceStable(want, func(i, j int) bool { return want[i].Name < want[j].Name })
++
++		x := &Labels{Labels: append([]prompb.Label{}, labels...)}
++		x.Sort()
++		if len(x.Labels) != len(want) {
++			t.Fatalf("length changed: got %d, want %d", len(x.Labels), len(want))
++		}
++		for j := range want {
++			if x.Labels[j] != want[j] {
++				t.Fatalf("input %v: got %v, want %v", labels, x.Labels, want)
++			}
++		}
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

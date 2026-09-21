@@ -1,0 +1,66 @@
+From b1b1cb641d805e3ac7b651cf355d5f4b4331b8d0 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sat, 19 Sep 2026 17:45:41 -0700
+Subject: [PATCH 12/16] lib/storage: make TestStorageDeletePendingSeries
+ independent of the time zone
+
+The test walks ten months from the epoch, and reads back the per-day index
+entry at each one. It derives those months from time.Unix(0, 0) in local
+time, steps forward a month at a time when writing rows, and backwards a
+month at a time when rewriting them after the delete.
+
+West of UTC the epoch is the 31st of December, and AddDate normalizes the
+31st of February to the 3rd of March, so the forward walk drifts -- Jan 1,
+Feb 1, Mar 4, Apr 4, May 3 -- while the backward walk, starting from a
+single nine-month jump, does not. The two land on different days, so the
+rows go into per-day index entries the assertions never look at, and only
+the first month, where the two agree, comes back:
+
+  unexpected labels count; got 1; want 10
+
+In UTC the epoch is the 1st, no normalization happens, and both walks
+agree, which is why CI does not see this.
+
+  before  UTC ok, Europe/Berlin ok, Asia/Shanghai ok, America/Los_Angeles FAIL
+  after   all four ok, and Pacific/Honolulu at UTC-10 as well
+
+Reverting either .UTC() alone brings the failure back, at 7 of 10 and 2 of
+10 months respectively, so both are doing work.
+
+The storage itself is not involved: the same failure reproduces on a
+pristine v1.126.0 worktree, and on v1.127.0, v1.128.0, v1.129.0 and
+v1.129.1.
+---
+ lib/storage/storage_test.go | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/lib/storage/storage_test.go b/lib/storage/storage_test.go
+index 52de8323e..217183937 100644
+--- a/lib/storage/storage_test.go
++++ b/lib/storage/storage_test.go
+@@ -740,7 +740,7 @@ func TestStorageDeletePendingSeries(t *testing.T) {
+ 	assertCountMonthsWithLabels := func(count int) {
+ 		t.Helper()
+ 
+-		ts := time.Unix(0, 0)
++		ts := time.Unix(0, 0).UTC()
+ 		n := 0
+ 		for range numMonths {
+ 			lns, err := s.SearchLabelNames(nil, 0, 0, nil, TimeRange{ts.UnixMilli(), ts.UnixMilli()}, 1e5, 1e9, noDeadline)
+@@ -783,7 +783,12 @@ func TestStorageDeletePendingSeries(t *testing.T) {
+ 	// Verify no metrics exist
+ 	assertCountRows(0)
+ 
+-	start := time.Unix(0, 0)
++	// UTC, so that the epoch is the 1st of a month. West of UTC it is the 31st,
++	// and AddDate normalizes the 31st of February to the 3rd of March, which
++	// makes stepping forward a month at a time and stepping back a month at a
++	// time land on different days -- and so in different per-day index entries,
++	// which is what this test reads back.
++	start := time.Unix(0, 0).UTC()
+ 	middle := start.AddDate(0, (numMonths-1)/2, 0)
+ 	end := start.AddDate(0, numMonths-1, 0)
+ 
+-- 
+2.50.1 (Apple Git-155)
+

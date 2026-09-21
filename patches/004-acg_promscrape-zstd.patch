@@ -1,0 +1,389 @@
+From 6c0624cb4d85c364c9de388fc3da2357ebba8c0e Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Wed, 16 Sep 2026 22:21:57 -0700
+Subject: [PATCH 01/16] promscrape: support zstd-compressed scrape responses
+
+Adds -promscrape.zstdCompression, off by default. With it on, the request
+carries Accept-Encoding: zstd, gzip; a target answering with zstd is
+decompressed as zstd, and gzip or no compression behaves as upstream does.
+
+ReadData returns the response's Content-Encoding ("gzip" / "zstd" / "")
+instead of an isGzipped bool, and readFromBuffer picks the decompressor
+from it.
+---
+ lib/promscrape/client.go                 |  35 +++++---
+ lib/promscrape/client_test.go            |   6 +-
+ lib/promscrape/client_zstd_test.go       | 108 +++++++++++++++++++++++
+ lib/promscrape/scrapework.go             |  20 +++--
+ lib/promscrape/scrapework_test.go        |  12 +--
+ lib/promscrape/scrapework_timing_test.go |   4 +-
+ 6 files changed, 154 insertions(+), 31 deletions(-)
+ create mode 100644 lib/promscrape/client_zstd_test.go
+
+diff --git a/lib/promscrape/client.go b/lib/promscrape/client.go
+index 8b34adf1d..fdd47767e 100644
+--- a/lib/promscrape/client.go
++++ b/lib/promscrape/client.go
+@@ -23,6 +23,9 @@ var (
+ 	disableCompression     = flag.Bool("promscrape.disableCompression", false, "Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. "+
+ 		"This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. "+
+ 		"It is possible to set 'disable_compression: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control")
++	zstdCompression = flag.Bool("promscrape.zstdCompression", false, "Whether to send 'Accept-Encoding: zstd, gzip' instead of 'Accept-Encoding: gzip' to all the scrape targets. "+
++		"zstd usually needs less CPU on scrape targets than gzip for the same or better compression ratio. "+
++		"Targets without zstd support may keep responding with gzip. This flag has no effect for targets with disabled compression")
+ 	disableKeepAlive = flag.Bool("promscrape.disableKeepAlive", false, "Whether to disable HTTP keep-alive connections when scraping all the targets. "+
+ 		"This may be useful when targets has no support for HTTP keep-alive connection. "+
+ 		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control. "+
+@@ -115,14 +118,14 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
+ 	return c, nil
+ }
+ 
+-func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
++func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ 	deadline := time.Now().Add(c.c.Timeout)
+ 	ctx, cancel := context.WithDeadline(c.ctx, deadline)
+ 	defer cancel()
+ 
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
+ 	if err != nil {
+-		return false, fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
+ 	}
+ 	// The following `Accept` header has been copied from Prometheus sources.
+ 	// See https://github.com/prometheus/prometheus/blob/f9d21f10ecd2a343a381044f131ea4e46381ce09/scrape/scrape.go#L532 .
+@@ -135,13 +138,17 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
+ 	req.Header.Set("User-Agent", "vm_promscrape")
+ 	if err := c.setHeaders(req); err != nil {
+-		return false, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+ 	}
+ 	if err := c.setProxyHeaders(req); err != nil {
+-		return false, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+ 	}
+ 	if !c.disableCompression {
+-		req.Header.Set("Accept-Encoding", "gzip")
++		if *zstdCompression {
++			req.Header.Set("Accept-Encoding", "zstd, gzip")
++		} else {
++			req.Header.Set("Accept-Encoding", "gzip")
++		}
+ 	}
+ 
+ 	scrapeRequests.Inc()
+@@ -150,7 +157,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+ 			scrapesTimedout.Inc()
+ 		}
+-		return false, fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
+ 	}
+ 	defer resp.Body.Close()
+ 
+@@ -160,7 +167,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 		if err != nil {
+ 			respBody = []byte(err.Error())
+ 		}
+-		return false, fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
++		return "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
+ 			c.scrapeURL, resp.StatusCode, http.StatusOK, respBody)
+ 	}
+ 	scrapesOK.Inc()
+@@ -172,17 +179,23 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+ 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+ 			scrapesTimedout.Inc()
+ 		}
+-		return false, fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
++		return "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
+ 	}
+ 	if int64(dst.Len()) >= c.maxScrapeSize {
+ 		maxScrapeSizeExceeded.Inc()
+-		return false, fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
++		return "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
+ 			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
+ 			"increase max_scrape_size value in scrape config for the given target", c.scrapeURL, c.maxScrapeSize)
+ 	}
+ 
+-	isGzipped := resp.Header.Get("Content-Encoding") == "gzip"
+-	return isGzipped, nil
++	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
++	// Any other Content-Encoding is treated as uncompressed data, like before.
++	switch ce := resp.Header.Get("Content-Encoding"); ce {
++	case "gzip", "zstd":
++		return ce, nil
++	default:
++		return "", nil
++	}
+ }
+ 
+ var (
+diff --git a/lib/promscrape/client_test.go b/lib/promscrape/client_test.go
+index b4275c0e7..5ee4884be 100644
+--- a/lib/promscrape/client_test.go
++++ b/lib/promscrape/client_test.go
+@@ -160,12 +160,12 @@ func TestClientProxyReadOk(t *testing.T) {
+ 		}
+ 
+ 		var cb chunkedbuffer.Buffer
+-		isGzipped, err := c.ReadData(&cb)
++		contentEncoding, err := c.ReadData(&cb)
+ 		if err != nil {
+ 			t.Fatalf("unexpected error at ReadData: %s", err)
+ 		}
+-		if isGzipped {
+-			t.Fatalf("the response mustn't be gzipped")
++		if contentEncoding != "" {
++			t.Fatalf("the response mustn't be compressed; got Content-Encoding %q", contentEncoding)
+ 		}
+ 		got, err := io.ReadAll(cb.NewReader())
+ 		if err != nil {
+diff --git a/lib/promscrape/client_zstd_test.go b/lib/promscrape/client_zstd_test.go
+new file mode 100644
+index 000000000..6266f9c37
+--- /dev/null
++++ b/lib/promscrape/client_zstd_test.go
+@@ -0,0 +1,108 @@
++package promscrape
++
++import (
++	"compress/gzip"
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/klauspost/compress/zstd"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
++)
++
++// testScrapeBody returns a few MiB of exposition-format text, so zstd and gzip produce multi-block streams.
++func testScrapeBody() string {
++	var sb strings.Builder
++	for i := 0; i < 60000; i++ {
++		fmt.Fprintf(&sb, `acg_requests_total{apikey_id="key-%08d-aaaa-bbbb-cccc",route_model_id="route-%d",business_group_id="bg-%d"} %d`+"\n", i, i%5, i%50, i*7)
++	}
++	return sb.String()
++}
++
++func TestClientReadDataContentEncoding(t *testing.T) {
++	body := testScrapeBody()
++
++	f := func(zstdEnabled bool, respEncoding, wantAcceptEncoding, wantContentEncoding string) {
++		t.Helper()
++
++		origZstd := *zstdCompression
++		*zstdCompression = zstdEnabled
++		defer func() {
++			*zstdCompression = origZstd
++		}()
++
++		var gotAcceptEncoding string
++		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			gotAcceptEncoding = r.Header.Get("Accept-Encoding")
++			if respEncoding != "" {
++				w.Header().Set("Content-Encoding", respEncoding)
++			}
++			switch respEncoding {
++			case "zstd":
++				// The same streaming encoder the scrape targets use.
++				zw, err := zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedFastest))
++				if err != nil {
++					panic(err)
++				}
++				_, _ = zw.Write([]byte(body))
++				_ = zw.Close()
++			case "gzip":
++				zw := gzip.NewWriter(w)
++				_, _ = zw.Write([]byte(body))
++				_ = zw.Close()
++			default:
++				_, _ = w.Write([]byte(body))
++			}
++		}))
++		defer backend.Close()
++
++		c, err := newClient(context.Background(), &ScrapeWork{
++			ScrapeURL:     backend.URL,
++			ScrapeTimeout: 5 * time.Second,
++			AuthConfig:    newTestAuthConfig(t, false, nil),
++			MaxScrapeSize: 64 << 20,
++		})
++		if err != nil {
++			t.Fatalf("cannot create client: %s", err)
++		}
++
++		var cb chunkedbuffer.Buffer
++		contentEncoding, err := c.ReadData(&cb)
++		if err != nil {
++			t.Fatalf("unexpected error at ReadData: %s", err)
++		}
++		if gotAcceptEncoding != wantAcceptEncoding {
++			t.Fatalf("unexpected Accept-Encoding; got %q; want %q", gotAcceptEncoding, wantAcceptEncoding)
++		}
++		if contentEncoding != wantContentEncoding {
++			t.Fatalf("unexpected content encoding; got %q; want %q", contentEncoding, wantContentEncoding)
++		}
++
++		var bb bytesutil.ByteBuffer
++		if err := readFromBuffer(&bb, &cb, contentEncoding); err != nil {
++			t.Fatalf("cannot read response body: %s", err)
++		}
++		if string(bb.B) != body {
++			t.Fatalf("unexpected response body; got %d bytes; want %d bytes", len(bb.B), len(body))
++		}
++	}
++
++	// zstd is disabled by default: the request and the response handling stay as in upstream.
++	f(false, "gzip", "gzip", "gzip")
++	f(false, "", "gzip", "")
++
++	// zstd is enabled and the target supports it.
++	f(true, "zstd", "zstd, gzip", "zstd")
++
++	// zstd is enabled, but the target supports only gzip.
++	f(true, "gzip", "zstd, gzip", "gzip")
++
++	// zstd is enabled, but the target doesn't compress responses.
++	f(true, "", "zstd, gzip", "")
++}
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index 083b59f70..ac87b63dc 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -196,7 +196,9 @@ type scrapeWork struct {
+ 	Config *ScrapeWork
+ 
+ 	// ReadData is called for reading the scrape response data into dst.
+-	ReadData func(dst *chunkedbuffer.Buffer) (bool, error)
++	//
++	// It returns the Content-Encoding of the read data: "gzip", "zstd" or "" for uncompressed data.
++	ReadData func(dst *chunkedbuffer.Buffer) (string, error)
+ 
+ 	// PushData is called for pushing collected data.
+ 	//
+@@ -424,13 +426,13 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+ 	cb := chunkedbuffer.Get()
+ 	defer chunkedbuffer.Put(cb)
+ 
+-	isGzipped, err := sw.ReadData(cb)
++	contentEncoding, err := sw.ReadData(cb)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	var bb bytesutil.ByteBuffer
+-	err = readFromBuffer(&bb, cb, isGzipped)
++	err = readFromBuffer(&bb, cb, contentEncoding)
+ 	return bb.B, err
+ }
+ 
+@@ -441,7 +443,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 	// This also allows measuring the real scrape duration, which doesn't include
+ 	// the time needed for processing of the read response.
+ 	cb := chunkedbuffer.Get()
+-	isGzipped, err := sw.ReadData(cb)
++	contentEncoding, err := sw.ReadData(cb)
+ 
+ 	// Measure scrape duration.
+ 	endTimestamp := time.Now().UnixMilli()
+@@ -458,7 +460,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 	// the parsed results to remote storage.
+ 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
+ 	if err == nil {
+-		err = readFromBuffer(body, cb, isGzipped)
++		err = readFromBuffer(body, cb, contentEncoding)
+ 	}
+ 	chunkedbuffer.Put(cb)
+ 
+@@ -487,20 +489,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+ 
+ var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
+ 
+-func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, isGzipped bool) error {
+-	if !isGzipped {
++func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, contentEncoding string) error {
++	if contentEncoding == "" {
+ 		src.MustWriteTo(dst)
+ 		return nil
+ 	}
+ 
+-	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), "gzip")
++	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), contentEncoding)
+ 	if err != nil {
+ 		return fmt.Errorf("cannot decompress response body: %w", err)
+ 	}
+ 	_, err = dst.ReadFrom(reader)
+ 	protoparserutil.PutUncompressedReader(reader)
+ 	if err != nil {
+-		return fmt.Errorf("cannot read gzipped response body: %w", err)
++		return fmt.Errorf("cannot read %s-compressed response body: %w", contentEncoding, err)
+ 	}
+ 	return nil
+ }
+diff --git a/lib/promscrape/scrapework_test.go b/lib/promscrape/scrapework_test.go
+index dedb92385..bfdcd525f 100644
+--- a/lib/promscrape/scrapework_test.go
++++ b/lib/promscrape/scrapework_test.go
+@@ -95,9 +95,9 @@ func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
+ 	}
+ 
+ 	readDataCalls := 0
+-	sw.ReadData = func(_ *chunkedbuffer.Buffer) (bool, error) {
++	sw.ReadData = func(_ *chunkedbuffer.Buffer) (string, error) {
+ 		readDataCalls++
+-		return false, fmt.Errorf("error when reading data")
++		return "", fmt.Errorf("error when reading data")
+ 	}
+ 
+ 	pushDataCalls := 0
+@@ -158,10 +158,10 @@ func testScrapeWorkScrapeInternalSuccess(t *testing.T, streamParse bool) {
+ 		sw.Config = cfg
+ 
+ 		readDataCalls := 0
+-		sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
++		sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
+ 			readDataCalls++
+ 			dst.MustWrite([]byte(data))
+-			return false, nil
++			return "", nil
+ 		}
+ 
+ 		var pushDataMu sync.Mutex
+@@ -610,10 +610,10 @@ func TestScrapeWorkScrapeInternalStreamConcurrency(t *testing.T) {
+ 		sw.Config = cfg
+ 
+ 		readDataCalls := 0
+-		sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
++		sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
+ 			readDataCalls++
+ 			dst.MustWrite([]byte(data))
+-			return false, nil
++			return "", nil
+ 		}
+ 
+ 		var pushDataCalls atomic.Int64
+diff --git a/lib/promscrape/scrapework_timing_test.go b/lib/promscrape/scrapework_timing_test.go
+index fa0454b52..d8177b414 100644
+--- a/lib/promscrape/scrapework_timing_test.go
++++ b/lib/promscrape/scrapework_timing_test.go
+@@ -205,9 +205,9 @@ func benchmarkScrapeWorkScrapeInternal(b *testing.B, data []byte, streamParse bo
+ 	protoparserutil.StartUnmarshalWorkers()
+ 	defer protoparserutil.StopUnmarshalWorkers()
+ 
+-	readData := func(dst *chunkedbuffer.Buffer) (bool, error) {
++	readData := func(dst *chunkedbuffer.Buffer) (string, error) {
+ 		dst.MustWrite(data)
+-		return false, nil
++		return "", nil
+ 	}
+ 
+ 	b.ReportAllocs()
+-- 
+2.50.1 (Apple Git-155)
+

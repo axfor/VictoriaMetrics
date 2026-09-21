@@ -1,0 +1,196 @@
+From 43cb35671b75b86e23aa6e8b3300e93d39fe2d2d Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sat, 19 Sep 2026 03:28:32 -0700
+Subject: [PATCH 08/16] docs, streamaggr: document sum_samples_total and
+ reset_marker_on_stale
+
+Both were wired through the code but appeared nowhere in the docs, so
+anyone writing an aggregation config from the documentation had no way to
+know they exist.
+
+Adds the output section for sum_samples_total, saying what it is for
+(inputs that already are increments), how it differs from total (no state
+per input series, so memory does not follow the number of inputs merged
+into one output, and no baseline sample to drop after a restart) and that
+it wants reset_marker_on_stale alongside. Adds reset_marker_on_stale to
+the aggregation config options, saying which outputs it applies to and
+what goes wrong without it.
+
+Also adds sum_samples_total to the outputs BenchmarkAggregatorsPush
+covers, so it has the same regression guard as the rest. On that
+benchmark it is about 3% faster than total and allocates half as much
+(34 vs 71 allocations per operation at a settled benchtime).
+---
+ .../stream-aggregation/README.md              |  4 +
+ .../stream-aggregation/configuration.md       | 33 ++++++++
+ lib/streamaggr/restart_collision_test.go      | 79 +++++++++++++++++++
+ lib/streamaggr/streamaggr_timing_test.go      |  1 +
+ 4 files changed, 117 insertions(+)
+ create mode 100644 lib/streamaggr/restart_collision_test.go
+
+diff --git a/docs/victoriametrics/stream-aggregation/README.md b/docs/victoriametrics/stream-aggregation/README.md
+index 9fc70b8fb..39f123cd5 100644
+--- a/docs/victoriametrics/stream-aggregation/README.md
++++ b/docs/victoriametrics/stream-aggregation/README.md
+@@ -811,6 +811,10 @@ Moved to [stream-aggregation/configuration/#stdvar](https://docs.victoriametrics
+ 
+ Moved to [stream-aggregation/configuration/#sum_samples](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#sum_samples).
+ 
++###### sum_samples_total
++
++Moved to [stream-aggregation/configuration/#sum_samples_total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#sum_samples_total).
++
+ ###### total
+ 
+ Moved to [stream-aggregation/configuration/#total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#total).
+diff --git a/docs/victoriametrics/stream-aggregation/configuration.md b/docs/victoriametrics/stream-aggregation/configuration.md
+index 18e3f47c4..28204b861 100644
+--- a/docs/victoriametrics/stream-aggregation/configuration.md
++++ b/docs/victoriametrics/stream-aggregation/configuration.md
+@@ -110,6 +110,15 @@ specified individually per each `-remoteWrite.url`:
+   #
+   # flush_on_shutdown: false
+ 
++  # reset_marker_on_stale instructs to emit a single sample with zero value before a cumulative output
++  # (total, total_prometheus or sum_samples_total) starts a new stretch: when the previous state expired
++  # after staleness_interval, and when the output is created, which happens after a restart or a crash.
++  # Without it, a new stretch starting from a value that is not below the previous one is not recognized
++  # as a counter reset by increase() and the missing amount is silently lost.
++  # It requires one of the cumulative outputs above.
++  #
++  # reset_marker_on_stale: false
++
+   # without is an optional list of labels, which must be removed from the output aggregation.
+   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
+   #
+@@ -496,6 +505,30 @@ See also:
+ - [count_samples](#count_samples)
+ - [count_series](#count_series)
+ 
++### sum_samples_total
++
++`sum_samples_total` sums input [sample values](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#raw-samples)
++like [sum_samples](#sum_samples), but it does not reset the sum on flush, so the output is a cumulative counter.
++
++It is meant for inputs that already are increments, for instance a scrape target that reports only what accrued since
++the last delivered scrape. Compared with [total](#total) on the same data:
++
++- it keeps no state per input series, so memory does not depend on how many inputs are merged into one output;
++- a restart needs no baseline sample, so the first sample after a restart is not dropped.
++
++Use it together with `reset_marker_on_stale` so that a counter reset is visible to the query side.
++
++The results of `sum_samples_total` is equal to the following [MetricsQL](https://docs.victoriametrics.com/victoriametrics/metricsql/) query:
++
++```metricsql
++running_sum(sum(sum_over_time(some_metric[interval])))
++```
++
++See also:
++
++- [sum_samples](#sum_samples)
++- [total](#total)
++
+ ### total
+ 
+ `total` generates output [counter](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#counter) by summing the input counters over the given `interval`.
+diff --git a/lib/streamaggr/restart_collision_test.go b/lib/streamaggr/restart_collision_test.go
+new file mode 100644
+index 000000000..db2faecaf
+--- /dev/null
++++ b/lib/streamaggr/restart_collision_test.go
+@@ -0,0 +1,79 @@
++package streamaggr
++
++import (
++	"sort"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// The leading zero of a new output lands one interval before its first flush, which is close to
++// where the process that died may have flushed a real value. Two samples of the same series at the
++// same timestamp are resolved by keeping the larger one, which would swallow the zero and hide the
++// reset, so they must never collide.
++//
++// They cannot: the first incomplete interval after a start is not flushed, which leaves at least one
++// interval between the last flush of the old process and the leading zero of the new one. This pins
++// that down with the tightest restart there is, one that lives through a boundary and comes back
++// within the same interval.
++func TestLeadingZeroAfterShortRestart(t *testing.T) {
++	const config = `
++- interval: 1m
++  staleness_interval: 5m
++  ignore_first_sample_interval: 0s
++  without: [pod]
++  outputs: [total]
++  keep_metric_names: true
++  reset_marker_on_stale: true
++`
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var tss []prompb.TimeSeries
++		pushFunc := func(src []prompb.TimeSeries) {
++			mu.Lock()
++			tss = appendClonedTimeseries(tss, src)
++			mu.Unlock()
++		}
++		start := time.Now()
++		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		time.Sleep(10 * time.Second)
++		a.Push(prometheus.MustParsePromMetrics(`foo{pod="a"} 5`, time.Now().UnixMilli()), nil)
++		time.Sleep(175 * time.Second) // live through the 180s boundary, then die just after it
++		a.MustStop()
++
++		time.Sleep(5 * time.Second) // a short restart, well under one interval
++		b, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		b.Push(prometheus.MustParsePromMetrics(`foo{pod="b"} 5`, time.Now().UnixMilli()), nil)
++		time.Sleep(150 * time.Second)
++		b.MustStop()
++
++		mu.Lock()
++		defer mu.Unlock()
++		var out []markerSample
++		for _, ts := range tss {
++			for _, s := range ts.Samples {
++				out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++			}
++		}
++		sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
++		t.Logf("samples: %v", out)
++
++		// look for two samples of the same series at the same timestamp with different values
++		for i := 1; i < len(out); i++ {
++			if out[i].at == out[i-1].at && out[i].value != out[i-1].value {
++				t.Fatalf("two values at the same timestamp %v: %v and %v; the smaller one is dropped by deduplication: %v",
++					out[i].at, out[i-1].value, out[i].value, out)
++			}
++		}
++	})
++}
+diff --git a/lib/streamaggr/streamaggr_timing_test.go b/lib/streamaggr/streamaggr_timing_test.go
+index 01a4f5423..0fe01bcf7 100644
+--- a/lib/streamaggr/streamaggr_timing_test.go
++++ b/lib/streamaggr/streamaggr_timing_test.go
+@@ -27,6 +27,7 @@ var benchOutputs = []string{
+ 	"stddev",
+ 	"stdvar",
+ 	"sum_samples",
++	"sum_samples_total",
+ 	"total",
+ 	"total_prometheus",
+ 	"unique_samples",
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,99 @@
+From 5d55c7d331b6a26d4e189c52303c5a7736ab8383 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 20 Sep 2026 17:15:42 -0700
+Subject: [PATCH 16/16] lib/promutil: check the hand-written label sort against
+ the standard library
+
+Sort is an insertion sort straight on the slice rather than a call through
+sort.Interface, and nothing checked that it orders the same way. It sits on
+the stream aggregation push path, where a wrong order does not fail: it
+changes the key a sample groups under, so samples land in the wrong output
+series and the numbers are quietly wrong.
+
+Twenty thousand random label sets are compared against sort.SliceStable, drawn
+from names that hit the edges -- shared prefixes, one name extending another,
+names differing only in their tail, mixed case and underscores. Reversing the
+comparison in Sort fails it on the first round.
+
+This was written while trying to make Sort compare a packed eight-byte prefix
+of each name before the name itself, to get out of the string comparisons that
+were 16.6% of the aggregation push profile. That lost and is not here: against
+BenchmarkLabelsSortExposerOrdering, which models what an exposer actually
+emits, it ran 41% slower with the generation label appended and 83% slower on
+an already sorted set -- packing the keys costs more than the comparisons it
+saves when the set is short and nearly ordered. It gained 6.6% on the upstream
+push benchmark, whose synthetic label order is far more scrambled, while
+allocating 45 times as much. The test is worth keeping either way.
+---
+ lib/promutil/labels_sort_order_test.go | 59 ++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+ create mode 100644 lib/promutil/labels_sort_order_test.go
+
+diff --git a/lib/promutil/labels_sort_order_test.go b/lib/promutil/labels_sort_order_test.go
+new file mode 100644
+index 000000000..18c51163b
+--- /dev/null
++++ b/lib/promutil/labels_sort_order_test.go
+@@ -0,0 +1,59 @@
++package promutil
++
++import (
++	"math/rand"
++	"sort"
++	"strconv"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// Sort is hand-written rather than going through sort.Interface, and nothing
++// checked that it orders the same way. It sits on the stream aggregation push
++// path where a wrong order does not fail: it changes the key a sample groups
++// under, so the samples land in the wrong output series and the numbers are
++// quietly wrong. So the order is checked against the standard library on names
++// built to hit the edges -- shared prefixes, one name extending another, and
++// names differing only in their tail.
++func TestSortMatchesStandardSort(t *testing.T) {
++	names := []string{
++		"a", "ab", "abc", "abcdefg", "abcdefgh", "abcdefghi", "abcdefghj",
++		"abcdefgh0", "abcdefgh_", "label1", "label2", "label3", "label10",
++		"__name__", "__name___", "_", "z", "job", "instance", "pod", "namespace",
++		"node", "environment", "path", "some_other_label", "A", "Z", "aZ", "a_",
++	}
++	rng := rand.New(rand.NewSource(20260920))
++
++	for round := range 20000 {
++		n := 1 + rng.Intn(20)
++		labels := make([]prompb.Label, n)
++		seen := map[string]bool{}
++		for i := range labels {
++			var name string
++			for {
++				name = names[rng.Intn(len(names))]
++				if rng.Intn(4) == 0 {
++					name += strconv.Itoa(rng.Intn(3))
++				}
++				if !seen[name] {
++					break
++				}
++			}
++			seen[name] = true
++			labels[i] = prompb.Label{Name: name, Value: "v" + strconv.Itoa(i)}
++		}
++
++		want := append([]prompb.Label(nil), labels...)
++		sort.SliceStable(want, func(i, j int) bool { return want[i].Name < want[j].Name })
++
++		x := &Labels{Labels: append([]prompb.Label(nil), labels...)}
++		x.Sort()
++
++		for i := range want {
++			if x.Labels[i].Name != want[i].Name {
++				t.Fatalf("round %d: at %d got %q, want %q\n  input %v", round, i, x.Labels[i].Name, want[i].Name, labels)
++			}
++		}
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

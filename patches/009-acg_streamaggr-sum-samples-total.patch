@@ -1,0 +1,303 @@
+From 2ad8f8d992842fe9648dee0e92bf0029901f5235 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Thu, 17 Sep 2026 09:41:58 -0700
+Subject: [PATCH 06/16] streamaggr: add the sum_samples_total output
+
+sum_samples resets on every flush; sum_samples_total keeps adding sample
+values and emits a cumulative counter. Where the input is already an
+increment, i.e. the scrape target reports only what accrued since the last
+delivered scrape, it replaces total: no previous value has to be kept per
+input series, so memory does not grow with the number of inputs merged
+into one output, and after a restart there is no first sample to drop as a
+baseline.
+
+The zero emitted on expiry and the leading zero of reset_marker_on_stale
+apply to sum_samples_total as well.
+---
+ lib/streamaggr/output.go                 | 23 ++++--
+ lib/streamaggr/reset_marker_test.go      |  2 +-
+ lib/streamaggr/streamaggr.go             |  7 +-
+ lib/streamaggr/sum_samples.go            | 53 +++++++++++++
+ lib/streamaggr/sum_samples_total_test.go | 94 ++++++++++++++++++++++++
+ 5 files changed, 169 insertions(+), 10 deletions(-)
+ create mode 100644 lib/streamaggr/sum_samples_total_test.go
+
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index 8a4ed0f0d..d004f8698 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -18,16 +18,27 @@ type aggrOutputs struct {
+ 	outputSamples      *metrics.Counter
+ }
+ 
+-// hasCumulativeTotal returns true if ao has total or total_prometheus output.
++// hasCumulativeTotal returns true if ao has total, total_prometheus or sum_samples_total output.
+ func (ao *aggrOutputs) hasCumulativeTotal() bool {
+ 	for _, c := range ao.configs {
+-		if tc, ok := c.(*totalAggrConfig); ok && !tc.resetTotalOnFlush {
++		if _, ok := cumulativeSuffix(c); ok {
+ 			return true
+ 		}
+ 	}
+ 	return false
+ }
+ 
++// cumulativeSuffix returns the output suffix for outputs producing a cumulative counter.
++func cumulativeSuffix(c aggrConfig) (string, bool) {
++	switch t := c.(type) {
++	case *totalAggrConfig:
++		return t.getSuffix(), !t.resetTotalOnFlush
++	case *sumSamplesTotalAggrConfig:
++		return "sum_samples_total", true
++	}
++	return "", false
++}
++
+ func (ao *aggrOutputs) getInputOutputKey(key string) (string, string) {
+ 	src := bytesutil.ToUnsafeBytes(key)
+ 	outputKeyLen, nSize := encoding.UnmarshalVarUint64(src)
+@@ -141,7 +152,7 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 	})
+ }
+ 
+-// appendResetMarkers emits a zero sample at the given timestamp for every total and total_prometheus output of av.
++// appendResetMarkers emits a zero sample at the given timestamp for every total, total_prometheus and sum_samples_total output of av.
+ //
+ // It is called for an entry which is going to be dropped because of staleness, and before the first visible flush
+ // of a new entry. The latter covers entries lost without a marker, e.g. on vmagent restart or crash:
+@@ -153,11 +164,9 @@ func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputK
+ 		outputs = av.green
+ 	}
+ 	for i := range outputs {
+-		tc, ok := ao.configs[i].(*totalAggrConfig)
+-		if !ok || tc.resetTotalOnFlush {
+-			continue
++		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
++			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
+ 		}
+-		ctx.appendSeriesAt(outputKey, tc.getSuffix(), timestamp, 0)
+ 	}
+ }
+ 
+diff --git a/lib/streamaggr/reset_marker_test.go b/lib/streamaggr/reset_marker_test.go
+index ed09a60f9..788e1649d 100644
+--- a/lib/streamaggr/reset_marker_test.go
++++ b/lib/streamaggr/reset_marker_test.go
+@@ -266,7 +266,7 @@ func TestResetMarkerOnStaleRequiresCumulativeTotal(t *testing.T) {
+ 			t.Fatalf("expecting an error for outputs %s", outputs)
+ 		}
+ 	}
+-	for _, outputs := range []string{"[total]", "[total_prometheus]", "[increase, total]"} {
++	for _, outputs := range []string{"[total]", "[total_prometheus]", "[increase, total]", "[sum_samples_total]"} {
+ 		config := `
+ - interval: 1m
+   outputs: ` + outputs + `
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 51c0e96ae..d1f52e6a0 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -47,6 +47,7 @@ var supportedOutputs = []string{
+ 	"stddev",
+ 	"stdvar",
+ 	"sum_samples",
++	"sum_samples_total",
+ 	"total",
+ 	"total_prometheus",
+ 	"unique_samples",
+@@ -184,7 +185,7 @@ type Config struct {
+ 	// This parameter is relevant only for the following outputs: total, total_prometheus, increase, increase_prometheus, and histogram_bucket.
+ 	IgnoreFirstSampleInterval string `yaml:"ignore_first_sample_interval,omitempty"`
+ 
+-	// ResetMarkerOnStale instructs to emit a single sample with zero value for total and total_prometheus outputs
++	// ResetMarkerOnStale instructs to emit a single sample with zero value for total, total_prometheus and sum_samples_total outputs
+ 	// when their state is dropped because no input samples were received during staleness_interval,
+ 	// and one interval before the first sample of a newly created output state.
+ 	//
+@@ -623,7 +624,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		aggrOutputs.configs[i] = ac
+ 	}
+ 	if aggrOutputs.resetMarkerOnStale && !aggrOutputs.hasCumulativeTotal() {
+-		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total` or `total_prometheus` output")
++		return nil, fmt.Errorf("`reset_marker_on_stale` requires `total`, `total_prometheus` or `sum_samples_total` output")
+ 	}
+ 	outputsLabels := make([]string, 0, len(outputsSeen))
+ 	for o := range outputsSeen {
+@@ -796,6 +797,8 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+ 		return newStdvarAggrConfig(), nil
+ 	case "sum_samples":
+ 		return newSumSamplesAggrConfig(), nil
++	case "sum_samples_total":
++		return newSumSamplesTotalAggrConfig(), nil
+ 	case "total":
+ 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
+ 	case "total_prometheus":
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index 8ec63e679..e65fb963f 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -1,5 +1,9 @@
+ package streamaggr
+ 
++import (
++	"math"
++)
++
+ type sumSamplesAggrValue struct {
+ 	sum float64
+ }
+@@ -26,3 +30,52 @@ type sumSamplesAggrConfig struct{}
+ func (*sumSamplesAggrConfig) getValue(_ any) aggrValue {
+ 	return &sumSamplesAggrValue{}
+ }
++
++// sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
++// so the output is a cumulative counter.
++//
++// It is intended for inputs which already are increments, e.g. scrape targets exposing the increase since the last
++// delivered scrape. Unlike total, it keeps no state per input series, so its memory usage doesn't depend on
++// the number of inputs merged into every output, and a restart doesn't need a baseline sample per input.
++type sumSamplesTotalAggrValue struct {
++	sum    float64
++	shared *sumSamplesTotalShared
++}
++
++type sumSamplesTotalShared struct {
++	total float64
++}
++
++func (av *sumSamplesTotalAggrValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
++	av.sum += sample.value
++}
++
++func (av *sumSamplesTotalAggrValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	total := av.shared.total + av.sum
++	av.sum = 0
++	if math.Abs(total) >= (1 << 53) {
++		// It is time to reset the entry, since it starts losing float64 precision
++		av.shared.total = 0
++	} else {
++		av.shared.total = total
++	}
++	ctx.appendSeries(key, "sum_samples_total", total)
++}
++
++func (av *sumSamplesTotalAggrValue) state() any {
++	return av.shared
++}
++
++func newSumSamplesTotalAggrConfig() aggrConfig {
++	return &sumSamplesTotalAggrConfig{}
++}
++
++type sumSamplesTotalAggrConfig struct{}
++
++func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
++	shared, ok := s.(*sumSamplesTotalShared)
++	if !ok {
++		shared = &sumSamplesTotalShared{}
++	}
++	return &sumSamplesTotalAggrValue{shared: shared}
++}
+diff --git a/lib/streamaggr/sum_samples_total_test.go b/lib/streamaggr/sum_samples_total_test.go
+new file mode 100644
+index 000000000..40dd866c2
+--- /dev/null
++++ b/lib/streamaggr/sum_samples_total_test.go
+@@ -0,0 +1,94 @@
++package streamaggr
++
++import (
++	"sort"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// Inputs are increments since the previous delivered scrape; the output is their cumulative sum across flushes and pods.
++func TestSumSamplesTotalAccumulates(t *testing.T) {
++	pushes := []pushAt{
++		{0, `foo{pod="a"} 2`},
++		{30 * time.Second, `foo{pod="b"} 3`},
++		{70 * time.Second, `foo{pod="a"} 1`},
++		{130 * time.Second, `foo{pod="b"} 4`},
++	}
++	out := runStaleScenario(t, markerConfig("[sum_samples_total]", true, false), pushes, 4*time.Minute, 0)["foo"]
++	if n := len(out); n == 0 || out[n-1].value != 10 {
++		t.Fatalf("the output must be the cumulative sum 10 of all increments; got %v", out)
++	}
++	for i := 1; i < len(out); i++ {
++		if out[i].value < out[i-1].value {
++			t.Fatalf("the output must never decrease without a marker; got %v", out)
++		}
++	}
++}
++
++// A restart loses no increments pushed after it: there is no baseline sample per input to skip.
++// With the marker the restarted output starts from an explicit zero, so increase() over both parts is exact.
++func TestSumSamplesTotalRestart(t *testing.T) {
++	config := func(marker bool) string {
++		return markerConfig("[sum_samples_total]", true, marker)
++	}
++	run := func(marker bool) []markerSample {
++		var out []markerSample
++		synctest.Test(t, func(t *testing.T) {
++			var mu sync.Mutex
++			var tss []prompb.TimeSeries
++			pushFunc := func(src []prompb.TimeSeries) {
++				mu.Lock()
++				tss = appendClonedTimeseries(tss, src)
++				mu.Unlock()
++			}
++			start := time.Now()
++			push := func(a *Aggregators, s string) {
++				a.Push(prometheus.MustParsePromMetrics(s, time.Now().UnixMilli()), nil)
++			}
++			a, err := LoadFromData([]byte(config(marker)), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(30 * time.Second)
++			push(a, `foo{pod="a"} 3`)
++			time.Sleep(time.Minute)
++			push(a, `foo{pod="a"} 3`)
++			time.Sleep(time.Minute)
++			a.MustStop() // restart while the output is alive: 6 so far
++			time.Sleep(30 * time.Second)
++			b, err := LoadFromData([]byte(config(marker)), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(30 * time.Second)
++			push(b, `foo{pod="b"} 2`) // right after the restart
++			time.Sleep(9 * time.Minute)
++			push(b, `foo{pod="a"} 4`) // after the output expired
++			time.Sleep(90 * time.Second)
++			b.MustStop()
++
++			mu.Lock()
++			defer mu.Unlock()
++			for _, ts := range tss {
++				for _, s := range ts.Samples {
++					out = append(out, markerSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++				}
++			}
++			sort.SliceStable(out, func(i, j int) bool { return out[i].at < out[j].at })
++		})
++		return out
++	}
++	with := run(true)
++	if got := increasePure(with); got != 12 {
++		t.Fatalf("with marker: want increase 12 (6 before the restart, 2 and 4 after); got %v from %v", got, with)
++	}
++	without := run(false)
++	if got := increasePure(without); got >= 12 {
++		t.Fatalf("without marker the restarted output isn't detected as a reset, so it must undercount; got %v from %v", got, without)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+
