@@ -1,6 +1,6 @@
 # vmagent 补丁(基于 VictoriaMetrics **v1.126.0-cluster**)
 
-十三个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
+十九个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -21,10 +21,16 @@
 | `016-acg_streamaggr-type-label-selector-test` | 钉住类型标签选择器的匹配语义,防止聚合配置里的 `_metric_type!=""` 被当成冗余删掉 | 可选,只加测试 |
 | `017-acg_promscrape-parse-mode-metric` | 导出每次抓取实际走的解析模式,让"未压缩响应有没有进内存"这件事可观测 | **强烈建议**,见下文 |
 | `018-acg_streamaggr-input-key-only-when-read` | 没有输出读 input key 时不再压缩它;`sum_samples_total` 耗时 −42%、分配 −51% | 建议,纯性能 |
+| `019-acg_promutil-label-sort-order-test` | 钉住标签排序的结果顺序,防止 012/013 的改动悄悄改变语义 | 可选,只加测试 |
+| `020-acg_streamaggr-acg-shape-bench` | 按 ACG 实际配置形态(`drop_input_labels` + 不写 by/without)补聚合 push 基准 | 可选,只加基准 |
+| `021-acg_zstd-encoder-concurrency` | 新增 `-zstd.encoderConcurrency`,限制 zstd 编码器并发槽位;每槽一个 8 MB 历史窗口,默认按核数开,64 核就是 512 MB 永不释放 | **强烈建议**,vmagent 存活堆 346 → 271 MB |
+| `022-acg_streamaggr-dedup-input-key` | 修 018 的一处严重错误:它复用了 `useInputKey`,而这个字段在 `dedup_interval > 0` 时本来就是 false,导致开 dedup 时一个输出组的所有输入序列挤进同一个 map 条目——三个 pod 各报 1 合出来是 1。顺带修 017 的 `SizeBytes()`/`Len()` 不一致,以及 021 的 flag 只在 !cgo 下声明(发布版是 CGO_ENABLED=1,传参直接起不来) | **必须**,打了 018 就必须打这个 |
 
-只动源码的是 8 个文件:`lib/promscrape/{client,scrapework}.go`、`lib/promutil/{labels,labelscompressor}.go`、
-`lib/streamaggr/{deduplicator,output,streamaggr,sum_samples}.go`,其中 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(6 个补丁碰它)和 `output.go`(3 个)。
+只动源码的是 22 个文件:`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
+`lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
+以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
+`needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
+冲突热点是 `streamaggr.go`(7 个补丁碰它)和 `output.go`(4 个)。
 
 ## 基线:为什么是集群版
 
