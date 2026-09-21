@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1007-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1008-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,7 +53,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1007-cluster` 构建——`sum_samples_total` 上游没有，用原版镜像会在启动时 fatal 退出。沿用你们现有的部署，改这几项：
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1008-cluster` 构建——`sum_samples_total` 上游没有，用原版镜像会在启动时 fatal 退出。沿用你们现有的部署，改这几项：
 
 **聚合配置已经有了**，在 `feature-apikey-redis-notification-axx` 分支上：`extraArgs` 里 `remoteWrite.streamAggr.config: [/etc/vmagent/streamaggr/usage.yaml]`，内容来自 `extraObjects` 的 `vmagent-streamaggr` ConfigMap。**要改的是它的内容，见 §四**——现有规则有个会毁掉框架指标的错。
 
@@ -258,7 +258,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1007-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1008-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -323,21 +323,62 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 - 聚合器为 **`staleness_interval`（40 分钟）窗口内出现过的每个 Key** 留一份状态，不是为此刻在报的那些。
 - 边车只删**连续 `-idle-scrapes`（30 次抓取 = 30 分钟）没被写过**的实例。
 
-所以只要**轮换一圈的周期短于这两个窗口**，两端最终持有的就是**全量注册 Key**。
+只要**轮换一圈的周期短于这两个窗口**，两端最终持有的就是**全量注册 Key**。
 
-实测（3 万注册 Key、总并发 5000、每 2 分钟换一批 5000 个活跃 Key，即 12 分钟轮完一圈）：
+#### 实测：3 万 Key 全部轮流活跃，3 小时
 
-| 分钟 | vmagent 存活堆 | vmagent 物理 | 边车存活堆 | 边车物理 | 边车活实例 |
-|---|---|---|---|---|---|
-| 1 | 219 MiB | 316 MiB | 218 MiB | 296 MiB | 89,695 |
-| 4 | 581 MiB | 718 MiB | 433 MiB | 562 MiB | 288,288 |
-| 8 | 1059 MiB | 1230 MiB | 704 MiB | 867 MiB | 584,702 |
+3 万注册 Key、总并发 5000、每 2 分钟换一批 5000 个活跃 Key（12 分钟轮完一圈），三个 app + vmagent + vm-insert + vm-storage 三分片，跑 180 分钟，取第 60~180 分钟（121 个采样点）：
 
-八分钟就越过 1 GiB 还在以每分钟一百多 MiB 上涨，**512Mi 的建议在这个形态下直接不够**。这一档的稳态数还在测，出来后补进本节。
+| | 存活堆 | 物理占用 | 建议配额 |
+|---|---|---|---|
+| app（每个） | 1215 MiB | 1435 MiB | **2Gi** |
+| **vmagent** | **1224 MiB** | **1517 MiB** | **2Gi** |
+| vm-insert | — | 412 MiB | 现状 |
+| vm-storage（每分片） | — | 1754 MiB | 现状，按可用内存自调 |
+| vm-select | — | 11 MiB | 现状 |
 
-**要控这个内存，杠杆是 `staleness_interval`，不是别的。** 报增量时缩短它是语义安全的（见下面「试过但不推荐的」里的论证）——固定活跃集那轮只省了 8% 所以没推荐，但轮换形态下它直接决定「要记住多少个 Key」，收益完全是另一个量级。上线前按你们真实的 Key 活跃模式测一轮再定值。
+对比固定 2000 活跃那一档：**vmagent 148 → 1224 MiB（8.3 倍）、app 206 → 1215 MiB（5.9 倍）**。
 
-判断自己属于哪种形态：看 `vm_streamaggr_labels_compressor_items_count` 和 vmagent 的 RSS 是不是随时间单调上涨到远超活跃 Key 数对应的量——是的话就是轮换形态。
+同一轮的其它数：
+
+- vmagent CPU **15.04 核秒/分钟**，约单核的 25%
+- app 活实例稳定在 **110.9 万**
+- 抓取 **135.5 万样本/分钟**，聚合输出 **440.6 万样本/分钟**
+- 压缩后单次抓取 **7 MiB**（16 MiB 上限的 44%），解压后 505 MiB/分钟
+- 540 次抓取 **100% `stream_without_body`**，抓取失败 0、超限 0；remote write 80,224 次全部 2XX
+
+**没有累积泄漏。** vmagent 存活堆从第 60 分钟起一直在 1206~1246 之间来回摆，第 180 分钟仍是 1224。配额按平台值给即可，不用乘时间系数。
+
+**合并与分片都正确**（经 vm-select 查）：
+
+- `acg_requests_total` **29,998** 条 series、gauge `acg_requests_concurrent_total` **29,963** 条——轮换下几乎全部 3 万 Key 都是活的
+- `acg_*` 里带 `pod`、`instance`、`_metric_type` 标签的各 **0** 条
+- 总 series **436 万**（3 万 Key × 约 145 条）
+- 三个 vm-storage 分片各持有 144.4 万 / 144.1 万 / 144.5 万个 metric id，**相差 0.3%**，分片均衡
+
+**vmagent 的内存花在哪**（存活堆 1133 MB 的构成）：
+
+```
+1057 MB (93%)  streamaggr.(*aggrOutputs).pushSamples   ← 聚合状态,就是主体
+ 229 MB        sync trie 的 indirect 节点
+ 192 MB        sync trie 的 entry 节点
+  97 MB        字符串驻留
+  94 MB        sumSamplesTotal.getValue
+   8 MB        zstd 编码器历史窗口          ← 一个槽,-zstd.encoderConcurrency=1 生效
+```
+
+聚合状态占 93%，所以**能动的只有「记住多少个 Key」这一个变量**。
+
+#### 要降内存，杠杆是 `staleness_interval`
+
+报增量时缩短它是语义安全的（见下面「试过但不推荐的」里的论证）。固定活跃集那轮只省了 8%，所以当时没推荐；但轮换形态下它直接决定要记住多少个 Key，收益完全是另一个量级——把 40m 缩到略大于轮换周期，聚合状态就从「全量 3 万」降到「一两批」。
+
+**上线前按你们真实的 Key 活跃模式测一轮再定值**，判据是：`staleness_interval` 要大于「同一个 Key 两次活跃之间的最长间隔」，否则中间那段会被当成 stale、补 0 重来（`reset_marker_on_stale` 保证不丢不重，但会多出 0 值点）。
+
+#### 自己属于哪一档，怎么判断
+
+看 vmagent 的 RSS 和 `vm_streamaggr_labels_compressor_items_count` 是不是涨到远超「此刻活跃 Key 数 × 145」——是的话就是轮换形态，按上面这张表配，不要按固定活跃那张。
+
 
 ---
 
@@ -368,7 +409,7 @@ sum(increase(acg_requests_total[1h]))
 | 内存没降 | `no_stale_markers` 没写，或配了 `sample_limit` / `series_limit`。查 `vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`，应为 0 |
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1007-cluster` 构建的。`sum_samples_total` 上游没有 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1008-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
