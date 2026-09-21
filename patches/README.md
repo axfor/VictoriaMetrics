@@ -1,5 +1,7 @@
 # vmagent 补丁(基于 VictoriaMetrics **v1.126.0-cluster**)
 
+> 集成步骤、最佳配置、配额见同目录的 [`INTEGRATION.md`](INTEGRATION.md)。本文件只讲补丁本身。
+
 二十个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
