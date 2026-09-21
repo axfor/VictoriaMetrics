@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1004-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1007-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,7 +53,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1004-cluster` 构建——`sum_samples_total` 上游没有，用原版镜像会在启动时 fatal 退出。沿用你们现有的部署，改这几项：
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1007-cluster` 构建——`sum_samples_total` 上游没有，用原版镜像会在启动时 fatal 退出。沿用你们现有的部署，改这几项：
 
 **聚合配置已经有了**，在 `feature-apikey-redis-notification-axx` 分支上：`extraArgs` 里 `remoteWrite.streamAggr.config: [/etc/vmagent/streamaggr/usage.yaml]`，内容来自 `extraObjects` 的 `vmagent-streamaggr` ConfigMap。**要改的是它的内容，见 §四**——现有规则有个会毁掉框架指标的错。
 
@@ -258,7 +258,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1004-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1007-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -368,7 +368,7 @@ sum(increase(acg_requests_total[1h]))
 | 内存没降 | `no_stale_markers` 没写，或配了 `sample_limit` / `series_limit`。查 `vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`，应为 0 |
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1004-cluster` 构建的。`sum_samples_total` 上游没有 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1007-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
