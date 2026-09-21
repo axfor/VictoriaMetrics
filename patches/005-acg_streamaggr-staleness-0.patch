@@ -1,7 +1,7 @@
 From 1afdeaa0ad68cbf37e64b8927ccbfb250cf2b1b1 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 17 Sep 2026 00:42:37 -0700
-Subject: [PATCH 02/16] streamaggr: emit a zero when an output expires on
+Subject: [PATCH 2/2] streamaggr: emit a zero when an output expires on
  staleness
 
 Adds the reset_marker_on_stale aggregation option, off by default, which

@@ -1,7 +1,7 @@
 From de22abbb4577297c36fcbeeadbdacbe1605c11de Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sat, 19 Sep 2026 04:35:05 -0700
-Subject: [PATCH 10/16] promutil, streamaggr: cache the most recent label
+Subject: [PATCH 10/10] promutil, streamaggr: cache the most recent label
  lookups
 
 Compressing the labels of a sample looks every label up in a shared

@@ -1,7 +1,7 @@
 From 2ad8f8d992842fe9648dee0e92bf0029901f5235 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 17 Sep 2026 09:41:58 -0700
-Subject: [PATCH 06/16] streamaggr: add the sum_samples_total output
+Subject: [PATCH 6/6] streamaggr: add the sum_samples_total output
 
 sum_samples resets on every flush; sum_samples_total keeps adding sample
 values and emits a cumulative counter. Where the input is already an

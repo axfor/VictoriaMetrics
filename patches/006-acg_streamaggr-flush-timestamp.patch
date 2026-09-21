@@ -1,7 +1,7 @@
 From a6d8a942cff22e7fe946f998c10669b8fca222aa Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 17 Sep 2026 04:27:53 -0700
-Subject: [PATCH 03/16] streamaggr: stop reusing the same flush timestamp
+Subject: [PATCH 3/3] streamaggr: stop reusing the same flush timestamp
 
 runFlusher only advanced flushTime when time.Now() was strictly after it.
 When the ticker landed exactly on an alignment boundary, which in real

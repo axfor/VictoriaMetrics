@@ -1,7 +1,7 @@
 From 43cb35671b75b86e23aa6e8b3300e93d39fe2d2d Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sat, 19 Sep 2026 03:28:32 -0700
-Subject: [PATCH 08/16] docs, streamaggr: document sum_samples_total and
+Subject: [PATCH 8/8] docs, streamaggr: document sum_samples_total and
  reset_marker_on_stale
 
 Both were wired through the code but appeared nowhere in the docs, so

@@ -1,7 +1,7 @@
 From dae3fce81b38b73603b0d2d039e5ce2257dbb009 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 20 Sep 2026 10:32:28 -0700
-Subject: [PATCH 14/16] promscrape: report which parse mode each scrape took
+Subject: [PATCH 14/14] promscrape: report which parse mode each scrape took
 
 Whether the uncompressed response is ever held in memory is decided per
 scrape, and three config options turn the cheap path off without saying so:

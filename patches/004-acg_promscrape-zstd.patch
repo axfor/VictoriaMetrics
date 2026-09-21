@@ -1,7 +1,7 @@
 From 6c0624cb4d85c364c9de388fc3da2357ebba8c0e Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Wed, 16 Sep 2026 22:21:57 -0700
-Subject: [PATCH 01/16] promscrape: support zstd-compressed scrape responses
+Subject: [PATCH 1/1] promscrape: support zstd-compressed scrape responses
 
 Adds -promscrape.zstdCompression, off by default. With it on, the request
 carries Accept-Encoding: zstd, gzip; a target answering with zstd is

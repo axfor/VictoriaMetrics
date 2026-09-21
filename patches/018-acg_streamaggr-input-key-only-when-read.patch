@@ -1,7 +1,7 @@
 From 08f4b377d894f1d3b0b0cfe79ed281382a4fc530 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 20 Sep 2026 10:41:40 -0700
-Subject: [PATCH 15/16] lib/streamaggr: build the input part of a key only when
+Subject: [PATCH 15/15] lib/streamaggr: build the input part of a key only when
  an output reads it
 
 A sample's key is the output part -- what the aggregation groups by -- followed

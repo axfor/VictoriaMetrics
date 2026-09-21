@@ -1,7 +1,7 @@
 From e8ac4b53f9f3a7948d31710ac15893c395f21953 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 20 Sep 2026 01:29:05 -0700
-Subject: [PATCH 13/16] lib/streamaggr: pin what a type-label selector takes
+Subject: [PATCH 13/13] lib/streamaggr: pin what a type-label selector takes
 
 The aggregation config we recommend for the delta SDK keys on a label
 carrying the metric's type, so that a metric added later needs no change to

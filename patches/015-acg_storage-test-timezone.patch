@@ -1,7 +1,7 @@
 From b1b1cb641d805e3ac7b651cf355d5f4b4331b8d0 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sat, 19 Sep 2026 17:45:41 -0700
-Subject: [PATCH 12/16] lib/storage: make TestStorageDeletePendingSeries
+Subject: [PATCH 12/12] lib/storage: make TestStorageDeletePendingSeries
  independent of the time zone
 
 The test walks ten months from the epoch, and reads back the per-day index

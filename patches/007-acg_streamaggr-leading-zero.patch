@@ -1,7 +1,7 @@
 From a815b8fb620a89b1323257d39de1882015aa0d93 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 17 Sep 2026 05:35:50 -0700
-Subject: [PATCH 04/16] streamaggr: emit a leading zero for a new output under
+Subject: [PATCH 4/4] streamaggr: emit a leading zero for a new output under
  reset_marker_on_stale
 
 The previous patch only emits a zero when an output expires on staleness.

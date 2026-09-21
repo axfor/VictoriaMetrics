@@ -1,7 +1,7 @@
 From d2a3202b1a622a923e41ebafbf8c1e3d909809e2 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sat, 19 Sep 2026 04:03:59 -0700
-Subject: [PATCH 09/16] promutil: sort labels without going through
+Subject: [PATCH 9/9] promutil: sort labels without going through
  sort.Interface
 
 Sorting the labels of every sample is a large share of the stream

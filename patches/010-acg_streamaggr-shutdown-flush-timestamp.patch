@@ -1,7 +1,7 @@
 From b2469ee1896f2590bccc44a7a8871435170c0f77 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 17 Sep 2026 10:17:14 -0700
-Subject: [PATCH 07/16] streamaggr: do not use a future timestamp for the
+Subject: [PATCH 7/7] streamaggr: do not use a future timestamp for the
  shutdown flush
 
 With flush_on_shutdown, the flush at shutdown used the next flush
