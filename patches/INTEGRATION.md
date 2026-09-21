@@ -134,11 +134,18 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 一个样本都进不去，而且只是 warn 日志、`up` 仍然是 1。所以增量不是「省内存的优化」，是**让这条链路能跑起来的前提**。
 
-增量端点实测（3 万注册 Key / 2000 活跃 / 三个 pod，稳态）：每个 pod 每轮 **压缩后 2.29 MiB**（72 次抓取的区间 2.14~2.33），解压后约 94 MiB。压缩后离 16 MiB 上限有 **7 倍余量**，所以这个参数不用改。
+增量端点实测，每个 pod 每轮的**压缩后**大小（这才是 `maxScrapeSize` 判的那个字节数）：
 
-两个口径别混：`vm_promscrape_scrape_response_size_bytes` 记的是**解压后**的字节（三个 pod 合计 283 MiB/分钟），而 `maxScrapeSize` 判的是**压缩后**的（合计约 6.9 MiB/分钟，这也是真正的网络流量）。要盯上限就看后者，别拿前一个指标去比。
+| 一批活跃 Key | 压缩后 | 解压后 |
+|---|---|---|
+| 2000（固定） | 2.29 MiB | 约 94 MiB |
+| 5000（轮换） | 7.11 MiB | 约 223 MiB |
 
-压缩后的大小跟**活跃 Key 数**走（每轮发的是有变化的那些）。活跃数翻到 7 倍才会碰到 16 MiB，届时调 `-promscrape.maxScrapeSize` 即可。
+**按活跃 Key 数线性走**，约 **1.4 KiB/Key**——每轮发的就是有变化的那些。推下去 16 MiB 上限对应**一批活跃 Key 约 1.1 万**。超过这个数就要调 `-promscrape.maxScrapeSize`，否则 vmagent 静默拒收整个响应（只有 warn 日志、`up` 仍然是 1）。盯 `vm_promscrape_max_scrape_size_exceeded_errors_total`，必须恒为 0。
+
+注册 Key 总数不影响这个大小，只有**一批同时活跃的数量**影响。
+
+两个口径别混：`vm_promscrape_scrape_response_size_bytes` 记的是**解压后**的字节，而 `maxScrapeSize` 判的是**压缩后**的（约差 30~40 倍，后者才是真正的网络流量）。要盯上限就看后者，别拿前一个指标去比。
 
 ### 为什么必须加 `no_stale_markers`
 
@@ -284,6 +291,16 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 **合并是对的**：VM 里 `acg_requests_total` **2000 条** series、gauge `acg_requests_concurrent_total` 也是 **2000 条**，都等于活跃 Key 数；`acg_*` 里带 `pod` 标签的 **0 条**、带 `_metric_type` 的 **0 条**。
 
 **VM 的数不要直接当配额。** 它按可用内存自调缓存，上面 622~651 MiB 是本机跑出来的，换到限了内存的容器里是另一个数。按现网实际给。
+
+写入侧三个组件的观测（集群拓扑 vmagent → vm-insert → vm-storage，同一批流量）：
+
+| | 物理占用 | 说明 |
+|---|---|---|
+| vm-insert | 270~360 MiB | 无状态转发，跟吞吐走，基本不随 Key 数涨 |
+| vm-storage | 数 GiB | **按可用内存自调缓存**，和上面 VM 那条同理，不能当配额 |
+| vm-select | 8 MiB | 没有查询负载时几乎不占 |
+
+**我们的补丁一行都没碰这三个组件**（改动全在 `lib/promscrape`、`lib/promutil`、`lib/streamaggr`、`lib/encoding/zstd`），所以它们的容量按你们现有经验给就行，这里只是说明这条链路跑通了。
 
 **总基数**：`acg_*` 共 **298,359** 条 series，51 个指标名，约等于「活跃 Key 数 × 149」——2000 活跃就是 30 万条。上面那些「2000 条」是**单个指标名**的口径（每 Key 一条），别拿它估 VM 的存储压力。
 
