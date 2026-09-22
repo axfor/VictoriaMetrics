@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1011-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1013-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,7 +53,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1011-cluster` 构建。
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1013-cluster` 构建。
 
 **最低 `v1.126.1004-cluster`，低于它会有两个问题，一个起不来、一个静默算错：**
 
@@ -84,7 +84,7 @@ extraArgs:
   remoteWrite.maxDiskUsagePerURL: "10GB"
 ```
 
-**不要再配 `zstd.encoderConcurrency`。** 从 `v1.126.1011-cluster` 起它默认就是 1，不用写；而写了会在旧镜像上让 vmagent 直接启动失败（`flag provided but not defined`）——一个纯内存优化把进程搞挂，所以我们把它从必配项里去掉了。
+**不要再配 `zstd.encoderConcurrency`。** 从 `v1.126.1013-cluster` 起它默认就是 1，不用写；而写了会在旧镜像上让 vmagent 直接启动失败（`flag provided but not defined`）——一个纯内存优化把进程搞挂，所以我们把它从必配项里去掉了。
 
 后两项是同一类问题：**按核数放大的常驻内存，与实际吞吐无关**。
 
@@ -277,7 +277,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1011-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1013-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -286,6 +286,42 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 **回退**：把 `metrics_path` 改回 `/metrics/cumulative`，reload vmagent。不用重新发版。
 
 那是个普通 handler，给累计值、不碰增量基线；它没有类型标签，两条聚合规则都不匹配，原样透传。回退后行为等同改造前：全量上报、内存回到老水平、数字正确。
+
+### 已经部署过的：怎么升级
+
+先判断当前镜像有没有问题：
+
+```sh
+kubectl exec -n acg-system deploy/victoria-metrics-agent -- \
+  /vmagent-prod -help 2>&1 | grep -c "zstd.encoderConcurrency"
+```
+
+输出 `0` 说明镜像早于 `v1.126.1003-cluster`，有两个问题：传这个参数会启动失败；**开了 `dedup_interval` 的规则会把一个输出组的所有输入序列挤进同一个条目——三个 pod 各报 1 合出来是 1，少三分之二，不报错**。
+
+**删配置只能让进程起来，第二个是正确性问题，必须换镜像。**
+
+**换镜像**：拉 fork 的 `v1.126.1013-cluster` 构建；内网拉不到 GitHub 就在现有源码上补打 `022`、`023`、`024`（当前应已打到 021）。打完自检：
+
+```sh
+grep -c buildInputKey lib/streamaggr/output.go            # 2
+grep -c buildInputKey lib/streamaggr/streamaggr.go        # 3
+head -1 lib/encoding/zstd/concurrency.go                  # package zstd,不能有 //go:build
+grep -o 'encoderConcurrency", [0-9]' lib/encoding/zstd/concurrency.go   # , 1
+```
+
+**编完先验再发布**——发布版是 `CGO_ENABLED=1` 构建的，原来出问题的正是这里：
+
+```sh
+docker run --rm <镜像> /vmagent-prod -help 2>&1 | grep "zstd.encoderConcurrency"
+```
+
+有输出才能往下走。
+
+**改 values**：`extraArgs` 里把 `zstd.encoderConcurrency` 整行删掉（不是注释掉），并按 §四 确认 gauge 那条规则用的是 `without`。
+
+单副本 + `maxSurge: 0` 滚动更新有几十秒空窗，**不丢数据**——边车按「成功送达」才前移基线，空窗期的增量留在边车，恢复后补上。
+
+回滚：改回原镜像 + 原 values。聚合规则若一并改过也要改回，**新旧规则不能混用**，否则同一指标会同时存在带 pod 和不带 pod 的两套序列。
 
 ---
 
@@ -326,7 +362,28 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 
 ## 七、上线后
 
-对一次账：取同一时间窗，VM 里的增量与边车侧的请求计数应当相等。
+四条验收，都要过：
+
+```sh
+# 1. 没有 flag 报错
+kubectl logs -n acg-system deploy/victoria-metrics-agent --tail=50 | grep -i "not defined"   # 无输出
+
+# 2. 抓取正常
+curl -s http://<vmagent>:8429/metrics | grep -E "^vm_promscrape_scrapes_failed_total|^vm_promscrape_max_scrape_size_exceeded_errors_total"   # 都是 0
+
+# 3. 走的是流式解析
+curl -s http://<vmagent>:8429/metrics | grep 'parse_mode_total{mode="one_shot"}'            # 0
+```
+
+```promql
+# 4.【关键】跨 pod 真的合并了 —— 在 vm-select 上查
+count({__name__=~"acg_.+",pod!=""})          # 必须是 0
+count(acg_requests_concurrent_total)         # 应等于活跃 Key 数,不是它的 3 倍或 1/3
+```
+
+**第 4 条是这次改造的核心**，前三条过了但第 4 条不过，等于没生效。
+
+再对一次账：取同一时间窗，VM 里的增量与边车侧的请求计数应当相等。
 
 ```promql
 sum(increase(acg_requests_total[1h]))
@@ -352,7 +409,7 @@ sum(increase(acg_requests_total[1h]))
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
 | vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | `extraArgs` 里还留着这个参数，而镜像版本低于 `v1.126.1004-cluster`。**这个参数现在不该出现在配置里**（1011 起默认就是 1），删掉即可。但镜像仍然必须升级——022 修的 dedup 少算 bug 是正确性问题，没有绕过的办法 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1011-cluster` 构建的。`sum_samples_total` 上游没有 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1013-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
