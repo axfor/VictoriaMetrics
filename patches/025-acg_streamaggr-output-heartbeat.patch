@@ -1,0 +1,303 @@
+From 2d73dabdea8dea370d56cac456f6d4962b7a176a Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Mon, 21 Sep 2026 22:24:11 -0700
+Subject: [PATCH 22/22] lib/streamaggr: let sum_samples_total leave out flushes
+ that change nothing
+
+An aggregator flushes every output every interval, whether or not the value
+moved. With scrape targets reporting increments that is mostly rewriting what
+the storage already holds: measured on a rotating key set of 30k, 26180 output
+series and 6723 of them -- a quarter -- carrying any increase in a two minute
+window. The other three quarters are the same total written again.
+
+output_heartbeat_interval leaves those out. A flush whose value equals the one
+last written is skipped unless the heartbeat is due.
+
+Skipping is safe for this output, and would not be for one that resets every
+interval, because a change is always written. A gap therefore spans an interval
+over which the value did not move, the samples on either side of it are equal,
+and increase() over any window containing the gap is unaffected. Nothing is
+attributed to the wrong window either: the value at the start of a gap is the
+value at its end.
+
+The heartbeat is there for a different reason. A series with no sample for
+longer than the query side's lookbehind -- five minutes by default -- reads as
+stale, so the interval has to stay under that, or -search.maxStalenessInterval
+has to be raised to match. That is why it is a parameter rather than a fixed
+choice: how far it can be pushed is a property of the query side, not of the
+aggregation.
+
+Empty or 0 keeps the old behaviour, and a value below the flush interval is
+rejected rather than silently doing nothing -- an output is only written on
+flush, so it could never take effect.
+
+The flush at shutdown is not special-cased. An earlier draft did, on the
+thinking that a restart needs the last value written; it does not, and no test
+could be made to fail over it. If the value moved it is written like any other
+change, and if it did not, the storage already holds it at the timestamp since
+which it has been true.
+
+Tests assert what is left out and that the total still arrives, rather than a
+sample count: the scenario harness aligns pushes to flushes by wall clock, so
+which flush a push lands in varies between runs, and a count-based assertion
+fails at random. Writing a changed value only once is caught by them.
+
+vm_streamaggr_skipped_unchanged_outputs_total counts what was left out.
+---
+ lib/streamaggr/output_heartbeat_test.go | 97 +++++++++++++++++++++++++
+ lib/streamaggr/streamaggr.go            | 40 ++++++++++
+ lib/streamaggr/sum_samples.go           | 38 ++++++++++
+ 3 files changed, 175 insertions(+)
+ create mode 100644 lib/streamaggr/output_heartbeat_test.go
+
+diff --git a/lib/streamaggr/output_heartbeat_test.go b/lib/streamaggr/output_heartbeat_test.go
+new file mode 100644
+index 000000000..597082dac
+--- /dev/null
++++ b/lib/streamaggr/output_heartbeat_test.go
+@@ -0,0 +1,97 @@
++package streamaggr
++
++import (
++	"testing"
++	"time"
++)
++
++// Writing an output whose value has not moved is ingestion for a value the
++// storage already holds. output_heartbeat_interval leaves those flushes out.
++//
++// It is only safe because a change is always written: a gap therefore spans an
++// interval over which the value did not move, so the samples on either side of
++// it are equal and increase() over any window containing the gap is unaffected.
++//
++// The scenario harness aligns pushes to flushes by wall clock, so which flush a
++// push lands in varies between runs. These assert the invariants that do not --
++// what gets left out, and that the total still arrives -- rather than a count.
++func TestOutputHeartbeatLeavesOutRepeatsOnly(t *testing.T) {
++	rule := func(hb string) string {
++		return "- match: foo\n  interval: 1m\n  output_heartbeat_interval: " + hb +
++			"\n  drop_input_labels: [pod]\n  outputs: [sum_samples_total]\n" +
++			"  keep_metric_names: true\n  staleness_interval: 40m\n"
++	}
++	// Five increments of 1, one per interval, then two idle intervals.
++	var pushes []pushAt
++	for i := 0; i < 5; i++ {
++		pushes = append(pushes, pushAt{at: time.Duration(i) * time.Minute, metrics: `foo{pod="a"} 1`})
++	}
++	const until = 7 * time.Minute
++
++	values := func(hb string) []float64 {
++		got := runStaleScenario(t, rule(hb), pushes, until, 0)["foo"]
++		v := make([]float64, 0, len(got))
++		for _, s := range got {
++			v = append(v, s.value)
++		}
++		return v
++	}
++
++	off := values("0s")
++	on := values("30m")
++
++	if len(off) == 0 || len(on) == 0 {
++		t.Fatalf("no samples: off=%v on=%v", off, on)
++	}
++	// The total has to survive whatever was skipped.
++	if off[len(off)-1] != 5 {
++		t.Fatalf("without the heartbeat the total is %v, want 5 -- the scenario itself is wrong", off[len(off)-1])
++	}
++	if last := on[len(on)-1]; last != 5 {
++		t.Errorf("with the heartbeat the total is %v, want 5: an increment was lost with a skipped flush", last)
++	}
++	// Every value written has to be a change. Repeats are exactly what is left out.
++	for i := 1; i < len(on); i++ {
++		if on[i] == on[i-1] {
++			t.Errorf("wrote %v twice in a row (%v): an unchanged flush was not skipped", on[i], on)
++		}
++	}
++	// And the baseline has to contain a repeat, or this proves nothing.
++	repeated := false
++	for i := 1; i < len(off); i++ {
++		if off[i] == off[i-1] {
++			repeated = true
++		}
++	}
++	if !repeated {
++		t.Fatalf("the baseline %v has no repeated value, so there was nothing to skip -- the scenario is too short", off)
++	}
++	if len(on) >= len(off) {
++		t.Errorf("heartbeat wrote %d samples, baseline %d: it should write fewer (%v vs %v)", len(on), len(off), on, off)
++	}
++}
++
++// Off by default: an empty or zero interval writes every flush, as before.
++func TestOutputHeartbeatIsOffByDefault(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  drop_input_labels: [pod]\n  outputs: [sum_samples_total]\n" +
++		"  keep_metric_names: true\n  staleness_interval: 40m\n"
++	got := runStaleScenario(t, cfg, []pushAt{{at: 0, metrics: `foo{pod="a"} 1`}}, 5*time.Minute, 0)["foo"]
++	repeated := false
++	for i := 1; i < len(got); i++ {
++		if got[i].value == got[i-1].value {
++			repeated = true
++		}
++	}
++	if !repeated {
++		t.Errorf("without output_heartbeat_interval every flush has to be written, but %d samples carry no repeat", len(got))
++	}
++}
++
++// A heartbeat below the flush interval is a configuration error rather than a
++// no-op: an output is only written on flush, so it could never take effect.
++func TestOutputHeartbeatRejectsSubIntervalValues(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  output_heartbeat_interval: 10s\n  outputs: [sum_samples_total]\n"
++	if _, err := LoadFromData([]byte(cfg), nil, &Options{}, "test"); err == nil {
++		t.Error("a heartbeat shorter than the interval was accepted")
++	}
++}
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 6e46b304a..d8910ea3c 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -199,6 +199,25 @@ type Config struct {
+ 	// (for example, because of a scrape outage), the marker makes the values before the gap to be counted twice.
+ 	ResetMarkerOnStale *bool `yaml:"reset_marker_on_stale,omitempty"`
+ 
++	// OutputHeartbeatInterval makes sum_samples_total skip a flush whose value is
++	// the same as the one last written, re-sending an unchanged output only this
++	// often. With scrape targets reporting increments, most outputs are unchanged
++	// in any one interval -- measured on a rotating key set, three quarters of
++	// them -- and writing each one again every interval is that much ingestion
++	// for a value the storage already holds.
++	//
++	// Skipping is safe for this output because a change is always written: a gap
++	// therefore spans an interval over which the value did not move, so the
++	// samples on either side of it are equal and increase() over any window
++	// containing the gap is unaffected.
++	//
++	// The heartbeat exists for a different reason -- a series with no sample for
++	// longer than the query side's lookbehind (5 minutes by default in
++	// VictoriaMetrics) reads as stale -- so keep this below that, or raise
++	// -search.maxStalenessInterval to match. Empty or 0 disables it, and every
++	// flush is written as before.
++	OutputHeartbeatInterval string `yaml:"output_heartbeat_interval,omitempty"`
++
+ 	// Outputs is a list of output aggregate functions to produce.
+ 	//
+ 	// The following names are allowed:
+@@ -416,6 +435,7 @@ type aggregator struct {
+ 	inputRelabeling   *promrelabel.ParsedConfigs
+ 	outputRelabeling  *promrelabel.ParsedConfigs
+ 	stalenessInterval time.Duration
++	outputHeartbeatInterval time.Duration
+ 
+ 	keepMetricNames  bool
+ 	ignoreOldSamples bool
+@@ -461,6 +481,7 @@ type aggregator struct {
+ 	samplesLag    *metrics.Histogram
+ 
+ 	flushTimeouts     *metrics.Counter
++	skippedOutputs    *metrics.Counter
+ 	ignoredOldSamples *metrics.Counter
+ 	ignoredNaNSamples *metrics.Counter
+ 	matchedSamples    *metrics.Counter
+@@ -509,6 +530,22 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		return nil, fmt.Errorf("interval=%s must be a multiple of dedup_interval=%s", interval, dedupInterval)
+ 	}
+ 
++	// check cfg.OutputHeartbeatInterval
++	var outputHeartbeatInterval time.Duration
++	if cfg.OutputHeartbeatInterval != "" {
++		outputHeartbeatInterval, err = time.ParseDuration(cfg.OutputHeartbeatInterval)
++		if err != nil {
++			return nil, fmt.Errorf("cannot parse `output_heartbeat_interval: %q`: %w", cfg.OutputHeartbeatInterval, err)
++		}
++		if outputHeartbeatInterval < 0 {
++			return nil, fmt.Errorf("`output_heartbeat_interval: %q` must be non-negative", cfg.OutputHeartbeatInterval)
++		}
++		if outputHeartbeatInterval > 0 && outputHeartbeatInterval < interval {
++			return nil, fmt.Errorf("`output_heartbeat_interval: %q` cannot be smaller than `interval: %q`: an output is only "+
++				"written on flush, so a heartbeat shorter than the interval changes nothing", cfg.OutputHeartbeatInterval, cfg.Interval)
++		}
++	}
++
+ 	// check cfg.StalenessInterval
+ 	stalenessInterval := interval * 2
+ 	if cfg.StalenessInterval != "" {
+@@ -677,6 +714,8 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		enableWindows:     enableWindows,
+ 		stalenessInterval: stalenessInterval,
+ 
++		outputHeartbeatInterval: outputHeartbeatInterval,
++
+ 		by:                  by,
+ 		without:             without,
+ 		aggregateOnlyByTime: aggregateOnlyByTime,
+@@ -695,6 +734,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+ 		matchedSamples:    ms.NewCounter(fmt.Sprintf(`vm_streamaggr_matched_samples_total{%s}`, metricLabels)),
+ 		flushTimeouts:     ms.NewCounter(fmt.Sprintf(`vm_streamaggr_flush_timeouts_total{%s}`, metricLabels)),
++		skippedOutputs:    ms.NewCounter(fmt.Sprintf(`vm_streamaggr_skipped_unchanged_outputs_total{%s}`, metricLabels)),
+ 		ignoredNaNSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="nan",%s}`, metricLabels)),
+ 		ignoredOldSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="too_old",%s}`, metricLabels)),
+ 	}
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index ec583f88f..dc512ae20 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -44,6 +44,19 @@ type sumSamplesTotalAggrValue struct {
+ 
+ type sumSamplesTotalShared struct {
+ 	total float64
++
++	// lastWritten is the value the last flush actually wrote, and lastWrittenAt
++	// when. They are only consulted under output_heartbeat_interval: a flush
++	// whose total equals lastWritten and that falls within the heartbeat is
++	// skipped, because the storage already holds that value.
++	//
++	// Skipping is safe here and would not be for an output that resets every
++	// interval: a change is always written, so a gap spans an interval over
++	// which the value did not move, the samples on either side of it are equal,
++	// and increase() over any window containing the gap is unaffected.
++	lastWritten   float64
++	lastWrittenAt int64
++	written       bool
+ }
+ 
+ func (av *sumSamplesTotalAggrValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
+@@ -59,9 +72,34 @@ func (av *sumSamplesTotalAggrValue) flush(_ aggrConfig, ctx *flushCtx, key strin
+ 	} else {
+ 		av.shared.total = total
+ 	}
++	if av.skip(ctx, total) {
++		ctx.a.skippedOutputs.Inc()
++		return
++	}
++	av.shared.lastWritten = total
++	av.shared.lastWrittenAt = ctx.flushTimestamp
++	av.shared.written = true
+ 	ctx.appendSeries(key, "sum_samples_total", total)
+ }
+ 
++// skip reports whether this flush writes nothing because the value has not
++// moved since the last one written and the heartbeat is not due.
++//
++// The flush at shutdown is not special-cased. Writing it again would change
++// nothing observable: if the value moved it is written like any other change,
++// and if it did not, the storage already holds it at an earlier timestamp,
++// which is where it has been true since.
++func (av *sumSamplesTotalAggrValue) skip(ctx *flushCtx, total float64) bool {
++	hb := ctx.a.outputHeartbeatInterval
++	if hb <= 0 || !av.shared.written {
++		return false
++	}
++	if total != av.shared.lastWritten {
++		return false
++	}
++	return ctx.flushTimestamp-av.shared.lastWrittenAt < hb.Milliseconds()
++}
++
+ func (av *sumSamplesTotalAggrValue) state() any {
+ 	return av.shared
+ }
+-- 
+2.50.1 (Apple Git-155)
+

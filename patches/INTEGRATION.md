@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1013-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1014-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,7 +53,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1013-cluster` 构建。
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1014-cluster` 构建。
 
 **最低 `v1.126.1004-cluster`，低于它会有两个问题，一个起不来、一个静默算错：**
 
@@ -84,7 +84,7 @@ extraArgs:
   remoteWrite.maxDiskUsagePerURL: "10GB"
 ```
 
-**不要再配 `zstd.encoderConcurrency`。** 从 `v1.126.1013-cluster` 起它默认就是 1，不用写；而写了会在旧镜像上让 vmagent 直接启动失败（`flag provided but not defined`）——一个纯内存优化把进程搞挂，所以我们把它从必配项里去掉了。
+**不要再配 `zstd.encoderConcurrency`。** 从 `v1.126.1014-cluster` 起它默认就是 1，不用写；而写了会在旧镜像上让 vmagent 直接启动失败（`flag provided but not defined`）——一个纯内存优化把进程搞挂，所以我们把它从必配项里去掉了。
 
 后两项是同一类问题：**按核数放大的常驻内存，与实际吞吐无关**。
 
@@ -277,7 +277,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1013-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1014-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -300,7 +300,7 @@ kubectl exec -n acg-system deploy/victoria-metrics-agent -- \
 
 **删配置只能让进程起来，第二个是正确性问题，必须换镜像。**
 
-**换镜像**：拉 fork 的 `v1.126.1013-cluster` 构建；内网拉不到 GitHub 就在现有源码上补打 `022`、`023`、`024`（当前应已打到 021）。打完自检：
+**换镜像**：拉 fork 的 `v1.126.1014-cluster` 构建；内网拉不到 GitHub 就在现有源码上补打 `022`、`023`、`024`（当前应已打到 021）。打完自检：
 
 ```sh
 grep -c buildInputKey lib/streamaggr/output.go            # 2
@@ -351,11 +351,36 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 
 **怎么判断自己属于哪一档**：看 vmagent 的 RSS 是不是远超「此刻活跃 Key 数 × 145 条序列」对应的量——是就按第二档配。
 
-**要降第二档的内存，唯一的杠杆是 `staleness_interval`**。报增量时缩短它是语义安全的，但它必须大于「同一个 Key 两次活跃之间的最长间隔」，否则中间那段会被判 stale、补 0 重来。上线前按真实活跃模式测一轮定值。
+**别指望靠 `staleness_interval` 降内存。** 实测 40m → 5m 只省 **15.4%**（1224 → 1036 MiB），不是按窗口比例缩。省下的只是 `sync.Map` 的条目节点，而标签压缩器和字符串驻留按「**见过的全量 Key**」持有，跟窗口长度无关。
+
+而且缩短它有个容易踩的副作用：累加器会不断过期归零，**`sum(acg_requests_total)` 这种直接读累计值的查询会得到几乎无意义的数**（实测比真实值低 85%）。`increase()` 能正确识别重置，所以对账要用 `increase()`，不能用当前值。
+
+第二档的内存要降，方向是**少写**（见下）和**降基数**（见 `vm-storage-cardinality.md`）。
 
 ### 增长口径
 
 **边车随注册 Key 线性长**（每个被访问过的 Key 都要有常驻实例），**vmagent 跟活跃窗口内的 Key 数走**。所以 vmagent 按活跃形态配，边车按注册 Key 扛峰值。
+
+### 减少写入：`output_heartbeat_interval`（可选，v1.126.1014-cluster 起）
+
+聚合器每个 `interval` 会把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写了一遍。
+
+`output_heartbeat_interval` 让 `sum_samples_total` 跳过这些：值和上次写的相同就不写，除非心跳到期。
+
+```yaml
+- match: '{_metric_type!="gauge",_metric_type!=""}'
+  interval: 60s
+  output_heartbeat_interval: 4m      # 加这一行
+  ...
+```
+
+**为什么不丢账**：值变了就一定写，所以空缺期间值必然恒定，`increase_pure` 在空缺两端取到同一个值。心跳只负责不让序列被 VM 判 stale，不承担正确性。
+
+**心跳上限由查询侧决定**，不是聚合层的性质：VM 默认 lookbehind 5 分钟，所以要低于它；调大 `-search.maxStalenessInterval` 到 15m 之后可以用 `10m`，写入降到约三分之一。
+
+预期降幅：`4m` 约降到 44%，`10m` 约降到 33%。
+
+**注意**：这条**只减少写入压力（vmstorage 的 CPU 与 IOPS），不成比例减少磁盘** —— 磁盘的大头是按序列数算的索引，见下。而且**端到端还没在真实负载上验证过**，上线前自己测一轮，盯 `vm_streamaggr_skipped_unchanged_outputs_total` 和对账。空值或 0 是原行为。
 
 存储另见 `docs/apikey-usage/vm-storage-cardinality.md`——结论是 VM 的磁盘和查询成本都由**序列数**决定，与写入频率无关，降存储只能降基数。
 
@@ -409,7 +434,7 @@ sum(increase(acg_requests_total[1h]))
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
 | vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | `extraArgs` 里还留着这个参数，而镜像版本低于 `v1.126.1004-cluster`。**这个参数现在不该出现在配置里**（1011 起默认就是 1），删掉即可。但镜像仍然必须升级——022 修的 dedup 少算 bug 是正确性问题，没有绕过的办法 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1013-cluster` 构建的。`sum_samples_total` 上游没有 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1014-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
@@ -434,9 +459,9 @@ go run ./examples/delta
 
 ## 试过但不推荐的
 
-**`staleness_interval` 缩短到 5m。** 报增量时它确实可以短——40 分钟那个下限是为报累计值定的（聚合端忘掉还活着的闲置实例会导致整个累计值被重复计一遍），而报增量时状态被忘掉后累加器归零、下一个样本从 0 开始，`reset_marker_on_stale` 两端都补 0、`increase()` 正确识别，不丢不重。
+**`staleness_interval` 缩短到 5m。** 报增量时它语义上确实可以短——40 分钟那个下限是为报累计值定的（聚合端忘掉还活着的闲置实例会导致整个累计值被重复计一遍），而报增量时状态被忘掉后累加器归零、下一个样本从 0 开始，`reset_marker_on_stale` 两端都补 0、`increase()` 正确识别，不丢不重。
 
-但实测只省 16 MiB（同一轮 A/B 里的 204 → 188），因为省下的只是 `sync.Map` 的条目节点，trie 结构和字符串驻留都不随之释放。**8% 的收益配不上动一个和正确性相关的参数**，保持 40m。
+但两种形态下都不值得：固定活跃集只省 8%，轮换形态实测也只省 15.4%（1224 → 1036 MiB）。**省下的只是 `sync.Map` 的条目节点**，trie 结构和字符串驻留都不随之释放。代价却是实打实的：累加器不断归零，任何直接读累计值的查询都会错（实测低 85%）。保持 40m。
 
 **这个结论只对「活跃 Key 基本固定」成立。** Key 轮流活跃时，40 分钟窗口决定的是「要记住多少个 Key」，缩短它省的就不是 8% 而是成倍——见 §六 末尾那一节。
 
