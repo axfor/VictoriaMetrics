@@ -183,7 +183,19 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **按活跃 Key 数线性走**，约 **1.4 KiB/Key**——每轮发的就是有变化的那些。注册 Key 总数不影响，只有**一批同时活跃的数量**影响。
 
-推下去 16 MiB 的默认值对应一批活跃约 1.1 万。**不要留在默认值上赌**：撞上去的表现是 vmagent 静默拒收整个响应，**只有 warn 日志、`up` 仍然是 1、一个样本都不进**，等发现时账已经缺了一段。
+推下去 16 MiB 的默认值对应一批活跃约 1.1 万。
+
+**但真正的风险不在稳态，在恢复场景**——这个上限要按「**最坏情况下同时待送达的量**」算，而不是稳态的变化量。vmagent 停了一段时间（升级、故障、配置错误）之后，边车会把所有未送达的增量攒着，恢复时一次全发。实测 3 万 Key 全部待送达时，压缩后 **16.26 MiB**，刚好越过 16 MiB 默认值。
+
+**撞上去不是丢一次抓取，是永久卡死：**
+
+```
+scrape=3  lines=1060499  ok=False
+scrape=4  lines=1061723  ok=False   ← 不降反增
+scrape=5  lines=1062771  ok=False
+```
+
+送达失败 → 边车把增量放回去等下次 → 下次响应只会更大 → 永远超限。**只有 warn 日志、`up` 仍然是 1、一个样本都不进**，而且再也不会自己恢复，除非调大限值或重启边车（丢掉积压的账）。
 
 所以上面直接把 `promscrape.maxScrapeSize` 设成 **500MiB**（约 35 万活跃 Key 的余量，等于把这个上限彻底挪出视线）。**调大它不花内存**——它只是 `io.LimitReader` 的上界，读取缓冲按上一次响应的实际大小定容，响应没真变大就不会多占。
 
@@ -191,7 +203,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 不想要这个风险就设回 `64MiB`（约 4.5 万活跃 Key，最坏 192 MiB），照样远超实测需要。
 
-上线后盯 `vm_promscrape_max_scrape_size_exceeded_errors_total`，必须恒为 0。
+上线后盯 `vm_promscrape_max_scrape_size_exceeded_errors_total`，**必须恒为 0**——它一旦非零就不会自己变回去，要立刻调大限值并 reload。
 
 两个口径别混：`vm_promscrape_scrape_response_size_bytes` 记的是**解压后**的字节，而 `maxScrapeSize` 判的是**压缩后**的（约差 30~40 倍，后者才是真正的网络流量）。要盯上限就看后者，别拿前一个指标去比。
 
@@ -429,6 +441,7 @@ sum(increase(acg_requests_total[1h]))
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
 | 边车内存比预期高，且聚合侧计数器重置频繁 | 代码里写了 `opts.IdleScrapes = 90`（早前文档的错误建议）。删掉这一行，用 `delta.Increments()` 的默认 30 |
 | vmagent 启动即退出，日志 `cannot parse stream aggregation config: field output_heartbeat_interval not found` | 聚合配置里有这个参数，但镜像早于 `v1.126.1014-cluster`（这个参数是那一版加的）。先换镜像，别把参数删掉 |
+| VM 里突然没有新数据，但 `up` 是 1、日志只有 warn | 抓取超限被拒。查 `vm_promscrape_max_scrape_size_exceeded_errors_total`，非零即是。**不会自愈**——边车把未送达的增量攒着，下次响应更大，永远超限。调大 `promscrape.maxScrapeSize` 并 reload |
 | vmagent 启动即退出，日志 `flag provided but not defined` | `extraArgs` 里配了当前镜像不认识的参数。`zstd.encoderConcurrency` 不该出现在配置里（默认已是 1），删掉；其余参数对照 §二 |
 | 聚合配置启动报错 | vmagent 不是用 `v1.126.1023-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
