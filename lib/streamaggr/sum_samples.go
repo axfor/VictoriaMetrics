@@ -44,6 +44,19 @@ type sumSamplesTotalAggrValue struct {
 
 type sumSamplesTotalShared struct {
 	total float64
+
+	// lastWritten is the value the last flush actually wrote, and lastWrittenAt
+	// when. They are only consulted under output_heartbeat_interval: a flush
+	// whose total equals lastWritten and that falls within the heartbeat is
+	// skipped, because the storage already holds that value.
+	//
+	// Skipping is safe here and would not be for an output that resets every
+	// interval: a change is always written, so a gap spans an interval over
+	// which the value did not move, the samples on either side of it are equal,
+	// and increase() over any window containing the gap is unaffected.
+	lastWritten   float64
+	lastWrittenAt int64
+	written       bool
 }
 
 func (av *sumSamplesTotalAggrValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
@@ -59,7 +72,32 @@ func (av *sumSamplesTotalAggrValue) flush(_ aggrConfig, ctx *flushCtx, key strin
 	} else {
 		av.shared.total = total
 	}
+	if av.skip(ctx, total) {
+		ctx.a.skippedOutputs.Inc()
+		return
+	}
+	av.shared.lastWritten = total
+	av.shared.lastWrittenAt = ctx.flushTimestamp
+	av.shared.written = true
 	ctx.appendSeries(key, "sum_samples_total", total)
+}
+
+// skip reports whether this flush writes nothing because the value has not
+// moved since the last one written and the heartbeat is not due.
+//
+// The flush at shutdown is not special-cased. Writing it again would change
+// nothing observable: if the value moved it is written like any other change,
+// and if it did not, the storage already holds it at an earlier timestamp,
+// which is where it has been true since.
+func (av *sumSamplesTotalAggrValue) skip(ctx *flushCtx, total float64) bool {
+	hb := ctx.a.outputHeartbeatInterval
+	if hb <= 0 || !av.shared.written {
+		return false
+	}
+	if total != av.shared.lastWritten {
+		return false
+	}
+	return ctx.flushTimestamp-av.shared.lastWrittenAt < hb.Milliseconds()
 }
 
 func (av *sumSamplesTotalAggrValue) state() any {

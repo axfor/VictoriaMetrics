@@ -199,6 +199,25 @@ type Config struct {
 	// (for example, because of a scrape outage), the marker makes the values before the gap to be counted twice.
 	ResetMarkerOnStale *bool `yaml:"reset_marker_on_stale,omitempty"`
 
+	// OutputHeartbeatInterval makes sum_samples_total skip a flush whose value is
+	// the same as the one last written, re-sending an unchanged output only this
+	// often. With scrape targets reporting increments, most outputs are unchanged
+	// in any one interval -- measured on a rotating key set, three quarters of
+	// them -- and writing each one again every interval is that much ingestion
+	// for a value the storage already holds.
+	//
+	// Skipping is safe for this output because a change is always written: a gap
+	// therefore spans an interval over which the value did not move, so the
+	// samples on either side of it are equal and increase() over any window
+	// containing the gap is unaffected.
+	//
+	// The heartbeat exists for a different reason -- a series with no sample for
+	// longer than the query side's lookbehind (5 minutes by default in
+	// VictoriaMetrics) reads as stale -- so keep this below that, or raise
+	// -search.maxStalenessInterval to match. Empty or 0 disables it, and every
+	// flush is written as before.
+	OutputHeartbeatInterval string `yaml:"output_heartbeat_interval,omitempty"`
+
 	// Outputs is a list of output aggregate functions to produce.
 	//
 	// The following names are allowed:
@@ -416,6 +435,7 @@ type aggregator struct {
 	inputRelabeling   *promrelabel.ParsedConfigs
 	outputRelabeling  *promrelabel.ParsedConfigs
 	stalenessInterval time.Duration
+	outputHeartbeatInterval time.Duration
 
 	keepMetricNames  bool
 	ignoreOldSamples bool
@@ -461,6 +481,7 @@ type aggregator struct {
 	samplesLag    *metrics.Histogram
 
 	flushTimeouts     *metrics.Counter
+	skippedOutputs    *metrics.Counter
 	ignoredOldSamples *metrics.Counter
 	ignoredNaNSamples *metrics.Counter
 	matchedSamples    *metrics.Counter
@@ -507,6 +528,22 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	}
 	if dedupInterval > 0 && interval%dedupInterval != 0 {
 		return nil, fmt.Errorf("interval=%s must be a multiple of dedup_interval=%s", interval, dedupInterval)
+	}
+
+	// check cfg.OutputHeartbeatInterval
+	var outputHeartbeatInterval time.Duration
+	if cfg.OutputHeartbeatInterval != "" {
+		outputHeartbeatInterval, err = time.ParseDuration(cfg.OutputHeartbeatInterval)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse `output_heartbeat_interval: %q`: %w", cfg.OutputHeartbeatInterval, err)
+		}
+		if outputHeartbeatInterval < 0 {
+			return nil, fmt.Errorf("`output_heartbeat_interval: %q` must be non-negative", cfg.OutputHeartbeatInterval)
+		}
+		if outputHeartbeatInterval > 0 && outputHeartbeatInterval < interval {
+			return nil, fmt.Errorf("`output_heartbeat_interval: %q` cannot be smaller than `interval: %q`: an output is only "+
+				"written on flush, so a heartbeat shorter than the interval changes nothing", cfg.OutputHeartbeatInterval, cfg.Interval)
+		}
 	}
 
 	// check cfg.StalenessInterval
@@ -677,6 +714,8 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		enableWindows:     enableWindows,
 		stalenessInterval: stalenessInterval,
 
+		outputHeartbeatInterval: outputHeartbeatInterval,
+
 		by:                  by,
 		without:             without,
 		aggregateOnlyByTime: aggregateOnlyByTime,
@@ -695,6 +734,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 
 		matchedSamples:    ms.NewCounter(fmt.Sprintf(`vm_streamaggr_matched_samples_total{%s}`, metricLabels)),
 		flushTimeouts:     ms.NewCounter(fmt.Sprintf(`vm_streamaggr_flush_timeouts_total{%s}`, metricLabels)),
+		skippedOutputs:    ms.NewCounter(fmt.Sprintf(`vm_streamaggr_skipped_unchanged_outputs_total{%s}`, metricLabels)),
 		ignoredNaNSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="nan",%s}`, metricLabels)),
 		ignoredOldSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="too_old",%s}`, metricLabels)),
 	}
