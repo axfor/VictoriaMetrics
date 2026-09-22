@@ -80,6 +80,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 ```yaml
 extraArgs:
   promscrape.zstdCompression: "true"
+  promscrape.maxScrapeSize: "64MiB"
   remoteWrite.queues: "2"
   remoteWrite.maxDiskUsagePerURL: "10GB"
 ```
@@ -164,9 +165,13 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 | 2000（固定） | 2.29 MiB | 约 94 MiB |
 | 5000（轮换） | 7.11 MiB | 约 223 MiB |
 
-**按活跃 Key 数线性走**，约 **1.4 KiB/Key**——每轮发的就是有变化的那些。推下去 16 MiB 上限对应**一批活跃 Key 约 1.1 万**。超过这个数就要调 `-promscrape.maxScrapeSize`，否则 vmagent 静默拒收整个响应（只有 warn 日志、`up` 仍然是 1）。盯 `vm_promscrape_max_scrape_size_exceeded_errors_total`，必须恒为 0。
+**按活跃 Key 数线性走**，约 **1.4 KiB/Key**——每轮发的就是有变化的那些。注册 Key 总数不影响，只有**一批同时活跃的数量**影响。
 
-注册 Key 总数不影响这个大小，只有**一批同时活跃的数量**影响。
+推下去 16 MiB 的默认值对应一批活跃约 1.1 万。**不要留在默认值上赌**：撞上去的表现是 vmagent 静默拒收整个响应，**只有 warn 日志、`up` 仍然是 1、一个样本都不进**，等发现时账已经缺了一段。
+
+所以 §二 里直接把 `promscrape.maxScrapeSize` 设成 **64MiB**（约 4.5 万活跃 Key 的余量）。**调大它不花内存**——它只是 `io.LimitReader` 的上界，读取缓冲按上一次的实际大小定容，响应没真变大就不会多占。留一个上界是为了万一目标失控时还有个刹车，所以别直接设成无限大。
+
+上线后盯 `vm_promscrape_max_scrape_size_exceeded_errors_total`，必须恒为 0。
 
 两个口径别混：`vm_promscrape_scrape_response_size_bytes` 记的是**解压后**的字节，而 `maxScrapeSize` 判的是**压缩后**的（约差 30~40 倍，后者才是真正的网络流量）。要盯上限就看后者，别拿前一个指标去比。
 
@@ -223,7 +228,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
   staleness_interval: 40m
   reset_marker_on_stale: true
   flush_on_shutdown: true
-  # output_heartbeat_interval: 4m    # 可选,减少写入,见下
+  output_heartbeat_interval: 4m
 
 - match: '{_metric_type="gauge"}'
   interval: 60s
@@ -234,17 +239,25 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
   dedup_interval: 60s
 ```
 
-### 可选：`output_heartbeat_interval` 减少写入（v1.126.1014-cluster 起）
+### `output_heartbeat_interval`：少写四分之三（v1.126.1014-cluster 起）
 
-聚合器每个 `interval` 把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写一遍。打开这个参数后，值和上次写的相同就不写，除非心跳到期。
+聚合器每个 `interval` 把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写一遍。打开后，值和上次写的相同就不写，除非心跳到期。`4m` 写入降到约 44%。
 
-**为什么不丢账**：值变了就一定写，所以空缺期间值必然恒定，`increase_pure` 在空缺两端取到同一个值。心跳只负责不让序列被 VM 判 stale，不承担正确性。
+**为什么不丢账**：值变了就一定写，所以空缺期间值必然恒定，`increase_pure` 在空缺两端取到同一个值。心跳不承担正确性，只负责不让序列在查询侧显得 stale。
 
-**上限由查询侧决定**：VM 默认 lookbehind 5 分钟，所以要低于它；把 `-search.maxStalenessInterval` 调到 15m 之后可以用 `10m`。预期 `4m` 写入降到约 44%，`10m` 约 33%。
+**为什么 `4m` 是安全的**：VM 的 lookback 默认**按每条序列自己的样本间隔推断**（该序列前 20 个间隔的 0.6 分位 + 1/8 余量），不是固定 5 分钟。更重要的是，**用量查询全部是显式区间**（`increase_pure(m[@range])`、`sum_over_time(m_1h[@range])`），走 `rc.Window`，**根本不经过 lookback**。
 
-**只减写入压力（vmstorage 的 CPU 与 IOPS），不成比例减磁盘**——磁盘大头是按序列数算的索引，见 §六。空值或 0 是原行为；小于 `interval` 的值会直接报错。
+只有**裸选择器的瞬时查询**（如直接查 `acg_requests_total` 不带区间）才可能因为空缺取不到点。要覆盖这种用法，在 vm-select 上加一条兜底：
 
-**端到端还没在真实负载上验证过**，所以默认没开。要用先在测试环境测一轮，盯 `vm_streamaggr_skipped_unchanged_outputs_total` 和对账（对账用 `increase()`，不能用当前累计值）。
+```
+-search.minStalenessInterval=5m
+```
+
+它把每条序列的 staleness 下限抬到 5 分钟，大于心跳即可。**心跳值必须小于这个下限。**
+
+**只减写入压力（vmstorage 的 CPU 与 IOPS），不成比例减磁盘**——磁盘大头是按序列数算的索引，见 §六。小于 `interval` 的值会直接报错；空值或 0 退回原来每轮全写的行为。
+
+上线后盯 `vm_streamaggr_skipped_unchanged_outputs_total` 应持续增长，并用 `increase()` 对一次账（不能用当前累计值）。
 
 ### 三处容易写错的地方
 
@@ -345,7 +358,7 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 
 而且缩短它有个容易踩的副作用：累加器会不断过期归零，**`sum(acg_requests_total)` 这种直接读累计值的查询会得到几乎无意义的数**（实测比真实值低 85%）。`increase()` 能正确识别重置，所以对账要用 `increase()`，不能用当前值。
 
-第二档的内存要降，方向是 §四 那个 `output_heartbeat_interval`（少写）和降基数（见 `vm-storage-cardinality.md`）。
+第二档的内存要降，方向是降基数（见 `vm-storage-cardinality.md`）。§四 的 `output_heartbeat_interval` 降的是写入压力，不是 vmagent 的内存。
 
 ### 增长口径
 
@@ -356,7 +369,7 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 
 ## 七、上线后
 
-四条验收，都要过：
+五条验收，都要过：
 
 ```sh
 # 1. 没有 flag 报错
@@ -367,15 +380,18 @@ curl -s http://<vmagent>:8429/metrics | grep -E "^vm_promscrape_scrapes_failed_t
 
 # 3. 走的是流式解析
 curl -s http://<vmagent>:8429/metrics | grep 'parse_mode_total{mode="one_shot"}'            # 0
+
+# 4. 跳过不变的输出确实在生效
+curl -s http://<vmagent>:8429/metrics | grep skipped_unchanged_outputs_total                # 应持续增长
 ```
 
 ```promql
-# 4.【关键】跨 pod 真的合并了 —— 在 vm-select 上查
+# 5.【关键】跨 pod 真的合并了 —— 在 vm-select 上查
 count({__name__=~"acg_.+",pod!=""})          # 必须是 0
 count(acg_requests_concurrent_total)         # 应等于活跃 Key 数,不是它的 3 倍或 1/3
 ```
 
-**第 4 条是这次改造的核心**，前三条过了但第 4 条不过，等于没生效。
+**第 5 条是这次改造的核心**，前四条过了但第 5 条不过，等于没生效。
 
 再对一次账：取同一时间窗，VM 里的增量与边车侧的请求计数应当相等。
 
