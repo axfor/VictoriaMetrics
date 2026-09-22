@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1009-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1010-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,7 +53,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1009-cluster` 构建。
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1010-cluster` 构建。
 
 **最低 `v1.126.1004-cluster`，低于它会有两个问题，一个起不来、一个静默算错：**
 
@@ -276,7 +276,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1009-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1010-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -290,173 +290,38 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 ## 六、配额
 
-3 万注册 Key、2000 活跃、三个边车，按本文全套配置跑 50 分钟，取第 35~50 分钟的稳态：
+按**活跃 Key 的形态**分两档配，差 8 倍，先确认自己属于哪一档。
 
-| | 存活堆（强制 GC 后） | 物理占用 | 建议配额 |
-|---|---|---|---|
-| 边车（每个） | 206 MiB | 299 MiB | 按注册 Key 数配，见下 |
-| **vmagent** | **148 MiB**（101~154） | **225 MiB**（150~233） | **512Mi** |
-| VM | — | 622~651 MiB | 见下面的说明 |
-
-同一轮里的其它数：
-
-- vmagent CPU **2.26 核秒/分钟**，约单核的 3.8%
-- 抓取 **74.6 万样本/分钟**（三个 pod 合计），聚合输出 **29.8 万样本/分钟**
-- 网络流量 **6.9 MiB/分钟**（压缩后），解压后 283 MiB/分钟
-- 解析模式 100% `stream_without_body`，抓取失败 0、超限 0、发送队列常态为 0
-- 边车活实例稳定在 **86,890** 个（约 2350 个 Key 有活实例，其余被闲置老化删掉）
-
-**合并是对的**：VM 里 `acg_requests_total` **2000 条** series、gauge `acg_requests_concurrent_total` 也是 **2000 条**，都等于活跃 Key 数；`acg_*` 里带 `pod` 标签的 **0 条**、带 `_metric_type` 的 **0 条**。
-
-**VM 的数不要直接当配额。** 它按可用内存自调缓存，上面 622~651 MiB 是本机跑出来的，换到限了内存的容器里是另一个数。按现网实际给。
-
-写入侧三个组件的观测（集群拓扑 vmagent → vm-insert → vm-storage，同一批流量）：
-
-| | 物理占用 | 说明 |
-|---|---|---|
-| vm-insert | 270~360 MiB | 无状态转发，跟吞吐走，基本不随 Key 数涨 |
-| vm-storage | 数 GiB | **按可用内存自调缓存**，和上面 VM 那条同理，不能当配额 |
-| vm-select | 8 MiB | 没有查询负载时几乎不占 |
-
-**我们的补丁一行都没碰这三个组件**（改动全在 `lib/promscrape`、`lib/promutil`、`lib/streamaggr`、`lib/encoding/zstd`），所以它们的容量按你们现有经验给就行，这里只是说明这条链路跑通了。
-
-**总基数**：`acg_*` 共 **298,359** 条 series，51 个指标名，约等于「活跃 Key 数 × 149」——2000 活跃就是 30 万条。上面那些「2000 条」是**单个指标名**的口径（每 Key 一条），别拿它估 VM 的存储压力。
-
-**vmagent 现在配 256 Mi，实测物理占用 225 MiB 常态、峰值 233 MiB**，余量太薄。512Mi 留一倍：聚合状态跟「过去 40 分钟内上报过的 Key」走，Key 批量导入会把它顶上去并且要 40 分钟才退。
-
-两端的增长口径不同（以下三档是早先一轮按同样方法实测的，绝对值对应当时的构建，看的是走势）：
-
-| 注册 Key | 边车（老化前峰值） | vmagent |
-|---|---|---|
-| 1 万 | 477 MiB | 210 MiB |
-| 3 万 | 1385 MiB | 227 MiB |
-| 10 万 | 4302 MiB | 261 MiB |
-
-**边车随注册 Key 线性长**（每个被访问过的 Key 都要有常驻实例；闲置老化走完后回落到活跃那一档，上表 206 MiB 就是回落后的值，1385 MiB 是老化前的峰值）；**vmagent 几乎不动**（聚合状态按输出 series 算，只跟活跃 Key 有关）。所以 vmagent 按活跃 Key 配，边车要按注册 Key 扛峰值。
-
-### ⚠️ 上面这一整套的前提是「活跃 Key 基本固定」
-
-**Key 轮流活跃时，上面的配额全部不成立。** 两端持有的都不是「此刻在忙的 Key」：
-
-- 聚合器为 **`staleness_interval`（40 分钟）窗口内出现过的每个 Key** 留一份状态，不是为此刻在报的那些。
-- 边车只删**连续 `-idle-scrapes`（30 次抓取 = 30 分钟）没被写过**的实例。
-
-只要**轮换一圈的周期短于这两个窗口**，两端最终持有的就是**全量注册 Key**。
-
-#### 实测：3 万 Key 全部轮流活跃，3 小时
-
-3 万注册 Key、总并发 5000、每 2 分钟换一批 5000 个活跃 Key（12 分钟轮完一圈），三个 app + vmagent + vm-insert + vm-storage 三分片，跑 180 分钟，取第 60~180 分钟（121 个采样点）：
+### 第一档：活跃 Key 基本固定（2000 活跃 / 3 万注册）
 
 | | 存活堆 | 物理占用 | 建议配额 |
 |---|---|---|---|
-| app（每个） | 1215 MiB | 1435 MiB | **2Gi** |
-| **vmagent** | **1224 MiB** | **1517 MiB** | **2Gi** |
-| vm-insert | — | 412 MiB | 现状 |
-| vm-storage（每分片） | — | 1754 MiB | 现状，按可用内存自调 |
-| vm-select | — | 11 MiB | 现状 |
+| 边车（每个） | 206 MiB | 299 MiB | 512Mi |
+| vmagent | 148 MiB | 225 MiB | 512Mi |
 
-对比固定 2000 活跃那一档：**vmagent 148 → 1224 MiB（8.3 倍）、app 206 → 1215 MiB（5.9 倍）**。
+### 第二档：Key 轮流活跃（每 2 分钟换一批 5000，12 分钟轮完 3 万）
 
-同一轮的其它数：
-
-- vmagent CPU **15.04 核秒/分钟**，约单核的 25%
-- app 活实例稳定在 **110.9 万**
-- 抓取 **135.5 万样本/分钟**，聚合输出 **440.6 万样本/分钟**
-- 压缩后单次抓取 **7 MiB**（16 MiB 上限的 44%），解压后 505 MiB/分钟
-- 540 次抓取 **100% `stream_without_body`**，抓取失败 0、超限 0；remote write 80,224 次全部 2XX
-
-**没有累积泄漏。** vmagent 存活堆从第 60 分钟起一直在 1206~1246 之间来回摆，第 180 分钟仍是 1224。配额按平台值给即可，不用乘时间系数。
-
-**合并与分片都正确**（经 vm-select 查）：
-
-- `acg_requests_total` **29,998** 条 series、gauge `acg_requests_concurrent_total` **29,963** 条——轮换下几乎全部 3 万 Key 都是活的
-- `acg_*` 里带 `pod`、`instance`、`_metric_type` 标签的各 **0** 条
-- 总 series **436 万**（3 万 Key × 约 145 条）
-- 三个 vm-storage 分片各持有 144.4 万 / 144.1 万 / 144.5 万个 metric id，**相差 0.3%**，分片均衡
-
-**vmagent 的内存花在哪**（存活堆 1133 MB 的构成）：
-
-```
-1057 MB (93%)  streamaggr.(*aggrOutputs).pushSamples   ← 聚合状态,就是主体
- 229 MB        sync trie 的 indirect 节点
- 192 MB        sync trie 的 entry 节点
-  97 MB        字符串驻留
-  94 MB        sumSamplesTotal.getValue
-   8 MB        zstd 编码器历史窗口          ← 一个槽,-zstd.encoderConcurrency=1 生效
-```
-
-聚合状态占 93%，所以**能动的只有「记住多少个 Key」这一个变量**。
-
-#### 要降内存，杠杆是 `staleness_interval`
-
-报增量时缩短它是语义安全的（见下面「试过但不推荐的」里的论证）。固定活跃集那轮只省了 8%，所以当时没推荐；但轮换形态下它直接决定要记住多少个 Key，收益完全是另一个量级——把 40m 缩到略大于轮换周期，聚合状态就从「全量 3 万」降到「一两批」。
-
-**上线前按你们真实的 Key 活跃模式测一轮再定值**，判据是：`staleness_interval` 要大于「同一个 Key 两次活跃之间的最长间隔」，否则中间那段会被当成 stale、补 0 重来（`reset_marker_on_stale` 保证不丢不重，但会多出 0 值点）。
-
-#### 自己属于哪一档，怎么判断
-
-看 vmagent 的 RSS 和 `vm_streamaggr_labels_compressor_items_count` 是不是涨到远超「此刻活跃 Key 数 × 145」——是的话就是轮换形态，按上面这张表配，不要按固定活跃那张。
-
-
-### VM 的存储由「序列数 × 天数」决定，不是由写入条数
-
-实测：索引跟写入条数**完全无关**。同样 10 万条序列、标签一字不差：
-
-| | 样本数 | indexdb | data |
+| | 存活堆 | 物理占用 | 建议配额 |
 |---|---|---|---|
-| 同一天，每序列 1 个点 | 10 万 | 7.7 MiB | 0.9 MiB |
-| 同一天，每序列 60 个点 | **600 万** | **7.7 MiB** | 1.1 MiB |
-| 3 天，每天 1 个点 | 30 万 | **14.5 MiB** | 0.9 MiB |
+| 边车（每个） | 1215 MiB | 1435 MiB | **2Gi** |
+| vmagent | 1224 MiB | 1517 MiB | **2Gi** |
 
-样本多 60 倍，索引 **−0.1%**；天数多 3 倍，索引 **+88.6%**。原因是 VM 除了全局的 `metricID ↔ 标签`，还有一份**按天的 `date → metricID`**——一条序列某天只要被写过哪怕一次，就要建一份当天条目。
+vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两者按可用内存自调缓存，按现网经验给即可）。
 
-按 ACG 真实标签形态（UUID × 10 个标签）拟合：**每序列 137 字节一次性 + 137 字节/天**。用它反推 3 小时那轮（436 万序列、1 天）应为 1.12 GiB，实测 1.162 GiB，差 4%。
+### 为什么差 8 倍
 
-三层保留期下的存储账（三层 series 数相同，都是 436 万）：
+两端持有的都不是「此刻在忙的 Key」：聚合器为 **`staleness_interval`（40 分钟）窗口内出现过的**每个 Key 留状态，边车只删**连续 `-idle-scrapes`（30 次抓取）没被写过**的实例。轮换一圈短于这两个窗口时，两端持有的就是**全量注册 Key**。
 
-| 层 | 保留 | 点/天 | 索引 | 数据 | 合计 |
-|---|---|---|---|---|---|
-| raw | 7 天 | 1440 | 4.5 GiB | 32.8 GiB | 37 GiB |
-| `_1h` | 30 天 | 24 | 17.3 GiB | 2.4 GiB | 20 GiB |
-| **`_1d`** | **365 天** | **1** | **204 GiB** | **1.2 GiB** | **206 GiB** |
-| | | | **226 GiB (86%)** | 36 GiB | **≈ 263 GiB** |
+**怎么判断自己属于哪一档**：看 vmagent 的 RSS 是不是远超「此刻活跃 Key 数 × 145 条序列」对应的量——是就按第二档配。
 
-**天层一层占 78%，其中 99.4% 是索引。** 它每条序列每天只写 1 个点（0.81 字节），却要为这个点建 137 字节的当天索引——索引是数据的 169 倍。
+**要降第二档的内存，唯一的杠杆是 `staleness_interval`**。报增量时缩短它是语义安全的，但它必须大于「同一个 Key 两次活跃之间的最长间隔」，否则中间那段会被判 stale、补 0 重来。上线前按真实活跃模式测一轮定值。
 
-**推论：降写入频率、只写变化，对 VM 存储几乎无效。** 天层已经是一天一个点了。唯一有效的是**降序列数**，而且它在天层上是 **365 倍杠杆**。
+### 增长口径
 
-### 降序列数的三条，都与业务语义无关
+**边车随注册 Key 线性长**（每个被访问过的 Key 都要有常驻实例），**vmagent 跟活跃窗口内的 Key 数走**。所以 vmagent 按活跃形态配，边车按注册 Key 扛峰值。
 
-**1. 名字和 ID 不要都做成标签（实测 indexdb −31.8%）**
+存储另见 `docs/apikey-usage/vm-storage-cardinality.md`——结论是 VM 的磁盘和查询成本都由**序列数**决定，与写入频率无关，降存储只能降基数。
 
-`business_group`/`business_group_id` 各 50 个取值、`route_model`/`route_model_id` 各 20、`provider_model`/`provider_model_id` 各 10——取值数相同说明是 1:1 映射。同时存两份**不增加序列数**，但 4620 万个标签值对里有 1310 万（28%）是纯冗余。名字在查询侧或前端按 ID 解析即可。
-
-**2. 常量标签是纯成本（实测再 −7.6%）**
-
-`job` 覆盖全部 436 万条序列、只有一个取值，对区分序列零贡献。`namespace`、`scraper_pod_namespace` 同理（`step` 不算，RetentionFilter 靠它）。在 `drop_input_labels` 里去掉即可。
-
-两条合计 indexdb **−37%**，查询同步变快——倒排索引小了，正则匹配扫的东西就少。
-
-**3. 直方图按指标摆桶，不要共用（序列 −35%，精度反而更好）**
-
-现在 `latencyBuckets` 16 个桶要同时伺候 ttft（均值 800ms）、svc（6000ms）、tpot（25ms），量级差 240 倍。结果**每个指标只用上 5~8 个桶**，其余全空，而在自己的分布区间里没有分辨率。实测 P90/P99 平均绝对误差 **24.6%**，`tps` 的 P99 报 239.7 而真值 113.6。
-
-每个指标按自己的分布摆 8 个桶：
-
-| 布局 | 每 Key 桶数 | P90/P99 平均误差 |
-|---|---|---|
-| 现有共用桶 | 95 | 24.6% |
-| 专属 6 桶 | 49（−48%） | 25.7% |
-| **专属 8 桶** | **62（−35%）** | **11.1%** |
-| 专属 12 桶 | 83（−13%） | 4.2% |
-
-**桶边界必须按指标分、对全体 Key 统一，绝不能按 Key / route / 业务组分。** `le` 是序列身份的一部分，查询靠 `sum(...) by (le)` 合并，边界不一致时累积计数不再单调——实测两个 route 各用各的桶，合并 P90 算出 16000ms 而真值 4046ms，**误差 +295%，不报错**。
-
-改边界的代价：跨新旧边界的查询窗口会算错，要么等保留期滚过，要么换指标名。边界要按线上真实分布定（取一天样本算 P1/P50/P90/P99 再对数等分），上界盖到 P99.8 以上，否则 P99 会被钉死在最后一个边界。
-
-三条合计：总序列 436 万 → 约 250 万，存储 **263 GiB → 约 128 GiB**，分位精度还变好了。
-
----
 
 ## 七、上线后
 
@@ -486,7 +351,7 @@ sum(increase(acg_requests_total[1h]))
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
 | vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | 镜像版本低于 `v1.126.1004-cluster`（补丁只打到 021、没打 022）。**应急**：把 `zstd.encoderConcurrency` 从 `extraArgs` 去掉即可启动，它只是内存优化，不影响正确性。**正解**：换镜像，否则 022 修的 dedup 少算 bug 也还在 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1009-cluster` 构建的。`sum_samples_total` 上游没有 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1010-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
