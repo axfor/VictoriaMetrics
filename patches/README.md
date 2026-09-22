@@ -2,7 +2,7 @@
 
 > 集成步骤、最佳配置、配额见同目录的 [`INTEGRATION.md`](INTEGRATION.md)。本文件只讲补丁本身。
 
-二十个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
+二十一个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -28,6 +28,7 @@
 | `021-acg_zstd-encoder-concurrency` | 新增 `-zstd.encoderConcurrency`,限制 zstd 编码器并发槽位;每槽一个 8 MB 历史窗口,默认按核数开,64 核就是 512 MB 永不释放 | **强烈建议**,vmagent 存活堆 346 → 271 MB |
 | `022-acg_streamaggr-dedup-input-key` | 修 018 的一处严重错误:它复用了 `useInputKey`,而这个字段在 `dedup_interval > 0` 时本来就是 false,导致开 dedup 时一个输出组的所有输入序列挤进同一个 map 条目——三个 pod 各报 1 合出来是 1。顺带修 017 的 `SizeBytes()`/`Len()` 不一致,以及 021 的 flag 只在 !cgo 下声明(发布版是 CGO_ENABLED=1,传参直接起不来) | **必须**,打了 018 就必须打这个 |
 | `023-acg_streamaggr-gauge-dedup-guard` | 钉住「开了 dedup 的 gauge 规则仍然跨 pod 求和」:`drop_input_labels` 在 dedup 之前删标签,`without` 在分组时删(之后),把 pod 写进前者会让三个 pod 在去重器眼里是同一条序列,只算一个 | 可选,只加测试 |
+| `024-acg_zstd-default-one-slot` | `-zstd.encoderConcurrency` 默认值改成 1,让它不必出现在部署配置里。一个纯内存优化不该有能力让进程起不来:旧镜像上传这个参数会 `flag provided but not defined` 直接退出 | **建议**,少一个必配项 |
 
 只动源码的是 22 个文件:`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`

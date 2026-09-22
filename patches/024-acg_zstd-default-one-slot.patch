@@ -1,0 +1,104 @@
+From 8f4f91f5454575d0b1c418db5810e496579f795f Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Mon, 21 Sep 2026 19:41:31 -0700
+Subject: [PATCH 21/21] lib/encoding/zstd: default the encoder concurrency to
+ one slot
+
+The flag was added with the library's own default -- one slot per CPU -- so a
+deployment only got the bounded footprint by carrying -zstd.encoderConcurrency=1
+in its arguments. That turned out to be the wrong shape for it twice over.
+
+A flag that has to be set to be useful is one a deployment can fail to carry
+across an upgrade. Worse, passing a flag the binary does not know aborts
+start-up, so an image built before the flag existed takes the process down the
+moment the argument is added -- a hard failure out of an optional memory
+optimisation. That happened: vmagent exited with
+
+  flag provided but not defined: -zstd.encoderConcurrency
+
+on an image predating it, and the operator's only quick way out was to drop the
+argument, which also drops the saving.
+
+Defaulting to 1 removes the argument from the deployment entirely. Nobody has to
+carry it, so nobody can fail to, and there is nothing to pass to an older binary.
+0 still means the library's own one-per-CPU for anyone who wants it back, and
+raising it is still there for a vmagent that really does compress several blocks
+at once -- measured, one block compresses at 4.2GB/s whether the concurrency is
+1 or 10, and the throughput only scales when several are compressed at the same
+time.
+
+The default is asserted rather than left to a comment: nothing fails when it
+goes back to 0, the process just quietly holds 8MB per CPU again. Putting the
+default back fails the test.
+
+The test sits in an unconstrained file rather than beside the other flag tests,
+which are !cgo, because the declaration is what both builds share.
+---
+ lib/encoding/zstd/concurrency.go              | 17 ++++++++----
+ lib/encoding/zstd/concurrency_default_test.go | 26 +++++++++++++++++++
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+ create mode 100644 lib/encoding/zstd/concurrency_default_test.go
+
+diff --git a/lib/encoding/zstd/concurrency.go b/lib/encoding/zstd/concurrency.go
+index c748ff98b..94401ae1b 100644
+--- a/lib/encoding/zstd/concurrency.go
++++ b/lib/encoding/zstd/concurrency.go
+@@ -10,11 +10,18 @@ import "flag"
+ // several blocks are compressed at the same time, so a process pushing a few
+ // hundred KB/s has no use for more than one or two.
+ //
++// The default is one slot rather than the library's own one-per-CPU, so that a
++// deployment gets the bounded footprint without having to set anything. A flag
++// that has to be set to be useful is a flag a deployment can fail to carry
++// across an upgrade, and passing one the binary does not know aborts start-up --
++// a hard failure out of an optional memory optimisation. Raise it only for a
++// vmagent that really does compress several blocks at once.
++//
+ // It is declared for both builds so that passing it never aborts start-up. The
+ // cgo build compresses through gozstd, which has no such pool, and ignores it.
+-var encoderConcurrency = flag.Int("zstd.encoderConcurrency", 0, "How many blocks may be zstd-compressed at once. "+
++var encoderConcurrency = flag.Int("zstd.encoderConcurrency", 1, "How many blocks may be zstd-compressed at once. "+
+ 	"Each one keeps an 8MB history window for the life of the process, so this is also 8MB of memory apiece. "+
+-	"0 means one per CPU, which is what the compression library defaults to. Compressing a single block does not "+
+-	"use more than one of them -- the concurrency only helps when several blocks are compressed at the same time -- "+
+-	"so a process that compresses a few hundred KB/s has no use for more than one or two. Has no effect in cgo "+
+-	"builds, which compress through gozstd")
++	"The default is 1; 0 means one per CPU, which is what the compression library itself defaults to. Compressing "+
++	"a single block does not use more than one of them -- the concurrency only helps when several blocks are "+
++	"compressed at the same time -- so a process that compresses a few hundred KB/s has no use for more than one "+
++	"or two. Has no effect in cgo builds, which compress through gozstd")
+diff --git a/lib/encoding/zstd/concurrency_default_test.go b/lib/encoding/zstd/concurrency_default_test.go
+new file mode 100644
+index 000000000..084bd8563
+--- /dev/null
++++ b/lib/encoding/zstd/concurrency_default_test.go
+@@ -0,0 +1,26 @@
++package zstd
++
++import (
++	"flag"
++	"testing"
++)
++
++// The flag defaults to one slot rather than to the library's one-per-CPU, so a
++// deployment gets the bounded footprint without carrying the flag in its
++// arguments. That matters beyond the memory: a flag that has to be set to be
++// useful is one a deployment can fail to carry across an upgrade, and passing a
++// flag the binary does not know aborts start-up -- so an optional memory
++// optimisation would take the process down. Nothing fails if this default goes
++// back to 0; the process just quietly holds 8MB per CPU again.
++//
++// This is in the unconstrained file rather than next to the other flag tests,
++// which are !cgo: the declaration is what both builds share.
++func TestEncoderConcurrencyDefaultsToOneSlot(t *testing.T) {
++	f := flag.Lookup("zstd.encoderConcurrency")
++	if f == nil {
++		t.Fatal("zstd.encoderConcurrency is not declared -- a cgo build would abort on start-up when it is passed")
++	}
++	if f.DefValue != "1" {
++		t.Errorf("zstd.encoderConcurrency defaults to %q, want \"1\": at the library's own default every CPU costs another 8MB history window that a vmagent pushing a few hundred KB/s never uses", f.DefValue)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

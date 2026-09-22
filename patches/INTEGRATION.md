@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1010-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1011-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,11 +53,11 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1010-cluster` 构建。
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1011-cluster` 构建。
 
 **最低 `v1.126.1004-cluster`，低于它会有两个问题，一个起不来、一个静默算错：**
 
-- **起不来**：`-zstd.encoderConcurrency` 在补丁 021 里只声明在 `zstd_pure.go`，那文件是 `//go:build !cgo`，而发布版 vmagent 用 `CGO_ENABLED=1` 构建，传这个参数会以 `flag provided but not defined` 直接退出。补丁 **022** 才把它挪到无 build 约束的 `concurrency.go`。
+- **起不来**：`-zstd.encoderConcurrency` 在补丁 021 里只声明在 `zstd_pure.go`，那文件是 `//go:build !cgo`，而发布版 vmagent 用 `CGO_ENABLED=1` 构建，传这个参数会以 `flag provided but not defined` 直接退出。补丁 **022** 把它挪到无 build 约束的 `concurrency.go`，补丁 **024** 进一步把默认值改成 1，让它不必出现在配置里——一个纯内存优化不该有能力让进程起不来。
 - **静默算错**：同样是补丁 022，修了 dedup 下所有输入序列挤进同一个 map 条目的 bug。gauge 那条规则开着 `dedup_interval`，停在 021 会让**三个 pod 各报 1 合出来是 1**。
 
 用原版上游镜像则是另一回事：`sum_samples_total` 上游没有，配置加载时直接 fatal 退出。
@@ -80,14 +80,15 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 ```yaml
 extraArgs:
   promscrape.zstdCompression: "true"
-  zstd.encoderConcurrency: "1"
   remoteWrite.queues: "2"
   remoteWrite.maxDiskUsagePerURL: "10GB"
 ```
 
+**不要再配 `zstd.encoderConcurrency`。** 从 `v1.126.1011-cluster` 起它默认就是 1，不用写；而写了会在旧镜像上让 vmagent 直接启动失败（`flag provided but not defined`）——一个纯内存优化把进程搞挂，所以我们把它从必配项里去掉了。
+
 后两项是同一类问题：**按核数放大的常驻内存，与实际吞吐无关**。
 
-- `zstd.encoderConcurrency` 不设时按核数开压缩槽，每槽常驻 8 MB 历史缓冲。单块压缩用不到并发（1 和 10 都是 4.2 GB/s），只有多块同时压才有用。设成 1 之后堆里 `zstd.(*fastBase).ensureHist` 正好 8 MB，就是一个槽。
+- zstd 编码槽：库自身按核数开，每槽常驻 8 MB 历史缓冲。我们把默认值改成 1 了，不用配。单块压缩用不到并发（1 和 10 都是 4.2 GB/s），只有多块同时压才有用；实测生效后堆里 `zstd.(*fastBase).ensureHist` 正好 8 MB，就是一个槽。
 - `remoteWrite.queues` 默认 `核数 × 2`，每队列一份发送缓冲（`maxRowsPerBlock=10000` 样本，实测约 3.3 MB）。
 
 三万 Key 实测（单独一轮 A/B，两个进程同负载），两项都设上后 vmagent 存活堆 **346 → 204 MiB（−41%）**、物理占用 428 → 286 MiB，**样本吞吐不变**。绝对值以 §六 那轮完整配置的为准，这里看的是差值。
@@ -276,7 +277,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1010-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1011-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -350,8 +351,8 @@ sum(increase(acg_requests_total[1h]))
 | 内存没降 | `no_stale_markers` 没写，或配了 `sample_limit` / `series_limit`。查 `vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`，应为 0 |
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
-| vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | 镜像版本低于 `v1.126.1004-cluster`（补丁只打到 021、没打 022）。**应急**：把 `zstd.encoderConcurrency` 从 `extraArgs` 去掉即可启动，它只是内存优化，不影响正确性。**正解**：换镜像，否则 022 修的 dedup 少算 bug 也还在 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1010-cluster` 构建的。`sum_samples_total` 上游没有 |
+| vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | `extraArgs` 里还留着这个参数，而镜像版本低于 `v1.126.1004-cluster`。**这个参数现在不该出现在配置里**（1011 起默认就是 1），删掉即可。但镜像仍然必须升级——022 修的 dedup 少算 bug 是正确性问题，没有绕过的办法 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1011-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
