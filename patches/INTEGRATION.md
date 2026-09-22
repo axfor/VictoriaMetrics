@@ -223,6 +223,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
   staleness_interval: 40m
   reset_marker_on_stale: true
   flush_on_shutdown: true
+  # output_heartbeat_interval: 4m    # 可选,减少写入,见下
 
 - match: '{_metric_type="gauge"}'
   interval: 60s
@@ -232,6 +233,18 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
   keep_metric_names: true
   dedup_interval: 60s
 ```
+
+### 可选：`output_heartbeat_interval` 减少写入（v1.126.1014-cluster 起）
+
+聚合器每个 `interval` 把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写一遍。打开这个参数后，值和上次写的相同就不写，除非心跳到期。
+
+**为什么不丢账**：值变了就一定写，所以空缺期间值必然恒定，`increase_pure` 在空缺两端取到同一个值。心跳只负责不让序列被 VM 判 stale，不承担正确性。
+
+**上限由查询侧决定**：VM 默认 lookbehind 5 分钟，所以要低于它；把 `-search.maxStalenessInterval` 调到 15m 之后可以用 `10m`。预期 `4m` 写入降到约 44%，`10m` 约 33%。
+
+**只减写入压力（vmstorage 的 CPU 与 IOPS），不成比例减磁盘**——磁盘大头是按序列数算的索引，见 §六。空值或 0 是原行为；小于 `interval` 的值会直接报错。
+
+**端到端还没在真实负载上验证过**，所以默认没开。要用先在测试环境测一轮，盯 `vm_streamaggr_skipped_unchanged_outputs_total` 和对账（对账用 `increase()`，不能用当前累计值）。
 
 ### 三处容易写错的地方
 
@@ -332,32 +345,11 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 
 而且缩短它有个容易踩的副作用：累加器会不断过期归零，**`sum(acg_requests_total)` 这种直接读累计值的查询会得到几乎无意义的数**（实测比真实值低 85%）。`increase()` 能正确识别重置，所以对账要用 `increase()`，不能用当前值。
 
-第二档的内存要降，方向是**少写**（见下）和**降基数**（见 `vm-storage-cardinality.md`）。
+第二档的内存要降，方向是 §四 那个 `output_heartbeat_interval`（少写）和降基数（见 `vm-storage-cardinality.md`）。
 
 ### 增长口径
 
 **边车随注册 Key 线性长**（每个被访问过的 Key 都要有常驻实例），**vmagent 跟活跃窗口内的 Key 数走**。所以 vmagent 按活跃形态配，边车按注册 Key 扛峰值。
-
-### 减少写入：`output_heartbeat_interval`（可选，v1.126.1014-cluster 起）
-
-聚合器每个 `interval` 会把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写了一遍。
-
-`output_heartbeat_interval` 让 `sum_samples_total` 跳过这些：值和上次写的相同就不写，除非心跳到期。
-
-```yaml
-- match: '{_metric_type!="gauge",_metric_type!=""}'
-  interval: 60s
-  output_heartbeat_interval: 4m      # 加这一行
-  ...
-```
-
-**为什么不丢账**：值变了就一定写，所以空缺期间值必然恒定，`increase_pure` 在空缺两端取到同一个值。心跳只负责不让序列被 VM 判 stale，不承担正确性。
-
-**心跳上限由查询侧决定**，不是聚合层的性质：VM 默认 lookbehind 5 分钟，所以要低于它；调大 `-search.maxStalenessInterval` 到 15m 之后可以用 `10m`，写入降到约三分之一。
-
-预期降幅：`4m` 约降到 44%，`10m` 约降到 33%。
-
-**注意**：这条**只减少写入压力（vmstorage 的 CPU 与 IOPS），不成比例减少磁盘** —— 磁盘的大头是按序列数算的索引，见下。而且**端到端还没在真实负载上验证过**，上线前自己测一轮，盯 `vm_streamaggr_skipped_unchanged_outputs_total` 和对账。空值或 0 是原行为。
 
 存储另见 `docs/apikey-usage/vm-storage-cardinality.md`——结论是 VM 的磁盘和查询成本都由**序列数**决定，与写入频率无关，降存储只能降基数。
 
