@@ -123,25 +123,29 @@ extraArgs:
 
 ## 三、scrape 配置
 
-内网现有两个 job 在 `repos/aigateway-victoriametrics-conf/helm/victoria-metrics-agent/values.yaml` 的 `extraScrapeConfigs` 下。**不用新增 job，改现有的两处。**
+`values.yaml` 的 `extraScrapeConfigs` 下两个 job，**不新增，改这两处**。
 
 ### `model-router-metrics`（60s，用量）
 
 ```yaml
   - job_name: model-router-metrics
     scrape_interval: 60s
-    scrape_timeout: 50s              # 改：原 10s，106 MB 的响应体不够
-    scrape_align_interval: 60s       # 加：对齐整分，聚合窗口才稳
-    no_stale_markers: true           # 加：不加内存翻几倍，见下
-    metrics_path: /metrics/usage     # 改：原 /metrics
-    # 其余 kubernetes_sd_configs、relabel_configs、metric_relabel_configs 不动
+    scrape_timeout: 50s
+    scrape_align_interval: 60s
+    no_stale_markers: true
+    metrics_path: /metrics/usage
+    # kubernetes_sd_configs、relabel_configs、metric_relabel_configs 不动
 ```
+
+`scrape_timeout` 要给到 50s（106 MB 的响应体 10s 不够），`scrape_align_interval` 对齐整分聚合窗口才稳，`no_stale_markers` 见下。
 
 ### `acg-model-router-metrics`（10s，框架）
 
 ```yaml
-    no_stale_markers: true           # 加，其余不动
+    no_stale_markers: true
 ```
+
+只加这一行，其余不动。
 
 ### 全量端点在默认配置下根本抓不动
 
@@ -208,29 +212,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 ---
 
-## 四、聚合规则（改现有的 `usage.yaml`）
-
-现有内容（`values.yaml` 的 `extraObjects` → `vmagent-streamaggr` ConfigMap），两条规则：
-
-```yaml
-- match: '{_metric_type!="gauge"}'        # ← 选择器有错，漏了 _metric_type!=""
-  interval: 60s
-  without: [pod, instance, node]          # ← 换成 drop_input_labels
-  drop_input_labels: [_metric_type]
-  outputs: [sum_samples_total]
-  staleness_interval: 40m
-  reset_marker_on_stale: true
-  flush_on_shutdown: true
-
-- match: '{_metric_type="gauge"}'
-  interval: 60s
-  dedup_interval: 60s
-  without: [pod, instance, node]          # ← 这条保持 without，不要跟着改
-  outputs: [sum_samples]                  #   只补一行 drop_input_labels: [_metric_type]
-  keep_metric_names: true
-```
-
-改成：
+## 四、聚合规则（`values.yaml` 的 `extraObjects` → `vmagent-streamaggr` ConfigMap）
 
 ```yaml
 - match: '{_metric_type!="gauge",_metric_type!=""}'
@@ -251,23 +233,18 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
   dedup_interval: 60s
 ```
 
-**两条规则去掉 pod 的方式不一样，这是有意的，不要统一。** 原因见下面第三条。
+### 三处容易写错的地方
 
-### 三处改动的原因
+**`_metric_type!=""` 不能少。** PromQL 把缺失的标签当空值，所以 `{_metric_type!="gauge"}` 会把**根本没有类型标签的样本一并选中**。`acg-model-router-metrics` 那个 job 采的 `model_router_*` 就没有类型标签——它们会被 `sum_samples_total` 当成增量逐次累加，一个已经到 100 万的计数器每分钟再加 100 万。不报错、抓取照常成功。
 
-**`_metric_type!=""` 不能少。** PromQL 把缺失的标签当空值，所以 `{_metric_type!="gauge"}` 会把**根本没有类型标签的样本一并选中**。现网 `acg-model-router-metrics` 那个 job 采的 `model_router_*` 就没有类型标签——它们会被 `sum_samples_total` 当成增量逐次累加，一个已经到 100 万的计数器每分钟再加 100 万，同时 `without` 把 pod/instance 抹掉。不报错、抓取照常成功。
+**两条规则去掉 pod 的方式不一样，这是有意的，不要统一。** 计数器那条用 `drop_input_labels`，gauge 那条用 `without`。
 
-**计数器那条：`without` 换成 `drop_input_labels`。** `without` 是减法：将来 relabel 新增一个 per-pod 标签会被保留，series 静默按 pod 裂开。`drop_input_labels` 里列的在分组前就删掉，根本不存在。而且不写 `by`/`without` 时聚合器走 `aggregateOnlyByTime`，样本的 input key 是空的，省一次标签压缩。
+- 计数器那条没有 dedup，`drop_input_labels` 更稳：`without` 是减法，将来 relabel 新增一个 per-pod 标签会被保留、series 静默按 pod 裂开；而且不写 `by`/`without` 时聚合器走 `aggregateOnlyByTime`，样本的 input key 是空的，省一次标签压缩。
+- gauge 那条开了 `dedup_interval`，而 **`drop_input_labels` 在 dedup 之前删标签，`without` 在分组时删（之后）**。pod 要是提前没了，三个 pod 在去重器眼里就是同一条 series，每窗口只留一个样本，`sum_samples` 只加到一个 pod 的值。
 
-**gauge 那条：`pod` 必须留在 `without` 里，不能挪进 `drop_input_labels`。** 两者的时机不同——`drop_input_labels` 在 **dedup 之前**删，`without` 在**分组时**删，也就是 dedup 之后。gauge 这条开了 `dedup_interval`，pod 要是在 dedup 之前就没了，三个 pod 在去重器眼里是同一条 series，每个窗口只留一个样本，`sum_samples` 加的就只有一个 pod 的值。
+  实测：三个 pod 各报 1，pod 放 `drop_input_labels` 得 **1**，放 `without` 得 **3**。不报错、series 数也对，只是值少三分之二。VM fork 里有 `TestGaugeRuleSumsAcrossPodsWithDedupOn` 钉住这个形态。
 
-实测：三个 pod 各报 1，pod 放 `drop_input_labels` 得 **1**，放 `without` 得 **3**。不报错、series 数也对，只是值少了三分之二。VM fork 里有 `TestGaugeRuleSumsAcrossPodsWithDedupOn` 钉住这个形态。
-
-计数器那条没有 dedup，所以不存在这个问题——它报的是增量，同一个 pod 在一个窗口里被抓两次本来就该相加。gauge 报的是当前值，抓两次不能相加，这才是它需要 dedup 的原因。
-
-现网 relabel 把 `instance` 也设成了 pod 名，所以它和 `pod` 都必须在列表里。`namespace`、`scraper_pod_namespace`、`step` 对所有 pod 相同，保留——**`step: 1m` 尤其不能删，RetentionFilter 靠它做分级保留**。
-
-代价说清楚：gauge 这条用 `without` 就保留了上面那个「新增 per-pod 标签会让 series 裂开」的风险。但两种失败方式不对等——裂开是看得见的（series 数变成三倍），少算是看不见的。将来 relabel 加了 per-pod 标签，两条规则都要同步加。
+**per-pod 标签要列全。** 现网 relabel 把 `instance` 也设成了 pod 名，所以它和 `pod` 都必须在列表里；将来再加 per-pod 标签，**两条规则都要同步加**。`namespace`、`scraper_pod_namespace`、`step` 对所有 pod 相同，保留——**`step: 1m` 尤其不能删，RetentionFilter 靠它做分级保留**。
 
 实测三个边车、50 个 Key，relabel 里故意加了个 `node_name`：VM 里 `acg_requests_total` 是 50 条 series（每 Key 一条）而不是 150 条，`acg_*` 里带 `pod` 标签的 0 条。
 
