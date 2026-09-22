@@ -28,7 +28,7 @@ trk := prometheus.EnableChangeTracking()   // 必须在任何指标创建之前�
 usageReg := prometheus.NewRegistry()
 // aistatistics 里 per-API-key 指标的 MustRegister：promReg → usageReg
 
-opts := delta.Increments()
+opts := delta.Increments()          // ReportIncrements + DisableHeartbeat + IdleScrapes:30
 opts.TypeLabel = "_metric_type"
 usage := delta.NewTracked(trk, opts)
 
@@ -38,6 +38,16 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 ```
 
 改注册目标是唯一要动的业务代码，集中在 aistatistics 一个包里。指标定义、`Inc()`、`Observe()` 一行不改。
+
+`delta.Increments()` 是一组必须配套的预设，**别手工拼 `delta.Options`**（拼错会在启动时 panic）。里面三项：报增量、关心跳、以及 **`IdleScrapes: 30`**——连续 30 次抓取没被写过就删掉实例，60 秒抓取间隔下就是闲置 30 分钟。
+
+**`IdleScrapes` 是边车内存的主要旋钮**，要调就改这一项：
+
+```go
+opts.IdleScrapes = 10   // 闲置 10 分钟就删
+```
+
+但它只在**小于「同一个 Key 两次活跃之间的间隔」时才起作用**。实测 3 万 Key 每 2 分钟换一批 5000（12 分钟轮一圈），`IdleScrapes=8` 只降 17% —— 因为每个 Key 在每 12 分钟里仍有 10 分钟是常驻的。要拿到数量级收益，闲置窗口得远小于轮换周期，代价是删除重建的频率上去、CPU 和分配增加。按自己的 Key 活跃模式定。
 
 三个端点的分工：
 
