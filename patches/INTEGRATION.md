@@ -51,31 +51,13 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ---
 
-## 二、vmagent
+## 二、vmagent 配置
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1014-cluster` 构建。
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1019-cluster` 构建。用原版上游镜像会在加载聚合配置时 fatal 退出——`sum_samples_total` 上游没有。
 
-**最低 `v1.126.1004-cluster`，低于它会有两个问题，一个起不来、一个静默算错：**
+下面是 `victoria-metrics-agent` 的 `values.yaml` 里**全部要改的地方**。
 
-- **起不来**：`-zstd.encoderConcurrency` 在补丁 021 里只声明在 `zstd_pure.go`，那文件是 `//go:build !cgo`，而发布版 vmagent 用 `CGO_ENABLED=1` 构建，传这个参数会以 `flag provided but not defined` 直接退出。补丁 **022** 把它挪到无 build 约束的 `concurrency.go`，补丁 **024** 进一步把默认值改成 1，让它不必出现在配置里——一个纯内存优化不该有能力让进程起不来。
-- **静默算错**：同样是补丁 022，修了 dedup 下所有输入序列挤进同一个 map 条目的 bug。gauge 那条规则开着 `dedup_interval`，停在 021 会让**三个 pod 各报 1 合出来是 1**。
-
-用原版上游镜像则是另一回事：`sum_samples_total` 上游没有，配置加载时直接 fatal 退出。
-
-**部署前先自检**，在容器里跑：
-
-```sh
-/vmagent-prod -help 2>&1 | grep -c "streamAggr.config"        # >0:是我们的 fork
-/vmagent-prod -help 2>&1 | grep "zstd.encoderConcurrency"     # 有输出:版本 ≥ 1004
-```
-
-第二条没输出就别急着改 `extraArgs`，先换镜像。
-
-沿用你们现有的部署，改这几项：
-
-**聚合配置已经有了**，在 `feature-apikey-redis-notification-axx` 分支上：`extraArgs` 里 `remoteWrite.streamAggr.config: [/etc/vmagent/streamaggr/usage.yaml]`，内容来自 `extraObjects` 的 `vmagent-streamaggr` ConfigMap。**要改的是它的内容，见 §四**——现有规则有个会毁掉框架指标的错。
-
-**`extraArgs` 里加三项**：
+### `extraArgs`
 
 ```yaml
 extraArgs:
@@ -85,16 +67,72 @@ extraArgs:
   remoteWrite.maxDiskUsagePerURL: "10GB"
 ```
 
-**不要再配 `zstd.encoderConcurrency`。** 从 `v1.126.1014-cluster` 起它默认就是 1，不用写；而写了会在旧镜像上让 vmagent 直接启动失败（`flag provided but not defined`）——一个纯内存优化把进程搞挂，所以我们把它从必配项里去掉了。
+### `extraScrapeConfigs`
 
-后两项是同一类问题：**按核数放大的常驻内存，与实际吞吐无关**。
+两个 job，不新增，改这两处：
+
+```yaml
+extraScrapeConfigs:
+  - job_name: model-router-metrics          # 60s,用量
+    scrape_interval: 60s
+    scrape_timeout: 50s
+    scrape_align_interval: 60s
+    no_stale_markers: true
+    metrics_path: /metrics/usage
+    # kubernetes_sd_configs、relabel_configs、metric_relabel_configs 不动
+
+  - job_name: acg-model-router-metrics      # 10s,框架;只加下面这一行
+    no_stale_markers: true
+```
+
+### 聚合规则（`extraObjects` → `vmagent-streamaggr` ConfigMap）
+
+```yaml
+- match: '{_metric_type!="gauge",_metric_type!=""}'
+  interval: 60s
+  drop_input_labels: [_metric_type, pod, instance, node]
+  outputs: [sum_samples_total]
+  keep_metric_names: true
+  staleness_interval: 40m
+  reset_marker_on_stale: true
+  flush_on_shutdown: true
+  output_heartbeat_interval: 4m
+
+- match: '{_metric_type="gauge"}'
+  interval: 60s
+  drop_input_labels: [_metric_type]
+  without: [pod, instance, node]
+  outputs: [sum_samples]
+  keep_metric_names: true
+  dedup_interval: 60s
+```
+
+### vm-select 上加一条
+
+```
+-search.minStalenessInterval=5m
+```
+
+配合上面的 `output_heartbeat_interval`，见 §三。
+
+### 保持不动的
+
+- **`tmpDataPath` 保持 `emptyDir`，不要改成 PVC。** vmagent 是无状态的，挂了卷就不能漂移——单副本 + 硬反亲和下节点故障时卷解绑不掉、pod 重建不出来，可用性反而更差。实测队列目录 8 MB 且几乎全是预分配结构，常态下直接推给 vm-insert，队列是空的。
+- **`-remoteWrite.disableOnDiskQueue` 不能开**，那会让队列连内存都不留。
+- **RBAC**：`kubernetes_sd_configs` 需要 pod 的 `get`/`list`/`watch`，已经在用 k8s 服务发现的话通常已经有了。
+
+---
+
+## 三、为什么这么配
+
+### CPU limit 就是抓取并发度
+
+vmagent 没有抓取并发参数，多目标并行抓、单响应体内部并行解析、解析后处理的上限，三层都锚定 `cgroup.AvailableCPUs()`，给少了就是串行。
+
+麻烦在于两项默认值是**按核数放大的常驻内存，与实际吞吐无关**：
 
 - zstd 编码槽：库自身按核数开，每槽常驻 8 MB 历史缓冲。我们把默认值改成 1 了，不用配。单块压缩用不到并发（1 和 10 都是 4.2 GB/s），只有多块同时压才有用；实测生效后堆里 `zstd.(*fastBase).ensureHist` 正好 8 MB，就是一个槽。
 - `remoteWrite.queues` 默认 `核数 × 2`，每队列一份发送缓冲（`maxRowsPerBlock=10000` 样本，实测约 3.3 MB）。
-
-三万 Key 实测（单独一轮 A/B，两个进程同负载），两项都设上后 vmagent 存活堆 **346 → 204 MiB（−41%）**、物理占用 428 → 286 MiB，**样本吞吐不变**。绝对值以 §六 那轮完整配置的为准，这里看的是差值。
-
-按核数放大的程度：
 
 | 核数 | 不设（zstd + 队列缓冲） | 设上后 |
 |---|---|---|
@@ -102,51 +140,15 @@ extraArgs:
 | 32 | 256 + 210 = 466 MB | 15 MB |
 | 64 | 512 + 420 = **932 MB** | 15 MB |
 
-实测吞吐需求约 233 KB/s，`queues=2` 绰绰有余。真要更高吞吐时再往上调，每加一个队列约 3.3 MB。
+设上之后 CPU 和内存解耦——CPU 按抓取需要给，内存不跟着涨。实测吞吐需求约 233 KB/s，`queues=2` 绰绰有余，真要更高吞吐时每加一个队列约 3.3 MB。
 
 `remoteWrite.maxDiskUsagePerURL` 的值按 `vmagent_remotewrite_pending_data_bytes` 的峰值乘容灾窗口定，`10GB` 只是占位。
 
-**`tmpDataPath` 保持 `emptyDir`，不要改成 PVC。** vmagent 是无状态的，挂了卷就不能漂移——单副本 + 硬反亲和下节点故障时卷解绑不掉、pod 重建不出来，可用性反而更差。实测队列目录 8 MB 且几乎全是预分配结构，常态下直接推给 vm-insert，队列是空的。
+### 队列丢数据的那个窗口
 
-但要知道有这么个窗口：**边车判定「已交付」只看 HTTP 响应写没写成功**，写成功就把基线前移，之后 vmagent 那边发生什么它一概不知。所以「VM 不可用」**且**「vmagent 同时重启」两件事同时发生时，队列里那段增量永久丢失，边车不会重发。报累计值时这个场景能自愈（下一轮的完整累计值补上），报增量不行。
+**边车判定「已交付」只看 HTTP 响应写没写成功**，写成功就把基线前移，之后 vmagent 那边发生什么它一概不知。所以「VM 不可用」**且**「vmagent 同时重启」两件事同时发生时，队列里那段增量永久丢失，边车不会重发。报累计值时这个场景能自愈（下一轮的完整累计值补上），报增量不行。
 
 这是双重故障，概率低，代价是丢一段账。监控 `vmagent_remotewrite_pending_data_bytes`——它**持续非零**才是真问题（说明 VM 跟不上），那时要解决的是 VM，不是把队列持久化。
-
-`-remoteWrite.disableOnDiskQueue` 不能开，那会让队列连内存都不留。
-
-**CPU limit 就是抓取并发度。** vmagent 没有抓取并发参数，多目标并行抓、单响应体内部并行解析、解析后处理的上限，三层都锚定 `cgroup.AvailableCPUs()`，给少了就是串行。
-
-这正是上面两个 flag 的意义：**不设它们时，每多给一个核就多背 8 MB（zstd）+ 6.6 MB（队列缓冲）**，想要并发就得付内存。设上之后两者解耦——CPU 按抓取需要给，内存不跟着涨。
-
-**RBAC**：§三用 `kubernetes_sd_configs`，需要 pod 的 `get`/`list`/`watch`。已经在用 k8s 服务发现的话通常已经有了。
-
----
-
-## 三、scrape 配置
-
-`values.yaml` 的 `extraScrapeConfigs` 下两个 job，**不新增，改这两处**。
-
-### `model-router-metrics`（60s，用量）
-
-```yaml
-  - job_name: model-router-metrics
-    scrape_interval: 60s
-    scrape_timeout: 50s
-    scrape_align_interval: 60s
-    no_stale_markers: true
-    metrics_path: /metrics/usage
-    # kubernetes_sd_configs、relabel_configs、metric_relabel_configs 不动
-```
-
-`scrape_timeout` 要给到 50s（106 MB 的响应体 10s 不够），`scrape_align_interval` 对齐整分聚合窗口才稳，`no_stale_markers` 见下。
-
-### `acg-model-router-metrics`（10s，框架）
-
-```yaml
-    no_stale_markers: true
-```
-
-只加这一行，其余不动。
 
 ### 全量端点在默认配置下根本抓不动
 
@@ -169,9 +171,9 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 推下去 16 MiB 的默认值对应一批活跃约 1.1 万。**不要留在默认值上赌**：撞上去的表现是 vmagent 静默拒收整个响应，**只有 warn 日志、`up` 仍然是 1、一个样本都不进**，等发现时账已经缺了一段。
 
-所以 §二 里直接把 `promscrape.maxScrapeSize` 设成 **500MiB**（约 35 万活跃 Key 的余量，等于把这个上限彻底挪出视线）。**调大它不花内存**——它只是 `io.LimitReader` 的上界，读取缓冲按上一次响应的实际大小定容，响应没真变大就不会多占。
+所以上面直接把 `promscrape.maxScrapeSize` 设成 **500MiB**（约 35 万活跃 Key 的余量，等于把这个上限彻底挪出视线）。**调大它不花内存**——它只是 `io.LimitReader` 的上界，读取缓冲按上一次响应的实际大小定容，响应没真变大就不会多占。
 
-但要知道它同时是个刹车，而 500MiB basically 等于松掉了：**撞上限之前 vmagent 会把压缩后的响应体完整读进内存**，最坏是 `500MiB × 目标数`。三个 pod 就是 1.5 GiB，已经超过 2Gi 配额的一半——正常情况下摸不到（实测 7.11 MiB），但边车要是因为 bug 疯狂膨胀，vmagent 会陪着一起 OOM 而不是拒收那一次抓取。
+但要知道它同时是个刹车，而 500MiB 基本等于松掉了：**撞上限之前 vmagent 会把压缩后的响应体完整读进内存**，最坏是 `500MiB × 目标数`。三个 pod 就是 1.5 GiB，已经超过 2Gi 配额的一半——正常情况下摸不到（实测 7.11 MiB），但边车要是因为 bug 疯狂膨胀，vmagent 会陪着一起 OOM 而不是拒收那一次抓取。
 
 不想要这个风险就设回 `64MiB`（约 4.5 万活跃 Key，最坏 192 MiB），照样远超实测需要。
 
@@ -195,7 +197,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 | `scraper_pod_namespace` | 同上 | 保留 |
 | `step` | 固定 `1m` | **保留**，RetentionFilter 靠它做分级保留 |
 
-前两个要在聚合层去掉，但两条规则的去法不同：计数器那条进 `drop_input_labels`，gauge 那条进 `without`（`drop_input_labels` 在 dedup 之前生效，gauge 那条开了 dedup，见 §四）。将来 relabel 再加 per-pod 标签，两条都要同步加。
+前两个要在聚合层去掉，但两条规则的去法不同：计数器那条进 `drop_input_labels`，gauge 那条进 `without`（`drop_input_labels` 在 dedup 之前生效，gauge 那条开了 dedup，见 §三）。将来 relabel 再加 per-pod 标签，两条都要同步加。
 
 ### `namespaces` 写了不生效
 
@@ -221,28 +223,6 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 ---
 
-## 四、聚合规则（`values.yaml` 的 `extraObjects` → `vmagent-streamaggr` ConfigMap）
-
-```yaml
-- match: '{_metric_type!="gauge",_metric_type!=""}'
-  interval: 60s
-  drop_input_labels: [_metric_type, pod, instance, node]
-  outputs: [sum_samples_total]
-  keep_metric_names: true
-  staleness_interval: 40m
-  reset_marker_on_stale: true
-  flush_on_shutdown: true
-  output_heartbeat_interval: 4m
-
-- match: '{_metric_type="gauge"}'
-  interval: 60s
-  drop_input_labels: [_metric_type]
-  without: [pod, instance, node]
-  outputs: [sum_samples]
-  keep_metric_names: true
-  dedup_interval: 60s
-```
-
 ### `output_heartbeat_interval`：少写四分之三（v1.126.1014-cluster 起）
 
 聚合器每个 `interval` 把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写一遍。打开后，值和上次写的相同就不写，除非心跳到期。`4m` 写入降到约 44%。
@@ -259,7 +239,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 它把每条序列的 staleness 下限抬到 5 分钟，大于心跳即可。**心跳值必须小于这个下限。**
 
-**只减写入压力（vmstorage 的 CPU 与 IOPS），不成比例减磁盘**——磁盘大头是按序列数算的索引，见 §六。小于 `interval` 的值会直接报错；空值或 0 退回原来每轮全写的行为。
+**只减写入压力（vmstorage 的 CPU 与 IOPS），不成比例减磁盘**——磁盘大头是按序列数算的索引，见 §五。小于 `interval` 的值会直接报错；空值或 0 退回原来每轮全写的行为。
 
 上线后盯 `vm_streamaggr_skipped_unchanged_outputs_total` 应持续增长，并用 `increase()` 对一次账（不能用当前累计值）。
 
@@ -280,7 +260,9 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 ---
 
-## 五、上线顺序与回退
+---
+
+## 四、上线顺序与回退
 
 **顺序不能反**：先上聚合层，再切边车。
 
@@ -296,43 +278,23 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 ### 已经部署过的：怎么升级
 
-先判断当前镜像有没有问题：
+**换镜像**：拉 fork 的 `v1.126.1019-cluster` 构建。内网拉不到 GitHub 就在现有源码上按编号补打缺的补丁，打完自检：
 
 ```sh
-kubectl exec -n acg-system deploy/victoria-metrics-agent -- \
-  /vmagent-prod -help 2>&1 | grep -c "zstd.encoderConcurrency"
+ls patches/*.patch | wc -l                                             # 22
+grep -c buildInputKey lib/streamaggr/streamaggr.go                     # 3
+grep -c outputHeartbeatInterval lib/streamaggr/streamaggr.go           # >0
 ```
 
-输出 `0` 说明镜像早于 `v1.126.1003-cluster`，有两个问题：传这个参数会启动失败；**开了 `dedup_interval` 的规则会把一个输出组的所有输入序列挤进同一个条目——三个 pod 各报 1 合出来是 1，少三分之二，不报错**。
+**改 values**：按 §二 整段对一遍。注意 `extraArgs` 里**不要有 `zstd.encoderConcurrency`**——它现在默认就是 1，写了反而会在旧镜像上让 vmagent 起不来。
 
-**删配置只能让进程起来，第二个是正确性问题，必须换镜像。**
+**发布**：单副本 + `maxSurge: 0` 滚动更新有几十秒空窗，**不丢数据**——边车按「成功送达」才前移基线，空窗期的增量留在边车，恢复后补上。
 
-**换镜像**：拉 fork 的 `v1.126.1014-cluster` 构建；内网拉不到 GitHub 就在现有源码上补打 `022`、`023`、`024`（当前应已打到 021）。打完自检：
-
-```sh
-grep -c buildInputKey lib/streamaggr/output.go            # 2
-grep -c buildInputKey lib/streamaggr/streamaggr.go        # 3
-head -1 lib/encoding/zstd/concurrency.go                  # package zstd,不能有 //go:build
-grep -o 'encoderConcurrency", [0-9]' lib/encoding/zstd/concurrency.go   # , 1
-```
-
-**编完先验再发布**——发布版是 `CGO_ENABLED=1` 构建的，原来出问题的正是这里：
-
-```sh
-docker run --rm <镜像> /vmagent-prod -help 2>&1 | grep "zstd.encoderConcurrency"
-```
-
-有输出才能往下走。
-
-**改 values**：`extraArgs` 里把 `zstd.encoderConcurrency` 整行删掉（不是注释掉），并按 §四 确认 gauge 那条规则用的是 `without`。
-
-单副本 + `maxSurge: 0` 滚动更新有几十秒空窗，**不丢数据**——边车按「成功送达」才前移基线，空窗期的增量留在边车，恢复后补上。
-
-回滚：改回原镜像 + 原 values。聚合规则若一并改过也要改回，**新旧规则不能混用**，否则同一指标会同时存在带 pod 和不带 pod 的两套序列。
+**回滚**：改回原镜像 + 原 values。聚合规则若一并改过也要改回，**新旧规则不能混用**，否则同一指标会同时存在带 pod 和不带 pod 的两套序列。
 
 ---
 
-## 六、配额
+## 五、配额
 
 按**活跃 Key 的形态**分两档配，差 8 倍，先确认自己属于哪一档。
 
@@ -362,7 +324,7 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 
 而且缩短它有个容易踩的副作用：累加器会不断过期归零，**`sum(acg_requests_total)` 这种直接读累计值的查询会得到几乎无意义的数**（实测比真实值低 85%）。`increase()` 能正确识别重置，所以对账要用 `increase()`，不能用当前值。
 
-第二档的内存要降，方向是降基数（见 `vm-storage-cardinality.md`）。§四 的 `output_heartbeat_interval` 降的是写入压力，不是 vmagent 的内存。
+第二档的内存要降，方向是降基数（见 `vm-storage-cardinality.md`）。§三 的 `output_heartbeat_interval` 降的是写入压力，不是 vmagent 的内存。
 
 ### 增长口径
 
@@ -371,7 +333,7 @@ vm-insert 412 MiB、vm-storage 每分片约 1.7 GiB、vm-select 11 MiB（后两�
 存储另见 `docs/apikey-usage/vm-storage-cardinality.md`——结论是 VM 的磁盘和查询成本都由**序列数**决定，与写入频率无关，降存储只能降基数。
 
 
-## 七、上线后
+## 六、上线后
 
 五条验收，都要过：
 
@@ -422,7 +384,7 @@ sum(increase(acg_requests_total[1h]))
 | 内存没降 | `no_stale_markers` 没写，或配了 `sample_limit` / `series_limit`。查 `vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`，应为 0 |
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
-| vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | `extraArgs` 里还留着这个参数，而镜像版本低于 `v1.126.1004-cluster`。**这个参数现在不该出现在配置里**（1011 起默认就是 1），删掉即可。但镜像仍然必须升级——022 修的 dedup 少算 bug 是正确性问题，没有绕过的办法 |
+| vmagent 启动即退出，日志 `flag provided but not defined` | `extraArgs` 里配了当前镜像不认识的参数。`zstd.encoderConcurrency` 不该出现在配置里（默认已是 1），删掉；其余参数对照 §二 |
 | 聚合配置启动报错 | vmagent 不是用 `v1.126.1014-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
