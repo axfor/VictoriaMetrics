@@ -1,9 +1,9 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1014-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1023-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
-只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
+只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，22 个补丁
 全在 `lib/promscrape`、`lib/promutil`、`lib/streamaggr`、`lib/encoding/zstd`。
 写入地址沿用现有的 `http://vm-insert:8480/insert/0/prometheus`（vm-insert 对
 `prometheus`、`prometheus/api/v1/write` 等后缀一视同仁，不用改）。
@@ -43,22 +43,22 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 **`IdleScrapes` 是用来回收长期不访问的 Key 的**：注册了 3 万个，实际常年有量的可能只有几千，剩下的休眠 Key 不该一直占着常驻实例。它不是内存旋钮——**不要为了省内存把它调小**，那会把只是「两次请求之间」的活跃 Key 也删掉，下次请求再建一遍，白白抖动。
 
-取值只要**大于「一个还在用的 Key 两次访问之间的正常间隔」**即可。30 分钟对绝大多数场景足够；如果你们有正常间隔超过半小时的低频 Key（比如按小时跑的批处理），相应调大：
+> ⚠️ **如果照早前版本的文档写了 `opts.IdleScrapes = 90`，删掉这一行。**
+> 那是个错的建议：90 次抓取 = 90 分钟，超过了 vmagent 的 `staleness_interval`（40 分钟），违反下面 §三 的配对约束。后果不是丢账，但边车会把闲置实例多留两倍时间（白占内存），同时聚合侧在边车还持有实例时就丢状态，产生本可避免的计数器重置。
+> 删掉即可，`delta.Increments()` 的默认值 30 就是对的。
 
-```go
-opts.IdleScrapes = 90   // 闲置 90 分钟才删
-```
+**默认的 30 不用改**，包括低频 Key。按小时跑的批处理 Key 会被删掉再重建，但账不会错：实例删除前那批增量已经送达，新实例从 0 开始报自己的增量；聚合器那边 40 分钟后丢状态、由 `reset_marker_on_stale` 补 0，`increase()` 识别得了计数器重置。实测把它压到 8（实例在 40 分钟里被反复删除重建几千次），对账 −1.20%，**全部来自采集滞后，没有一点是删建丢的**。
 
-调小没有收益：实测 3 万 Key 每 2 分钟换一批 5000（12 分钟全部轮一遍，等于没有休眠 Key），`IdleScrapes` 从 30 压到 8 也只降 17%，因为每个 Key 在每 12 分钟里仍有 10 分钟是常驻的。真正决定边车内存的是**有多少 Key 在活跃窗口内有量**，不是这个参数。
+调小也没有收益：实测 3 万 Key 每 2 分钟换一批 5000（12 分钟全部轮一遍，等于没有休眠 Key），从 30 压到 8 只降 16%（1067 → 898 MiB），因为每个 Key 在每 12 分钟里仍有 10 分钟是常驻的。真正决定边车内存的是**有多少 Key 在活跃窗口内有量**，不是这个参数。
 
-**这一项要和 vmagent 的 `staleness_interval` 配成一对**，两端都得忘掉长期不来的 Key，见 §三。
+真要调大（比如想少一些删建抖动），**必须同时把 vmagent 的 `staleness_interval` 调到比它更大**——两者是一对，顺序反了会出问题，见 §三。
 
 三个端点的分工：
 
 | 端点 | 内容 | 谁抓 | 间隔 |
 |---|---|---|---|
-| `/metrics` | 框架指标，累计值 | `acg-framework` job | 10s |
-| `/metrics/usage` | per-Key 用量，**增量** + 类型标签 | `acg-usage` job | 60s |
+| `/metrics` | 框架指标，累计值 | `acg-model-router-metrics` job | 10s |
+| `/metrics/usage` | per-Key 用量，**增量** + 类型标签 | `model-router-metrics` job | 60s |
 | `/metrics/cumulative` | per-Key 用量，累计值 | 不配 job。排查和回退用 | — |
 
 `/metrics/usage` **只能有一个消费者**：它报的是「自上次成功送达以来」，基线只有一份。第二个采集方会拿走第一个再也看不到的增量，不报错。
@@ -67,7 +67,7 @@ opts.IdleScrapes = 90   // 闲置 90 分钟才删
 
 ## 二、vmagent 配置
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1019-cluster` 构建。用原版上游镜像会在加载聚合配置时 fatal 退出——`sum_samples_total` 上游没有。
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1023-cluster` 构建。用原版上游镜像会在加载聚合配置时 fatal 退出——`sum_samples_total` 上游没有。
 
 下面是 `victoria-metrics-agent` 的 `values.yaml` 里**全部要改的地方**。
 
@@ -250,11 +250,20 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 顺序要这样：边车先忘、停止上报，vmagent 的状态随后到期，由 `reset_marker_on_stale` 补一个 0 把这条输出正常收尾。反过来的话，vmagent 在边车还持有实例、只是暂时没写的时候就把状态丢了，Key 一恢复又要重建一遍聚合状态并补 0，白白多一轮抖动。
 
-改其中一个就要同步看另一个。边车那边调大了 `IdleScrapes`（比如低频批处理 Key 要 90 分钟），`staleness_interval` 也得跟着大过它。
+**两个默认值（30 / 40m）就是配好的，不用动。** 真要改其中一个，另一个必须同步跟上，保持上面那个大小关系。
 
-### `output_heartbeat_interval`：少写四分之三（v1.126.1014-cluster 起）
+### `output_heartbeat_interval`：少写六成（v1.126.1014-cluster 起）
 
-聚合器每个 `interval` 把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写一遍。打开后，值和上次写的相同就不写，除非心跳到期。`4m` 写入降到约 44%。
+聚合器每个 `interval` 把**全部**输出序列刷一遍，不管值有没有变。实测轮换形态下 26180 条输出序列，两分钟窗口内真正有增量的只有 **6723 条（25.7%）**——四分之三是把同一个总数又写一遍。打开后，值和上次写的相同就不写，除非心跳到期。
+
+**端到端实测**（3 万 Key / 总并发 5000 / 每 2 分钟换一批 5000，45 分钟，`4m`）：
+
+| | 值 |
+|---|---|
+| 写入量 | **降到 37.4%**（写出 6446 万，跳过 1 亿 774 万） |
+| `vmagent_remotewrite_requests_total` | 18014 → **6942**（38.5%，与上一行互相印证） |
+| 对账偏差 | **−0.72%**，比不开这个参数那轮的 −1.20% 还小 |
+| 跨 pod 合并 | `acg_requests_total` 30000 条、带 `pod` 的 0 条，正常 |
 
 **为什么不丢账**：值变了就一定写，所以空缺期间值必然恒定，`increase_pure` 在空缺两端取到同一个值。心跳不承担正确性，只负责不让序列在查询侧显得 stale。
 
@@ -289,25 +298,23 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 ---
 
----
-
 ## 四、上线顺序与回退
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1014-cluster` 的 vmagent + `aggr.yml`
-2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
+1. 先按 §二 部署新 vmagent（含聚合 ConfigMap）
+2. 边车发版，但 `extraScrapeConfigs` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
 反过来做——边车先报增量而聚合层不在——VM 会把增量当累计值存，数字直接错。
 
-**回退**：把 `metrics_path` 改回 `/metrics/cumulative`，reload vmagent。不用重新发版。
+**回退**：把 `extraScrapeConfigs` 里的 `metrics_path` 改回 `/metrics/cumulative`，reload vmagent。不用重新发版。
 
 那是个普通 handler，给累计值、不碰增量基线；它没有类型标签，两条聚合规则都不匹配，原样透传。回退后行为等同改造前：全量上报、内存回到老水平、数字正确。
 
 ### 已经部署过的：怎么升级
 
-**换镜像**：拉 fork 的 `v1.126.1019-cluster` 构建。内网拉不到 GitHub 就在现有源码上按编号补打缺的补丁，打完自检：
+**换镜像**：拉 fork 的 `v1.126.1023-cluster` 构建。内网拉不到 GitHub 就在现有源码上按编号补打缺的补丁，打完自检：
 
 ```sh
 ls patches/*.patch | wc -l                                             # 22
@@ -390,13 +397,18 @@ count(acg_requests_concurrent_total)         # 应等于活跃 Key 数,不是它
 
 **第 5 条是这次改造的核心**，前四条过了但第 5 条不过，等于没生效。
 
-再对一次账：取同一时间窗，VM 里的增量与边车侧的请求计数应当相等。
+再对一次账：
 
 ```promql
 sum(increase(acg_requests_total[1h]))
 ```
 
-和边车 `/metrics/cumulative` 上同一窗口的差值比。相等即通过。
+和边车 `/metrics/cumulative` 上同一窗口的差值比。
+
+两点要注意，否则会误判成丢数据：
+
+- **必须用 `increase()`，不能用 `sum(acg_requests_total)`。** 聚合状态过期重建时累加器会归零，`increase()` 识别得了计数器重置，直接读当前值识别不了（实测缩短 `staleness_interval` 后直接读当前值比真实值低 85%）。
+- **会有约 1%~1.5% 的系统性偏低，这是正常的**，来自「最后一次抓取之后、取数之前完成的请求」。实测 910 req/s、60 秒抓取间隔下差 26132 个请求，折合 28.7 秒——正好是抓取间隔的一半，即平均滞后。超出这个量级才需要查。
 
 ---
 
@@ -415,8 +427,10 @@ sum(increase(acg_requests_total[1h]))
 | 内存没降 | `no_stale_markers` 没写，或配了 `sample_limit` / `series_limit`。查 `vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`，应为 0 |
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
+| 边车内存比预期高，且聚合侧计数器重置频繁 | 代码里写了 `opts.IdleScrapes = 90`（早前文档的错误建议）。删掉这一行，用 `delta.Increments()` 的默认 30 |
+| vmagent 启动即退出，日志 `cannot parse stream aggregation config: field output_heartbeat_interval not found` | 聚合配置里有这个参数，但镜像早于 `v1.126.1014-cluster`（这个参数是那一版加的）。先换镜像，别把参数删掉 |
 | vmagent 启动即退出，日志 `flag provided but not defined` | `extraArgs` 里配了当前镜像不认识的参数。`zstd.encoderConcurrency` 不该出现在配置里（默认已是 1），删掉；其余参数对照 §二 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1014-cluster` 构建的。`sum_samples_total` 上游没有 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1023-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
@@ -449,4 +463,4 @@ go run ./examples/delta
 
 ## 补丁
 
-vmagent 补丁清单与打法见 `vm/vmagent/README.md`（20 个，编号 004~023 接内网现有的 001~003）。
+vmagent 补丁清单与打法见 `vm/vmagent/README.md`（22 个，编号 004~025 接内网现有的 001~003）。
