@@ -1,6 +1,6 @@
 # API Key 用量统计 · 内网集成
 
-`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1008-cluster`
+`client_golang v1.24.1011` · `VictoriaMetrics v1.126.1009-cluster`
 
 链路：**app（model-router，client_golang）→ vmagent → vm-insert → vm-storage**。
 只有 vmagent 侧要换二进制，vm-insert / vm-select / vm-storage 一行没改，20 个补丁
@@ -53,7 +53,25 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 
 ## 二、vmagent
 
-二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1008-cluster` 构建——`sum_samples_total` 上游没有，用原版镜像会在启动时 fatal 退出。沿用你们现有的部署，改这几项：
+二进制用 `github.com/axfor/VictoriaMetrics` 的 `v1.126.1009-cluster` 构建。
+
+**最低 `v1.126.1004-cluster`，低于它会有两个问题，一个起不来、一个静默算错：**
+
+- **起不来**：`-zstd.encoderConcurrency` 在补丁 021 里只声明在 `zstd_pure.go`，那文件是 `//go:build !cgo`，而发布版 vmagent 用 `CGO_ENABLED=1` 构建，传这个参数会以 `flag provided but not defined` 直接退出。补丁 **022** 才把它挪到无 build 约束的 `concurrency.go`。
+- **静默算错**：同样是补丁 022，修了 dedup 下所有输入序列挤进同一个 map 条目的 bug。gauge 那条规则开着 `dedup_interval`，停在 021 会让**三个 pod 各报 1 合出来是 1**。
+
+用原版上游镜像则是另一回事：`sum_samples_total` 上游没有，配置加载时直接 fatal 退出。
+
+**部署前先自检**，在容器里跑：
+
+```sh
+/vmagent-prod -help 2>&1 | grep -c "streamAggr.config"        # >0:是我们的 fork
+/vmagent-prod -help 2>&1 | grep "zstd.encoderConcurrency"     # 有输出:版本 ≥ 1004
+```
+
+第二条没输出就别急着改 `extraArgs`，先换镜像。
+
+沿用你们现有的部署，改这几项：
 
 **聚合配置已经有了**，在 `feature-apikey-redis-notification-axx` 分支上：`extraArgs` 里 `remoteWrite.streamAggr.config: [/etc/vmagent/streamaggr/usage.yaml]`，内容来自 `extraObjects` 的 `vmagent-streamaggr` ConfigMap。**要改的是它的内容，见 §四**——现有规则有个会毁掉框架指标的错。
 
@@ -258,7 +276,7 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 **顺序不能反**：先上聚合层，再切边车。
 
-1. 部署 `v1.126.1008-cluster` 的 vmagent + `aggr.yml`
+1. 部署 `v1.126.1009-cluster` 的 vmagent + `aggr.yml`
 2. 边车发版，但 `scrape.yml` 里 `metrics_path` 仍指 `/metrics/cumulative`
 3. 确认 VM 里数字正常，再把 `metrics_path` 改成 `/metrics/usage`
 
@@ -380,6 +398,64 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 看 vmagent 的 RSS 和 `vm_streamaggr_labels_compressor_items_count` 是不是涨到远超「此刻活跃 Key 数 × 145」——是的话就是轮换形态，按上面这张表配，不要按固定活跃那张。
 
 
+### VM 的存储由「序列数 × 天数」决定，不是由写入条数
+
+实测：索引跟写入条数**完全无关**。同样 10 万条序列、标签一字不差：
+
+| | 样本数 | indexdb | data |
+|---|---|---|---|
+| 同一天，每序列 1 个点 | 10 万 | 7.7 MiB | 0.9 MiB |
+| 同一天，每序列 60 个点 | **600 万** | **7.7 MiB** | 1.1 MiB |
+| 3 天，每天 1 个点 | 30 万 | **14.5 MiB** | 0.9 MiB |
+
+样本多 60 倍，索引 **−0.1%**；天数多 3 倍，索引 **+88.6%**。原因是 VM 除了全局的 `metricID ↔ 标签`，还有一份**按天的 `date → metricID`**——一条序列某天只要被写过哪怕一次，就要建一份当天条目。
+
+按 ACG 真实标签形态（UUID × 10 个标签）拟合：**每序列 137 字节一次性 + 137 字节/天**。用它反推 3 小时那轮（436 万序列、1 天）应为 1.12 GiB，实测 1.162 GiB，差 4%。
+
+三层保留期下的存储账（三层 series 数相同，都是 436 万）：
+
+| 层 | 保留 | 点/天 | 索引 | 数据 | 合计 |
+|---|---|---|---|---|---|
+| raw | 7 天 | 1440 | 4.5 GiB | 32.8 GiB | 37 GiB |
+| `_1h` | 30 天 | 24 | 17.3 GiB | 2.4 GiB | 20 GiB |
+| **`_1d`** | **365 天** | **1** | **204 GiB** | **1.2 GiB** | **206 GiB** |
+| | | | **226 GiB (86%)** | 36 GiB | **≈ 263 GiB** |
+
+**天层一层占 78%，其中 99.4% 是索引。** 它每条序列每天只写 1 个点（0.81 字节），却要为这个点建 137 字节的当天索引——索引是数据的 169 倍。
+
+**推论：降写入频率、只写变化，对 VM 存储几乎无效。** 天层已经是一天一个点了。唯一有效的是**降序列数**，而且它在天层上是 **365 倍杠杆**。
+
+### 降序列数的三条，都与业务语义无关
+
+**1. 名字和 ID 不要都做成标签（实测 indexdb −31.8%）**
+
+`business_group`/`business_group_id` 各 50 个取值、`route_model`/`route_model_id` 各 20、`provider_model`/`provider_model_id` 各 10——取值数相同说明是 1:1 映射。同时存两份**不增加序列数**，但 4620 万个标签值对里有 1310 万（28%）是纯冗余。名字在查询侧或前端按 ID 解析即可。
+
+**2. 常量标签是纯成本（实测再 −7.6%）**
+
+`job` 覆盖全部 436 万条序列、只有一个取值，对区分序列零贡献。`namespace`、`scraper_pod_namespace` 同理（`step` 不算，RetentionFilter 靠它）。在 `drop_input_labels` 里去掉即可。
+
+两条合计 indexdb **−37%**，查询同步变快——倒排索引小了，正则匹配扫的东西就少。
+
+**3. 直方图按指标摆桶，不要共用（序列 −35%，精度反而更好）**
+
+现在 `latencyBuckets` 16 个桶要同时伺候 ttft（均值 800ms）、svc（6000ms）、tpot（25ms），量级差 240 倍。结果**每个指标只用上 5~8 个桶**，其余全空，而在自己的分布区间里没有分辨率。实测 P90/P99 平均绝对误差 **24.6%**，`tps` 的 P99 报 239.7 而真值 113.6。
+
+每个指标按自己的分布摆 8 个桶：
+
+| 布局 | 每 Key 桶数 | P90/P99 平均误差 |
+|---|---|---|
+| 现有共用桶 | 95 | 24.6% |
+| 专属 6 桶 | 49（−48%） | 25.7% |
+| **专属 8 桶** | **62（−35%）** | **11.1%** |
+| 专属 12 桶 | 83（−13%） | 4.2% |
+
+**桶边界必须按指标分、对全体 Key 统一，绝不能按 Key / route / 业务组分。** `le` 是序列身份的一部分，查询靠 `sum(...) by (le)` 合并，边界不一致时累积计数不再单调——实测两个 route 各用各的桶，合并 P90 算出 16000ms 而真值 4046ms，**误差 +295%，不报错**。
+
+改边界的代价：跨新旧边界的查询窗口会算错，要么等保留期滚过，要么换指标名。边界要按线上真实分布定（取一天样本算 P1/P50/P90/P99 再对数等分），上界盖到 P99.8 以上，否则 P99 会被钉死在最后一个边界。
+
+三条合计：总序列 436 万 → 约 250 万，存储 **263 GiB → 约 128 GiB**，分位精度还变好了。
+
 ---
 
 ## 七、上线后
@@ -409,7 +485,8 @@ sum(increase(acg_requests_total[1h]))
 | 内存没降 | `no_stale_markers` 没写，或配了 `sample_limit` / `series_limit`。查 `vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}`，应为 0 |
 | 边车启动就 panic | 手工拼了 `delta.Options` 而不是用 `delta.Increments()`。报增量时不要配 `GenLabel`、`RebaseAfterGap` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 调晚了，在建指标之后 |
-| 聚合配置启动报错 | vmagent 不是用 `v1.126.1008-cluster` 构建的。`sum_samples_total` 上游没有 |
+| vmagent 启动即退出，日志 `flag provided but not defined: -zstd.encoderConcurrency` | 镜像版本低于 `v1.126.1004-cluster`（补丁只打到 021、没打 022）。**应急**：把 `zstd.encoderConcurrency` 从 `extraArgs` 去掉即可启动，它只是内存优化，不影响正确性。**正解**：换镜像，否则 022 修的 dedup 少算 bug 也还在 |
+| 聚合配置启动报错 | vmagent 不是用 `v1.126.1009-cluster` 构建的。`sum_samples_total` 上游没有 |
 | 升级后代码没变 | 复用了 tag。`proxy.golang.org` 永久缓存快照，同名强推静默无效，必须换新版本号 |
 | vmagent 内存一路涨、远超活跃 Key 数对应的量 | Key 在轮流活跃，而聚合状态跟的是「`staleness_interval` 窗口内出现过的 Key」。见 §六 末尾 |
 | vmagent 重启后少一段账 | VM 当时不可用、队列非空，而 vmagent 又重启了。边车按 HTTP 响应写成功就把基线前移，那段增量没人再持有。看 `vmagent_remotewrite_pending_data_bytes` 是否持续非零 |
