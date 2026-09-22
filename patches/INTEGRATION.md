@@ -80,7 +80,7 @@ mux.Handle("/metrics/cumulative", promhttp.HandlerFor(usageReg, promhttp.Handler
 ```yaml
 extraArgs:
   promscrape.zstdCompression: "true"
-  promscrape.maxScrapeSize: "64MiB"
+  promscrape.maxScrapeSize: "200MiB"
   remoteWrite.queues: "2"
   remoteWrite.maxDiskUsagePerURL: "10GB"
 ```
@@ -169,7 +169,9 @@ the response from ".../metrics/acg" exceeds -promscrape.maxScrapeSize (16777216 
 
 推下去 16 MiB 的默认值对应一批活跃约 1.1 万。**不要留在默认值上赌**：撞上去的表现是 vmagent 静默拒收整个响应，**只有 warn 日志、`up` 仍然是 1、一个样本都不进**，等发现时账已经缺了一段。
 
-所以 §二 里直接把 `promscrape.maxScrapeSize` 设成 **64MiB**（约 4.5 万活跃 Key 的余量）。**调大它不花内存**——它只是 `io.LimitReader` 的上界，读取缓冲按上一次的实际大小定容，响应没真变大就不会多占。留一个上界是为了万一目标失控时还有个刹车，所以别直接设成无限大。
+所以 §二 里直接把 `promscrape.maxScrapeSize` 设成 **200MiB**（约 14 万活跃 Key 的余量）。**调大它不花内存**——它只是 `io.LimitReader` 的上界，读取缓冲按上一次响应的实际大小定容，响应没真变大就不会多占。
+
+留一个上界是为了目标失控时还有个刹车，别设成无限大。这个刹车的代价要知道：撞上限之前，vmagent 会把压缩后的响应体完整读进内存，最坏情况是 **200 MiB × 目标数**。三个 pod 就是 600 MiB，在 2Gi 配额里可以接受；目标数再多就要相应上调配额，或者把这个值调回小一些。
 
 上线后盯 `vm_promscrape_max_scrape_size_exceeded_errors_total`，必须恒为 0。
 
