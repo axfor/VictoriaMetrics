@@ -1,0 +1,466 @@
+From 6233a36b37a448674164f39d68a09f75577a27d5 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Wed, 23 Sep 2026 08:11:18 -0700
+Subject: [PATCH 23/23] lib/streamaggr: keep output entries in sharded maps
+ instead of a sync.Map
+
+A heap profile of vmagent aggregating one 30k-key deployment -- about nine
+million output series -- put 1058 MiB of its 3136 MiB in sync.Map's own trie
+nodes (newIndirectNode and newEntryNode), roughly 120 bytes of structure per
+series on top of the entry it points at. A plain map slot costs a few dozen.
+
+The entries now live in 256 maps, each behind its own RWMutex, chosen by an
+xxhash of the output key. A push looks the key up under the read lock and, on a
+miss, looks again under the write lock before inserting, so two pushers
+creating the same entry at once still end up on one. A flush copies one shard's
+entries out under the read lock and flushes them with the lock released, so it
+never holds up pushes to a shard for the length of a flush. A stale entry is
+removed from its shard as soon as it is marked, as before: a push that finds it
+marked goes back to look it up again, and would keep doing so while it stayed.
+
+On ACG-shaped series (ten labels, four of them UUIDs) with the production
+aggregation config, per output series:
+
+  heap      434 -> 360 bytes  (-17%)
+  objects   8.6 -> 6.2
+
+BenchmarkAggregatorsPushACGShape is unchanged within noise (sum_samples_total
+124 -> 126 ms, sum_samples 120 -> 125 ms median of six, ranges overlapping).
+
+TestAggrOutputsConserveSamplesUnderConcurrency pushes from eight goroutines onto
+overlapping series with a flush running throughout and checks that what is
+flushed adds up to what was pushed; TestAggrOutputsDropStaleEntriesAndRebuild
+checks a stale entry leaves its shard and a later push rebuilds it. Both fail
+when the re-check before insert is removed (1 to 10 samples lost out of
+240000), when the last flush leaves entries behind, or when a stale entry is
+only marked.
+---
+ lib/streamaggr/acg_memory_test.go    |  84 +++++++++++++++
+ lib/streamaggr/output.go             | 111 ++++++++++++++++----
+ lib/streamaggr/output_shards_test.go | 150 +++++++++++++++++++++++++++
+ 3 files changed, 323 insertions(+), 22 deletions(-)
+ create mode 100644 lib/streamaggr/acg_memory_test.go
+ create mode 100644 lib/streamaggr/output_shards_test.go
+
+diff --git a/lib/streamaggr/acg_memory_test.go b/lib/streamaggr/acg_memory_test.go
+new file mode 100644
+index 000000000..c99eac231
+--- /dev/null
++++ b/lib/streamaggr/acg_memory_test.go
+@@ -0,0 +1,84 @@
++package streamaggr
++
++import (
++	"fmt"
++	"runtime"
++	"testing"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// What aggregation state costs per output series, on the configuration ACG runs
++// and label sets of the shape it sends: ten labels, four of them UUIDs.
++//
++// A 30k-key deployment keeps about nine million output series in this state, so
++// bytes per series is what decides vmagent's memory; a heap profile of one taken
++// under that load put a third of it in sync.Map's trie nodes rather than in the
++// data.
++func TestACGAggregationMemoryPerSeries(t *testing.T) {
++	if testing.Short() {
++		t.Skip("allocates a few hundred MiB")
++	}
++	const n = 300000
++	config := `
++- match: '{_metric_type!="gauge",_metric_type!=""}'
++  interval: 60s
++  drop_input_labels: [_metric_type, pod, instance, node]
++  outputs: [sum_samples_total]
++  keep_metric_names: true
++  staleness_interval: 40m
++  reset_marker_on_stale: true
++  flush_on_shutdown: true
++  output_heartbeat_interval: 4m
++`
++	a, err := LoadFromData([]byte(config), func(_ []prompb.TimeSeries) {}, nil, "acg")
++	if err != nil {
++		t.Fatalf("cannot load config: %s", err)
++	}
++	defer a.MustStop()
++
++	uuid := func(kind string, i int) string {
++		return fmt.Sprintf("%08x-%04x-5%03x-8%03x-%012x", i*2654435761%0xffffffff, len(kind), i%0xfff, (i/7)%0xfff, i)
++	}
++	series := make([]prompb.TimeSeries, 0, 1000)
++	var matchIdxs []byte
++	push := func() {
++		matchIdxs = a.Push(series, matchIdxs)
++		series = series[:0]
++	}
++
++	runtime.GC()
++	var before runtime.MemStats
++	runtime.ReadMemStats(&before)
++
++	for i := range n {
++		key, combo := i/4, i%4
++		series = append(series, prompb.TimeSeries{
++			Labels: []prompb.Label{
++				{Name: "__name__", Value: "acg_input_tokens"},
++				{Name: "_metric_type", Value: "counter"},
++				{Name: "apikey_id", Value: uuid("key", key)},
++				{Name: "business_group", Value: fmt.Sprintf("bg-%03d", key%50)},
++				{Name: "business_group_id", Value: uuid("bg", key%50)},
++				{Name: "pod", Value: "model-router-764746947b-ct9hv"},
++				{Name: "provider_id", Value: fmt.Sprintf("provider-%02d", combo)},
++				{Name: "provider_model", Value: fmt.Sprintf("provider-%02d-model-%d", combo, combo)},
++				{Name: "provider_model_id", Value: uuid("model", combo)},
++				{Name: "route_model", Value: fmt.Sprintf("model-%03d", key%20)},
++				{Name: "route_model_id", Value: uuid("route", key%20)},
++			},
++			Samples: []prompb.Sample{{Value: 1, Timestamp: 1}},
++		})
++		if len(series) == cap(series) {
++			push()
++		}
++	}
++	push()
++
++	runtime.GC()
++	var after runtime.MemStats
++	runtime.ReadMemStats(&after)
++	perSeries := float64(after.HeapAlloc-before.HeapAlloc) / n
++	objs := float64(after.HeapObjects-before.HeapObjects) / n
++	t.Logf("%d output series: %.0f bytes and %.1f heap objects per series", n, perSeries, objs)
++}
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index 7fa6750b8..a5c2f9a25 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -3,14 +3,34 @@ package streamaggr
+ import (
+ 	"sync"
+ 
++	"github.com/cespare/xxhash/v2"
++
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+ 	"github.com/VictoriaMetrics/metrics"
+ )
+ 
++// aggrOutputShards is how many independently locked maps hold the output
++// entries. Pushes run from many scrape goroutines at once; 256 keeps two of them
++// landing on the same lock rare at the core counts vmagent runs on.
++const aggrOutputShards = 256
++
++// aggrOutputShard is one lock and the entries hashed to it.
++//
++// The entries used to live in a sync.Map. Under the load one 30k-key
++// deployment puts on it -- about nine million output series -- a third of
++// vmagent's heap was sync.Map's own trie nodes rather than the entries: some 120
++// bytes of indirect and entry nodes per series, where a plain map slot costs a
++// few dozen.
++type aggrOutputShard struct {
++	mu sync.RWMutex
++	m  map[string]*aggrValues
++	_  [64 - 24 - 8]byte // a cache line to itself, so neighbouring locks do not share one
++}
++
+ type aggrOutputs struct {
+-	m              sync.Map
++	shards         [aggrOutputShards]aggrOutputShard
+ 	useSharedState bool
+ 	useInputKey    bool
+ 	// buildInputKey is whether compressLabels puts the input part into a
+@@ -69,9 +89,12 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+ 		sample = &samples[i]
+ 		inputKey, outputKey = ao.getInputOutputKey(sample.key)
+ 
++		sh := ao.shardOf(outputKey)
+ 	again:
+-		v, ok := ao.m.Load(outputKey)
+-		if !ok {
++		sh.mu.RLock()
++		av := sh.m[outputKey]
++		sh.mu.RUnlock()
++		if av == nil {
+ 			// The entry is missing in the map. Try creating it.
+ 			nv = &aggrValues{
+ 				blue: make([]aggrValue, len(ao.configs)),
+@@ -85,15 +108,18 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+ 					nv.green[idx] = ac.getValue(nv.blue[idx].state())
+ 				}
+ 			}
+-			v = nv
+-			outputKey = bytesutil.InternString(outputKey)
+-			vNew, loaded := ao.m.LoadOrStore(outputKey, v)
+-			if loaded {
+-				// Use the entry created by a concurrent goroutine.
+-				v = vNew
++			key := bytesutil.InternString(outputKey)
++			sh.mu.Lock()
++			if sh.m == nil {
++				sh.m = make(map[string]*aggrValues)
++			}
++			if av = sh.m[key]; av == nil {
++				sh.m[key] = nv
++				av = nv
+ 			}
++			// Otherwise use the entry created by a concurrent goroutine.
++			sh.mu.Unlock()
+ 		}
+-		av := v.(*aggrValues)
+ 		av.mu.Lock()
+ 		deleted := av.deleteDeadline < 0
+ 		if !deleted {
+@@ -116,27 +142,69 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+ 	}
+ }
+ 
++// shardOf returns the shard holding outputKey.
++func (ao *aggrOutputs) shardOf(outputKey string) *aggrOutputShard {
++	return &ao.shards[xxhash.Sum64String(outputKey)%aggrOutputShards]
++}
++
++// flushEntry is one entry copied out of a shard, so the shard's lock is not held
++// while the entry is flushed.
++type flushEntry struct {
++	key string
++	av  *aggrValues
++}
++
++var flushEntriesPool sync.Pool
++
+ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+-	m := &ao.m
++	var entries []flushEntry
++	if v := flushEntriesPool.Get(); v != nil {
++		entries = *v.(*[]flushEntry)
++	}
++	for i := range ao.shards {
++		sh := &ao.shards[i]
++		sh.mu.RLock()
++		for k, av := range sh.m {
++			entries = append(entries, flushEntry{key: k, av: av})
++		}
++		sh.mu.RUnlock()
++		for _, e := range entries {
++			ao.flushEntry(ctx, sh, e.key, e.av)
++		}
++		clear(entries)
++		entries = entries[:0]
++	}
++	flushEntriesPool.Put(&entries)
++}
++
++// removeEntry drops key from sh if it still maps to av.
++func (sh *aggrOutputShard) removeEntry(key string, av *aggrValues) {
++	sh.mu.Lock()
++	if sh.m[key] == av {
++		delete(sh.m, key)
++	}
++	sh.mu.Unlock()
++}
++
++func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey string, av *aggrValues) {
+ 	var outputs []aggrValue
+-	m.Range(func(k, v any) bool {
+-		// Atomically delete the entry from the map, so new entry is created for the next flush.
+-		av := v.(*aggrValues)
++	{
+ 		av.mu.Lock()
+ 
+ 		// check for stale entries
+ 		deleted := ctx.flushTimestamp > av.deleteDeadline
+ 		if deleted {
+ 			if ao.resetMarkerOnStale {
+-				ao.appendResetMarkers(ctx, av, k.(string), ctx.flushTimestamp)
++				ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp)
+ 			}
+-			// Mark the current entry as deleted
++			// Mark the current entry as deleted, and drop it straight away: a
++			// concurrent push that finds it marked goes back to look it up
++			// again, and keeps doing so for as long as it is still in the map.
+ 			av.deleteDeadline = -1
+ 			av.mu.Unlock()
+-			m.Delete(k)
+-			return true
++			sh.removeEntry(outputKey, av)
++			return
+ 		}
+-		outputKey := k.(string)
+ 		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
+ 			// The first visible flush of a new output entry: emit a zero one interval earlier.
+ 			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
+@@ -152,10 +220,9 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 		}
+ 		av.mu.Unlock()
+ 		if ctx.isLast {
+-			m.Delete(k)
++			sh.removeEntry(outputKey, av)
+ 		}
+-		return true
+-	})
++	}
+ }
+ 
+ // appendResetMarkers emits a zero sample at the given timestamp for every total, total_prometheus and sum_samples_total output of av.
+diff --git a/lib/streamaggr/output_shards_test.go b/lib/streamaggr/output_shards_test.go
+new file mode 100644
+index 000000000..eaa1d90e3
+--- /dev/null
++++ b/lib/streamaggr/output_shards_test.go
+@@ -0,0 +1,150 @@
++package streamaggr
++
++import (
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// Pushes from several goroutines onto overlapping series, with a flush running
++// all the while, must neither lose nor repeat a sample: what comes out of every
++// flush adds up to what went in. This is the contract the sync.Map gave for free
++// and the sharded map has to keep -- two pushers creating the same entry at once
++// must end up on one entry, and a flush copying a shard out must not skip or
++// double any entry.
++func TestAggrOutputsConserveSamplesUnderConcurrency(t *testing.T) {
++	const config = `
++- match: acg_requests_total
++  interval: 1h
++  outputs: [sum_samples]
++  keep_metric_names: true
++`
++	var out atomic.Int64 // sum of every flushed value, scaled to an integer
++	pushFunc := func(tss []prompb.TimeSeries) {
++		for _, ts := range tss {
++			for _, s := range ts.Samples {
++				out.Add(int64(s.Value))
++			}
++		}
++	}
++	as, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++	if err != nil {
++		t.Fatalf("cannot load config: %s", err)
++	}
++	a := as.as[0]
++	defer as.MustStop()
++
++	const (
++		pushers = 8
++		rounds  = 300
++		keys    = 5000 // few enough that pushers collide on every key
++	)
++	var in atomic.Int64
++	var wg sync.WaitGroup
++	for p := range pushers {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			tss := make([]prompb.TimeSeries, 0, 100)
++			var matchIdxs []byte
++			for r := range rounds {
++				tss = tss[:0]
++				for k := range 100 {
++					key := (p*7919 + r*104729 + k*31) % keys
++					tss = append(tss, prompb.TimeSeries{
++						Labels:  []prompb.Label{{Name: "__name__", Value: "acg_requests_total"}, {Name: "apikey_id", Value: fmt.Sprintf("key-%05d", key)}},
++						Samples: []prompb.Sample{{Value: 1, Timestamp: time.Now().UnixMilli()}},
++					})
++				}
++				matchIdxs = as.Push(tss, matchIdxs)
++				in.Add(int64(len(tss)))
++			}
++		}()
++	}
++	stop := make(chan struct{})
++	flushed := make(chan struct{})
++	go func() {
++		defer close(flushed)
++		for {
++			select {
++			case <-stop:
++				return
++			default:
++				a.flush(pushFunc, time.Now(), &currentState{}, false)
++			}
++		}
++	}()
++	wg.Wait()
++	close(stop)
++	<-flushed
++	a.flush(pushFunc, time.Now(), &currentState{}, true)
++
++	if got, want := out.Load(), in.Load(); got != want {
++		t.Fatalf("flushed %d samples in total, pushed %d", got, want)
++	}
++	if n := entriesIn(a.aggrOutputs); n != 0 {
++		t.Fatalf("%d entries left after the last flush, want none", n)
++	}
++}
++
++// An entry that goes stale is dropped from its shard, and a later push for the
++// same series builds a new one rather than finding the dropped one.
++func TestAggrOutputsDropStaleEntriesAndRebuild(t *testing.T) {
++	const config = `
++- match: acg_requests_total
++  interval: 1h
++  staleness_interval: 1h
++  outputs: [sum_samples]
++  keep_metric_names: true
++`
++	var got []float64
++	pushFunc := func(tss []prompb.TimeSeries) {
++		for _, ts := range tss {
++			for _, s := range ts.Samples {
++				got = append(got, s.Value)
++			}
++		}
++	}
++	as, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++	if err != nil {
++		t.Fatalf("cannot load config: %s", err)
++	}
++	a := as.as[0]
++	defer as.MustStop()
++
++	push := func(v float64) {
++		as.Push([]prompb.TimeSeries{{
++			Labels:  []prompb.Label{{Name: "__name__", Value: "acg_requests_total"}, {Name: "apikey_id", Value: "k"}},
++			Samples: []prompb.Sample{{Value: v, Timestamp: time.Now().UnixMilli()}},
++		}}, nil)
++	}
++	push(3)
++	if n := entriesIn(a.aggrOutputs); n != 1 {
++		t.Fatalf("%d entries after one push, want 1", n)
++	}
++	// Well past the staleness deadline: the entry is dropped, not flushed.
++	a.flush(pushFunc, time.Now().Add(3*time.Hour), &currentState{}, false)
++	if n := entriesIn(a.aggrOutputs); n != 0 {
++		t.Fatalf("%d entries after the stale flush, want 0", n)
++	}
++	push(5)
++	a.flush(pushFunc, time.Now(), &currentState{}, true)
++	if len(got) != 1 || got[0] != 5 {
++		t.Fatalf("flushed %v, want only the push made after the entry was rebuilt: [5]", got)
++	}
++}
++
++func entriesIn(ao *aggrOutputs) int {
++	n := 0
++	for i := range ao.shards {
++		sh := &ao.shards[i]
++		sh.mu.RLock()
++		n += len(sh.m)
++		sh.mu.RUnlock()
++	}
++	return n
++}
+-- 
+2.50.1 (Apple Git-155)
+

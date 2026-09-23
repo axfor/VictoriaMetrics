@@ -1,0 +1,241 @@
+From cefa6d209c07c8eb11aeef35c847f6bf4635e1be Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Wed, 23 Sep 2026 08:25:04 -0700
+Subject: [PATCH 24/24] lib/streamaggr: hold a single output inside its entry,
+ and sum_samples_total's state with its value
+
+Without shared state -- enable_windows off, the common configuration and ACG's
+-- each output series cost four allocations: the aggrValues entry (72 bytes,
+rounded to 80), a one-element slice for its outputs, and for sum_samples_total
+the value and the shared state it points at. Nothing about them needs to be
+separate.
+
+aggrValues now keeps the one output of a single-output aggregator without shared
+state in an inline array, and puts everything else behind a pointer to a slice
+laid out blue then green, so the entry is 48 bytes and there is no separate
+slice. sum_samples_total allocates a value together with the state it owns
+when nothing else shares it; a green value still points at its blue value's
+state. Without shared state there is no green half, exactly as before.
+
+On ACG-shaped series with the production config, per output series:
+
+  heap      360 -> 313 bytes  (-13%; -28% with the sharded map)
+  objects   6.2 -> 4.2
+
+BenchmarkAggregatorsPushACGShape medians 126 -> 114 ms (sum_samples_total) and
+125 -> 110 ms (sum_samples), fewer allocations to make.
+
+The one existing enable_windows test does not notice blue and green being
+confused, so TestAggrValuesKeepBlueAndGreenApart checks the layout directly:
+right lengths, distinct values, green sharing blue's state. Returning the blue
+half for green fails it.
+---
+ lib/streamaggr/output.go             | 82 ++++++++++++++++++----------
+ lib/streamaggr/output_shards_test.go | 41 ++++++++++++++
+ lib/streamaggr/sum_samples.go        | 16 ++++--
+ 3 files changed, 107 insertions(+), 32 deletions(-)
+
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index a5c2f9a25..75a81fb5f 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -96,18 +96,7 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+ 		sh.mu.RUnlock()
+ 		if av == nil {
+ 			// The entry is missing in the map. Try creating it.
+-			nv = &aggrValues{
+-				blue: make([]aggrValue, len(ao.configs)),
+-			}
+-			if ao.useSharedState {
+-				nv.green = make([]aggrValue, len(ao.configs))
+-			}
+-			for idx, ac := range ao.configs {
+-				nv.blue[idx] = ac.getValue(nil)
+-				if ao.useSharedState {
+-					nv.green[idx] = ac.getValue(nv.blue[idx].state())
+-				}
+-			}
++			nv = ao.newAggrValues()
+ 			key := bytesutil.InternString(outputKey)
+ 			sh.mu.Lock()
+ 			if sh.m == nil {
+@@ -123,11 +112,7 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+ 		av.mu.Lock()
+ 		deleted := av.deleteDeadline < 0
+ 		if !deleted {
+-			if isGreen {
+-				outputs = av.green
+-			} else {
+-				outputs = av.blue
+-			}
++			outputs = av.outputs(len(ao.configs), isGreen)
+ 			for idx, o := range outputs {
+ 				o.pushSample(ao.configs[idx], sample, inputKey, deleteDeadline)
+ 			}
+@@ -210,11 +195,7 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey
+ 			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
+ 			av.started = true
+ 		}
+-		if ctx.isGreen {
+-			outputs = av.green
+-		} else {
+-			outputs = av.blue
+-		}
++		outputs = av.outputs(len(ao.configs), ctx.isGreen)
+ 		for i, o := range outputs {
+ 			o.flush(ao.configs[i], ctx, outputKey, ctx.isLast)
+ 		}
+@@ -232,10 +213,7 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey
+ // the previous output ends at some value X, and the new output restarts from a small value,
+ // which increase() cannot detect as a counter reset if it isn't smaller than X.
+ func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputKey string, timestamp int64) {
+-	outputs := av.blue
+-	if ctx.isGreen {
+-		outputs = av.green
+-	}
++	outputs := av.outputs(len(ao.configs), ctx.isGreen)
+ 	for i := range outputs {
+ 		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
+ 			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
+@@ -245,10 +223,58 @@ func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputK
+ 
+ type aggrValues struct {
+ 	mu             sync.Mutex
+-	blue           []aggrValue
+-	green          []aggrValue
+ 	deleteDeadline int64
+ 	started        bool // a zero sample has been emitted before the first visible flush (reset_marker_on_stale)
++
++	// one holds the output when there is a single one and no shared state --
++	// the common configuration, ACG's included -- so an entry and its output
++	// cost one allocation instead of two, and 48 bytes instead of 80 plus a
++	// slice. Otherwise every output is in more: the blue ones, then with shared
++	// state the green ones.
++	one  [1]aggrValue
++	more *[]aggrValue
++}
++
++// newAggrValues builds the entry for a new output series.
++func (ao *aggrOutputs) newAggrValues() *aggrValues {
++	nv := &aggrValues{}
++	n := len(ao.configs)
++	if n == 1 && !ao.useSharedState {
++		nv.one[0] = ao.configs[0].getValue(nil)
++		return nv
++	}
++	size := n
++	if ao.useSharedState {
++		size = 2 * n
++	}
++	all := make([]aggrValue, size)
++	for idx, ac := range ao.configs {
++		all[idx] = ac.getValue(nil)
++		if ao.useSharedState {
++			all[n+idx] = ac.getValue(all[idx].state())
++		}
++	}
++	nv.more = &all
++	return nv
++}
++
++// outputs returns the blue or green outputs of av, n being how many outputs the
++// aggregator has. Without shared state there are no green ones, as before.
++func (av *aggrValues) outputs(n int, isGreen bool) []aggrValue {
++	if av.more == nil {
++		if isGreen {
++			return nil
++		}
++		return av.one[:]
++	}
++	all := *av.more
++	if isGreen {
++		if len(all) < 2*n {
++			return nil
++		}
++		return all[n : 2*n]
++	}
++	return all[:n]
+ }
+ 
+ type aggrConfig interface {
+diff --git a/lib/streamaggr/output_shards_test.go b/lib/streamaggr/output_shards_test.go
+index eaa1d90e3..e3c103f78 100644
+--- a/lib/streamaggr/output_shards_test.go
++++ b/lib/streamaggr/output_shards_test.go
+@@ -148,3 +148,44 @@ func entriesIn(ao *aggrOutputs) int {
+ 	}
+ 	return n
+ }
++
++// With shared state every output has a blue and a green value sharing one
++// state, and the two halves must not be confused: a push for the green window
++// that lands on a blue value is attributed to the wrong window.
++func TestAggrValuesKeepBlueAndGreenApart(t *testing.T) {
++	for _, n := range []int{1, 2, 3} {
++		configs := make([]aggrConfig, n)
++		for i := range configs {
++			configs[i] = newHistogramBucketAggrConfig(true)
++		}
++		ao := &aggrOutputs{configs: configs, useSharedState: true}
++		av := ao.newAggrValues()
++		blue, green := av.outputs(n, false), av.outputs(n, true)
++		if len(blue) != n || len(green) != n {
++			t.Fatalf("n=%d: %d blue and %d green outputs, want %d of each", n, len(blue), len(green), n)
++		}
++		for i := range n {
++			if blue[i] == green[i] {
++				t.Fatalf("n=%d: output %d is the same value in blue and green", n, i)
++			}
++			if blue[i].state() != green[i].state() {
++				t.Fatalf("n=%d: output %d: green does not share blue's state", n, i)
++			}
++		}
++	}
++}
++
++// Without shared state there is no green half, as before the entry was
++// flattened, and a single output is held in the entry itself.
++func TestAggrValuesWithoutSharedState(t *testing.T) {
++	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig()}}
++	av := one.newAggrValues()
++	if av.more != nil || len(av.outputs(1, false)) != 1 || av.outputs(1, true) != nil {
++		t.Fatalf("single output: more=%v, blue %d, green %v", av.more != nil, len(av.outputs(1, false)), av.outputs(1, true))
++	}
++	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(), newSumSamplesTotalAggrConfig()}}
++	av = two.newAggrValues()
++	if len(av.outputs(2, false)) != 2 || av.outputs(2, true) != nil {
++		t.Fatalf("two outputs: blue %d, green %v", len(av.outputs(2, false)), av.outputs(2, true))
++	}
++}
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index dc512ae20..8b068c6d6 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -110,12 +110,20 @@ func newSumSamplesTotalAggrConfig() aggrConfig {
+ 
+ type sumSamplesTotalAggrConfig struct{}
+ 
++// sumSamplesTotalOwned is a value together with the shared state it owns when
++// no other value shares it, so the pair costs one allocation instead of two.
++type sumSamplesTotalOwned struct {
++	v      sumSamplesTotalAggrValue
++	shared sumSamplesTotalShared
++}
++
+ func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+-	shared, ok := s.(*sumSamplesTotalShared)
+-	if !ok {
+-		shared = &sumSamplesTotalShared{}
++	if shared, ok := s.(*sumSamplesTotalShared); ok {
++		return &sumSamplesTotalAggrValue{shared: shared}
+ 	}
+-	return &sumSamplesTotalAggrValue{shared: shared}
++	o := &sumSamplesTotalOwned{}
++	o.v.shared = &o.shared
++	return &o.v
+ }
+ 
+ // needsInputKey reports that this output looks only at the sample, so the key
+-- 
+2.50.1 (Apple Git-155)
+
