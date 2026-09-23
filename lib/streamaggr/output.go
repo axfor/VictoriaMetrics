@@ -96,18 +96,7 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
 		sh.mu.RUnlock()
 		if av == nil {
 			// The entry is missing in the map. Try creating it.
-			nv = &aggrValues{
-				blue: make([]aggrValue, len(ao.configs)),
-			}
-			if ao.useSharedState {
-				nv.green = make([]aggrValue, len(ao.configs))
-			}
-			for idx, ac := range ao.configs {
-				nv.blue[idx] = ac.getValue(nil)
-				if ao.useSharedState {
-					nv.green[idx] = ac.getValue(nv.blue[idx].state())
-				}
-			}
+			nv = ao.newAggrValues()
 			key := bytesutil.InternString(outputKey)
 			sh.mu.Lock()
 			if sh.m == nil {
@@ -123,11 +112,7 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
 		av.mu.Lock()
 		deleted := av.deleteDeadline < 0
 		if !deleted {
-			if isGreen {
-				outputs = av.green
-			} else {
-				outputs = av.blue
-			}
+			outputs = av.outputs(len(ao.configs), isGreen)
 			for idx, o := range outputs {
 				o.pushSample(ao.configs[idx], sample, inputKey, deleteDeadline)
 			}
@@ -210,11 +195,7 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey 
 			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
 			av.started = true
 		}
-		if ctx.isGreen {
-			outputs = av.green
-		} else {
-			outputs = av.blue
-		}
+		outputs = av.outputs(len(ao.configs), ctx.isGreen)
 		for i, o := range outputs {
 			o.flush(ao.configs[i], ctx, outputKey, ctx.isLast)
 		}
@@ -232,10 +213,7 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey 
 // the previous output ends at some value X, and the new output restarts from a small value,
 // which increase() cannot detect as a counter reset if it isn't smaller than X.
 func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputKey string, timestamp int64) {
-	outputs := av.blue
-	if ctx.isGreen {
-		outputs = av.green
-	}
+	outputs := av.outputs(len(ao.configs), ctx.isGreen)
 	for i := range outputs {
 		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
 			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
@@ -245,10 +223,58 @@ func (ao *aggrOutputs) appendResetMarkers(ctx *flushCtx, av *aggrValues, outputK
 
 type aggrValues struct {
 	mu             sync.Mutex
-	blue           []aggrValue
-	green          []aggrValue
 	deleteDeadline int64
 	started        bool // a zero sample has been emitted before the first visible flush (reset_marker_on_stale)
+
+	// one holds the output when there is a single one and no shared state --
+	// the common configuration, ACG's included -- so an entry and its output
+	// cost one allocation instead of two, and 48 bytes instead of 80 plus a
+	// slice. Otherwise every output is in more: the blue ones, then with shared
+	// state the green ones.
+	one  [1]aggrValue
+	more *[]aggrValue
+}
+
+// newAggrValues builds the entry for a new output series.
+func (ao *aggrOutputs) newAggrValues() *aggrValues {
+	nv := &aggrValues{}
+	n := len(ao.configs)
+	if n == 1 && !ao.useSharedState {
+		nv.one[0] = ao.configs[0].getValue(nil)
+		return nv
+	}
+	size := n
+	if ao.useSharedState {
+		size = 2 * n
+	}
+	all := make([]aggrValue, size)
+	for idx, ac := range ao.configs {
+		all[idx] = ac.getValue(nil)
+		if ao.useSharedState {
+			all[n+idx] = ac.getValue(all[idx].state())
+		}
+	}
+	nv.more = &all
+	return nv
+}
+
+// outputs returns the blue or green outputs of av, n being how many outputs the
+// aggregator has. Without shared state there are no green ones, as before.
+func (av *aggrValues) outputs(n int, isGreen bool) []aggrValue {
+	if av.more == nil {
+		if isGreen {
+			return nil
+		}
+		return av.one[:]
+	}
+	all := *av.more
+	if isGreen {
+		if len(all) < 2*n {
+			return nil
+		}
+		return all[n : 2*n]
+	}
+	return all[:n]
 }
 
 type aggrConfig interface {

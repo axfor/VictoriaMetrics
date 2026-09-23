@@ -110,12 +110,20 @@ func newSumSamplesTotalAggrConfig() aggrConfig {
 
 type sumSamplesTotalAggrConfig struct{}
 
+// sumSamplesTotalOwned is a value together with the shared state it owns when
+// no other value shares it, so the pair costs one allocation instead of two.
+type sumSamplesTotalOwned struct {
+	v      sumSamplesTotalAggrValue
+	shared sumSamplesTotalShared
+}
+
 func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
-	shared, ok := s.(*sumSamplesTotalShared)
-	if !ok {
-		shared = &sumSamplesTotalShared{}
+	if shared, ok := s.(*sumSamplesTotalShared); ok {
+		return &sumSamplesTotalAggrValue{shared: shared}
 	}
-	return &sumSamplesTotalAggrValue{shared: shared}
+	o := &sumSamplesTotalOwned{}
+	o.v.shared = &o.shared
+	return &o.v
 }
 
 // needsInputKey reports that this output looks only at the sample, so the key

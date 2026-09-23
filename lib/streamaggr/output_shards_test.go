@@ -148,3 +148,44 @@ func entriesIn(ao *aggrOutputs) int {
 	}
 	return n
 }
+
+// With shared state every output has a blue and a green value sharing one
+// state, and the two halves must not be confused: a push for the green window
+// that lands on a blue value is attributed to the wrong window.
+func TestAggrValuesKeepBlueAndGreenApart(t *testing.T) {
+	for _, n := range []int{1, 2, 3} {
+		configs := make([]aggrConfig, n)
+		for i := range configs {
+			configs[i] = newHistogramBucketAggrConfig(true)
+		}
+		ao := &aggrOutputs{configs: configs, useSharedState: true}
+		av := ao.newAggrValues()
+		blue, green := av.outputs(n, false), av.outputs(n, true)
+		if len(blue) != n || len(green) != n {
+			t.Fatalf("n=%d: %d blue and %d green outputs, want %d of each", n, len(blue), len(green), n)
+		}
+		for i := range n {
+			if blue[i] == green[i] {
+				t.Fatalf("n=%d: output %d is the same value in blue and green", n, i)
+			}
+			if blue[i].state() != green[i].state() {
+				t.Fatalf("n=%d: output %d: green does not share blue's state", n, i)
+			}
+		}
+	}
+}
+
+// Without shared state there is no green half, as before the entry was
+// flattened, and a single output is held in the entry itself.
+func TestAggrValuesWithoutSharedState(t *testing.T) {
+	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig()}}
+	av := one.newAggrValues()
+	if av.more != nil || len(av.outputs(1, false)) != 1 || av.outputs(1, true) != nil {
+		t.Fatalf("single output: more=%v, blue %d, green %v", av.more != nil, len(av.outputs(1, false)), av.outputs(1, true))
+	}
+	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(), newSumSamplesTotalAggrConfig()}}
+	av = two.newAggrValues()
+	if len(av.outputs(2, false)) != 2 || av.outputs(2, true) != nil {
+		t.Fatalf("two outputs: blue %d, green %v", len(av.outputs(2, false)), av.outputs(2, true))
+	}
+}
