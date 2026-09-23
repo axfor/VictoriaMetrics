@@ -3,14 +3,34 @@ package streamaggr
 import (
 	"sync"
 
+	"github.com/cespare/xxhash/v2"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/metrics"
 )
 
+// aggrOutputShards is how many independently locked maps hold the output
+// entries. Pushes run from many scrape goroutines at once; 256 keeps two of them
+// landing on the same lock rare at the core counts vmagent runs on.
+const aggrOutputShards = 256
+
+// aggrOutputShard is one lock and the entries hashed to it.
+//
+// The entries used to live in a sync.Map. Under the load one 30k-key
+// deployment puts on it -- about nine million output series -- a third of
+// vmagent's heap was sync.Map's own trie nodes rather than the entries: some 120
+// bytes of indirect and entry nodes per series, where a plain map slot costs a
+// few dozen.
+type aggrOutputShard struct {
+	mu sync.RWMutex
+	m  map[string]*aggrValues
+	_  [64 - 24 - 8]byte // a cache line to itself, so neighbouring locks do not share one
+}
+
 type aggrOutputs struct {
-	m              sync.Map
+	shards         [aggrOutputShards]aggrOutputShard
 	useSharedState bool
 	useInputKey    bool
 	// buildInputKey is whether compressLabels puts the input part into a
@@ -69,9 +89,12 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
 		sample = &samples[i]
 		inputKey, outputKey = ao.getInputOutputKey(sample.key)
 
+		sh := ao.shardOf(outputKey)
 	again:
-		v, ok := ao.m.Load(outputKey)
-		if !ok {
+		sh.mu.RLock()
+		av := sh.m[outputKey]
+		sh.mu.RUnlock()
+		if av == nil {
 			// The entry is missing in the map. Try creating it.
 			nv = &aggrValues{
 				blue: make([]aggrValue, len(ao.configs)),
@@ -85,15 +108,18 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
 					nv.green[idx] = ac.getValue(nv.blue[idx].state())
 				}
 			}
-			v = nv
-			outputKey = bytesutil.InternString(outputKey)
-			vNew, loaded := ao.m.LoadOrStore(outputKey, v)
-			if loaded {
-				// Use the entry created by a concurrent goroutine.
-				v = vNew
+			key := bytesutil.InternString(outputKey)
+			sh.mu.Lock()
+			if sh.m == nil {
+				sh.m = make(map[string]*aggrValues)
 			}
+			if av = sh.m[key]; av == nil {
+				sh.m[key] = nv
+				av = nv
+			}
+			// Otherwise use the entry created by a concurrent goroutine.
+			sh.mu.Unlock()
 		}
-		av := v.(*aggrValues)
 		av.mu.Lock()
 		deleted := av.deleteDeadline < 0
 		if !deleted {
@@ -116,27 +142,69 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
 	}
 }
 
+// shardOf returns the shard holding outputKey.
+func (ao *aggrOutputs) shardOf(outputKey string) *aggrOutputShard {
+	return &ao.shards[xxhash.Sum64String(outputKey)%aggrOutputShards]
+}
+
+// flushEntry is one entry copied out of a shard, so the shard's lock is not held
+// while the entry is flushed.
+type flushEntry struct {
+	key string
+	av  *aggrValues
+}
+
+var flushEntriesPool sync.Pool
+
 func (ao *aggrOutputs) flushState(ctx *flushCtx) {
-	m := &ao.m
+	var entries []flushEntry
+	if v := flushEntriesPool.Get(); v != nil {
+		entries = *v.(*[]flushEntry)
+	}
+	for i := range ao.shards {
+		sh := &ao.shards[i]
+		sh.mu.RLock()
+		for k, av := range sh.m {
+			entries = append(entries, flushEntry{key: k, av: av})
+		}
+		sh.mu.RUnlock()
+		for _, e := range entries {
+			ao.flushEntry(ctx, sh, e.key, e.av)
+		}
+		clear(entries)
+		entries = entries[:0]
+	}
+	flushEntriesPool.Put(&entries)
+}
+
+// removeEntry drops key from sh if it still maps to av.
+func (sh *aggrOutputShard) removeEntry(key string, av *aggrValues) {
+	sh.mu.Lock()
+	if sh.m[key] == av {
+		delete(sh.m, key)
+	}
+	sh.mu.Unlock()
+}
+
+func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey string, av *aggrValues) {
 	var outputs []aggrValue
-	m.Range(func(k, v any) bool {
-		// Atomically delete the entry from the map, so new entry is created for the next flush.
-		av := v.(*aggrValues)
+	{
 		av.mu.Lock()
 
 		// check for stale entries
 		deleted := ctx.flushTimestamp > av.deleteDeadline
 		if deleted {
 			if ao.resetMarkerOnStale {
-				ao.appendResetMarkers(ctx, av, k.(string), ctx.flushTimestamp)
+				ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp)
 			}
-			// Mark the current entry as deleted
+			// Mark the current entry as deleted, and drop it straight away: a
+			// concurrent push that finds it marked goes back to look it up
+			// again, and keeps doing so for as long as it is still in the map.
 			av.deleteDeadline = -1
 			av.mu.Unlock()
-			m.Delete(k)
-			return true
+			sh.removeEntry(outputKey, av)
+			return
 		}
-		outputKey := k.(string)
 		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
 			// The first visible flush of a new output entry: emit a zero one interval earlier.
 			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
@@ -152,10 +220,9 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 		}
 		av.mu.Unlock()
 		if ctx.isLast {
-			m.Delete(k)
+			sh.removeEntry(outputKey, av)
 		}
-		return true
-	})
+	}
 }
 
 // appendResetMarkers emits a zero sample at the given timestamp for every total, total_prometheus and sum_samples_total output of av.
