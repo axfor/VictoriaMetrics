@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/integration.md`。
 
-二十二个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
+二十四个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -30,12 +30,14 @@
 | `023-acg_streamaggr-gauge-dedup-guard` | 钉住「开了 dedup 的 gauge 规则仍然跨 pod 求和」:`drop_input_labels` 在 dedup 之前删标签,`without` 在分组时删(之后),把 pod 写进前者会让三个 pod 在去重器眼里是同一条序列,只算一个 | 可选,只加测试 |
 | `024-acg_zstd-default-one-slot` | `-zstd.encoderConcurrency` 默认值改成 1,让它不必出现在部署配置里。一个纯内存优化不该有能力让进程起不来:旧镜像上传这个参数会 `flag provided but not defined` 直接退出 | **建议**,少一个必配项 |
 | `025-acg_streamaggr-output-heartbeat` | 新增 `output_heartbeat_interval`:`sum_samples_total` 跳过值没变的刷出,只在心跳到期时补写。实测轮换形态下四分之三的输出序列每轮都在重写同一个值 | 可选,减少写入压力 |
+| `026-acg_streamaggr-sharded-outputs` | 聚合输出条目从 `sync.Map` 改为 256 个分片的普通 map:3 万 key 时近千万条输出序列,堆剖面里三分之一是 `sync.Map` 的 trie 节点而不是数据。每条输出序列 434 → 360 字节 | 建议,纯内存 |
+| `027-acg_streamaggr-inline-single-output` | 单个输出直接放在条目里,`sum_samples_total` 的值与状态一次分配。每条输出序列 360 → 313 字节(两条合计 −28%) | 建议,纯内存;依赖 026 |
 
 只动源码的是 22 个文件:`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(7 个补丁碰它)和 `output.go`(4 个)。
+冲突热点是 `streamaggr.go`(7 个补丁碰它)和 `output.go`(6 个)。
 
 ## 基线:为什么是集群版
 
