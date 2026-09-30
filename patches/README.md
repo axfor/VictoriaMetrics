@@ -1,8 +1,8 @@
-# vmagent 补丁(基于 VictoriaMetrics **v1.126.0-cluster**)
+# VictoriaMetrics 补丁:vmagent、vmselect、vmstorage(基于 **v1.126.0-cluster**)
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/integration.md`。
 
-二十四个补丁,**按编号顺序打**。源码是 fork `github.com/axfor/VictoriaMetrics`
+二十六个补丁,**按编号顺序打**。004~027 是 vmagent 的,028 是 vmselect 的,029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -32,8 +32,10 @@
 | `025-acg_streamaggr-output-heartbeat` | 新增 `output_heartbeat_interval`:`sum_samples_total` 跳过值没变的刷出,只在心跳到期时补写。实测轮换形态下四分之三的输出序列每轮都在重写同一个值 | 可选,减少写入压力 |
 | `026-acg_streamaggr-sharded-outputs` | 聚合输出条目从 `sync.Map` 改为 256 个分片的普通 map:3 万 key 时近千万条输出序列,堆剖面里三分之一是 `sync.Map` 的 trie 节点而不是数据。每条输出序列 434 → 360 字节 | 建议,纯内存 |
 | `027-acg_streamaggr-inline-single-output` | 单个输出直接放在条目里,`sum_samples_total` 的值与状态一次分配。每条输出序列 360 → 313 字节(两条合计 −28%) | 建议,纯内存;依赖 026 |
+| `028-acg_httpserver-zstd-response` | 客户端在 `Accept-Encoding` 里给 zstd 的权重高于 gzip(或相同且排在前面)时,响应改用 zstd 压缩(第八部分);其余客户端照旧拿 gzip | 可选,ruler 读导出时省 vmselect 的 CPU;没有它 ruler 退回 gzip |
+| `029-acg_storage-tsdb-status-from-names` | 带 `match[]` 的 `/api/v1/status/tsdb` 在匹配数不超过新参数时从匹配序列的指标名统计,不再扫当天全部倒排索引(第九部分)。实验集群 2.4 亿序列的一天:29–41 秒 → 0.06–0.38 秒,结果逐项相同 | **建议**(ruler 切分片要问它),需在 vmstorage 上加参数才生效 |
 
-只动源码的是 22 个文件:`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
+只动源码的是 26 个文件:028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
@@ -142,7 +144,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -392,3 +394,48 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
 
 其余类别(正常、单 pod 短中断、单 pod 长中断、全部 pod 长中断)三组都全部相等;打 0007 那组重复时间戳为 0。
 
+---
+
+## 八、vmselect 按客户端要求用 zstd 压缩响应(028)
+
+上游的响应压缩走 gzhttp,客户端同时列出 gzip 和 zstd 时它总是选 gzip,读大导出的客户端怎么要都拿不到 zstd。
+补丁在 `Accept-Encoding` 里 zstd 的权重高于 gzip、或权重相同且排在前面时用 zstd 压缩响应;否则原样交给上游的 gzip,
+浏览器和各种代理的行为不变。ACG ruler 读导出时发的是 `zstd, gzip;q=0.5`。
+
+- 压不压照搬 gzhttp 对 gzip 的规则:先攒 1 KB 再决定,只压至少 1 KB 的 2xx 完整响应,所以错误信息和小响应原样发出;
+  HEAD、204、206,以及 handler 自己设了 `Content-Encoding` 或 `Content-Range` 的都不压;1xx 立即转发;
+  正文写出之前的 Flush 不提前发响应头;压缩时去掉 `Accept-Ranges`、加上 `Vary: Accept-Encoding`。
+- 请求原样交给 handler,不删 `Accept-Encoding`;VM 出错中止响应(接管并断开连接)之后,不再往连接上写。
+- 压缩窗口 1 MiB:80 MB 的真实导出压缩 15.2 倍,默认的 4 MiB 窗口是 16.1 倍,每个在途响应占的内存是后者的四分之一。
+- 改的是 `lib/httpserver`,所有组件的 HTTP 接口都带上了,但只对明确偏好 zstd 的客户端生效。
+  不需要参数;`-http.disableResponseCompression` 关掉压缩时它也一起关。
+- 验证:10 个测试覆盖上面每条规则和对抗审查提出的全部情形;把 16 条规则逐一改回去,每次都有测试失败。
+  实验集群 vmselect 换上后,ruler 用的两种导出(POST 的 JSON 导出和 native 导出)都返回 zstd,解压后和不压缩时逐字节一致;
+  400 错误和小响应是明文。
+- ruler 用 v0.1.8 及以后:它会先解压非 2xx 响应再读错误信息。上游 gzip 同样会压 1 KB 以上的错误,与 028 无关。
+
+## 九、带选择器的 TSDB status 从匹配序列的指标名统计(029)
+
+`/api/v1/status/tsdb` 带 `match[]` 时,vmstorage 先找出匹配的 metricID(很快),然后**不管匹配多少**
+都把当天 per-day 倒排索引的每一行扫一遍、逐行和匹配集合求交,所以代价和当天的序列总数成正比。
+实验集群一天 2.4 亿序列:只匹配 3 万条的选择器也要 29–41 秒,trace 里找 metricID 只占 0.1 秒。
+
+补丁照 vmstorage 自己在查标签名、标签值时的做法(`searchLabelNamesWithFiltersOnDate` 匹配不超过 10 万时
+走 `getLabelNamesForMetricIDs`):匹配数不超过 `-search.maxMetricIDsForDirectTSDBStatus` 时,
+从这些序列的指标名统计各项;按倒排索引行的顺序推入 top heap,前 N 名边界上的并列和扫描时一样。
+
+- **默认 0,即上游行为(总是扫描)**,要在 vmstorage 上加参数才生效。建议 `-search.maxMetricIDsForDirectTSDBStatus=200000`
+  (按单个 vmstorage 上的匹配数算):ruler 切好的每一片三台合计不超过 30 万;实验集群四分之一规模时,切片前问的整个选择器每台约 17 万。
+  超过阈值的照旧扫描,和上游一样。
+- 撤回原先建议的 100 万:修复前的版本实测每台匹配 68 万条要 15.9 秒、vmstorage 内存涨约 300 MB,已接近扫描的 30 秒。
+  本机 30 万序列的小索引上,匹配 1% 时新路径快于扫描(65 对 100 毫秒),10% 时持平,全部匹配时慢 5 倍。
+- 统计在内存里做,每个不同的 `标签=值` 约分配 500 字节(本机实测),请求结束即释放。
+- 对抗审查后的修复:按查询截止时间检查,超时即返回错误,和扫描一致;跳过索引自用的内部标签键;
+  遇到找不到指标名的序列(新序列正在注册、索引快照不完整时)退回扫描。
+- 和扫描的差异只在扫描本身算错的地方:名字里带 `=` 的标签,扫描会算成以它开头的另一个标签的值;
+  per-day 索引里重复出现的序列,扫描会算两次。新路径这两处都算对。
+- 验证:随机 600 条序列(含删除的序列、全局索引日期、需要转义的字符)在 400 组过滤、focusLabel、topN 下,新旧路径逐字段相同;
+  另有多租户隔离、退回扫描、截止时间三个测试;把新路径设为默认时 `lib/storage` 原有测试全过;
+  实验集群 5 个真实选择器的返回和打补丁前逐字段相同(修复后的版本复核过)。
+- 实测(修复后的版本):29–41 秒 → 0.06–0.38 秒,重启后第一次 0.4–4.4 秒。ruler 三个副本首次补算一整天 2133 → 1271 秒,
+  其中导出也快了 45%,因为扫描不再和导出抢 vmstorage 的 CPU(这一组是修复前的版本测的)。
