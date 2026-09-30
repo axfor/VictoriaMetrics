@@ -188,7 +188,7 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler, disableB
 		handlerWrapper(w, r, rhw)
 	})
 	if !*disableResponseCompression {
-		h = gzipHandlerWrapper(h)
+		h = compressHandlerWrapper(h)
 	}
 	s.s.Handler = h
 
