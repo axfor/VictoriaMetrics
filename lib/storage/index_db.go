@@ -1471,6 +1471,18 @@ func (db *indexDB) GetTSDBStatus(qt *querytracer.Tracer, accountID, projectID ui
 	return is.getTSDBStatus(qt, tfss, date, focusLabel, topN, maxMetrics)
 }
 
+// maxMetricIDsForDirectTSDBStatus is the most series the filters of a TSDB
+// status may match for it to be collected from their metric names rather than
+// by scanning the inverted index of the whole day, which costs as much as the
+// day has series however few of them match. 0 always scans.
+var maxMetricIDsForDirectTSDBStatus atomic.Int64
+
+// SetMaxMetricIDsForDirectTSDBStatus sets the most series the filters of a
+// TSDB status may match for it to be collected from their metric names.
+func SetMaxMetricIDsForDirectTSDBStatus(n int) {
+	maxMetricIDsForDirectTSDBStatus.Store(int64(n))
+}
+
 // getTSDBStatus returns topN entries for tsdb status for the given tfss, date and focusLabel.
 func (is *indexSearch) getTSDBStatus(qt *querytracer.Tracer, tfss []*TagFilters, date uint64, focusLabel string, topN, maxMetrics int) (*TSDBStatus, error) {
 	filter, err := is.searchMetricIDsWithFiltersOnDate(qt, tfss, date, maxMetrics)
@@ -1480,6 +1492,12 @@ func (is *indexSearch) getTSDBStatus(qt *querytracer.Tracer, tfss []*TagFilters,
 	if filter != nil && filter.Len() == 0 {
 		qt.Printf("no matching series for filter=%s", tfss)
 		return &TSDBStatus{}, nil
+	}
+	if filter != nil && int64(filter.Len()) <= maxMetricIDsForDirectTSDBStatus.Load() {
+		status, ok, err := is.getTSDBStatusForMetricIDs(qt, filter, focusLabel, topN)
+		if err != nil || ok {
+			return status, err
+		}
 	}
 
 	ts := &is.ts
@@ -1602,6 +1620,123 @@ func (is *indexSearch) getTSDBStatus(qt *querytracer.Tracer, tfss []*TagFilters,
 		LabelValueCountByLabelName:   thLabelValueCountByLabelName.getSortedResult(),
 	}
 	return status, nil
+}
+
+// getTSDBStatusForMetricIDs returns the TSDB status of the series of filter
+// from their metric names, or false when the name of one cannot be found, as
+// while a new series is being registered or after a snapshot of an incomplete
+// index, so that the index is scanned instead. It pushes the entries into the
+// top heaps in the order of the rows of the inverted index, by the encoded
+// label and value, so that ties at the edge of topN go as they go when the
+// index is scanned.
+//
+// It differs from the scan only where the scan miscounts: a label whose name
+// has '=' in it is not taken for the value of a label its name begins with,
+// and a series listed twice in the per-day index is counted once.
+func (is *indexSearch) getTSDBStatusForMetricIDs(qt *querytracer.Tracer, filter *uint64set.Set, focusLabel string, topN int) (*TSDBStatus, bool, error) {
+	type labelStats struct {
+		series uint64
+		values map[string]*uint64 // value -> series
+	}
+	dmis := is.db.s.getDeletedMetricIDs()
+	byLabel := make(map[string]*labelStats) // the metric name is under an empty label, as in the index
+	var totalSeries, totalLabelValuePairs uint64
+	// Map lookups by string(b) do not allocate: only a new label or value does.
+	count := func(label, value []byte) {
+		ls := byLabel[string(label)]
+		if ls == nil {
+			ls = &labelStats{values: make(map[string]*uint64)}
+			byLabel[string(label)] = ls
+		}
+		n := ls.values[string(value)]
+		if n == nil {
+			n = new(uint64)
+			ls.values[string(value)] = n
+		}
+		*n++
+		ls.series++
+		totalLabelValuePairs++
+	}
+	var mn MetricName
+	var buf []byte
+	metricIDs := filter.AppendTo(nil)
+	for i, metricID := range metricIDs {
+		if i&paceLimiterSlowIterationsMask == 0 {
+			if err := checkSearchDeadlineAndPace(is.deadline); err != nil {
+				return nil, false, err
+			}
+		}
+		if dmis.Has(metricID) {
+			continue
+		}
+		var ok bool
+		buf, ok = is.searchMetricNameWithCache(buf[:0], metricID)
+		if !ok {
+			qt.Printf("no metric name for metricID=%d; scanning the index instead", metricID)
+			return nil, false, nil
+		}
+		if err := mn.Unmarshal(buf); err != nil {
+			logger.Panicf("FATAL: cannot unmarshal metricName %q: %s", buf, err)
+		}
+		totalSeries++
+		count(nil, mn.MetricGroup)
+		for _, tag := range mn.Tags {
+			// The scan skips the keys the index adds for its own use.
+			if !isArtificialTagKey(tag.Key) {
+				count(tag.Key, tag.Value)
+			}
+		}
+	}
+	qt.Printf("collected TSDB status from the metric names of %d metricIDs", len(metricIDs))
+
+	type pair struct {
+		label, value string
+		order        []byte // as the row of the inverted index begins
+		series       uint64
+	}
+	pairs := make([]pair, 0, len(byLabel))
+	for label, ls := range byLabel {
+		for value, n := range ls.values {
+			order := marshalTagValue(nil, []byte(label))
+			order = marshalTagValue(order, []byte(value))
+			pairs = append(pairs, pair{label, value, order, *n})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return string(pairs[i].order) < string(pairs[j].order) })
+	thSeriesCountByMetricName := newTopHeap(topN)
+	thSeriesCountByLabelName := newTopHeap(topN)
+	thSeriesCountByFocusLabelValue := newTopHeap(topN)
+	thSeriesCountByLabelValuePair := newTopHeap(topN)
+	thLabelValueCountByLabelName := newTopHeap(topN)
+	name := func(label string) []byte {
+		if label == "" {
+			return []byte("__name__")
+		}
+		return []byte(label)
+	}
+	for i, p := range pairs {
+		if i+1 == len(pairs) || pairs[i+1].label != p.label {
+			ls := byLabel[p.label]
+			thLabelValueCountByLabelName.push(name(p.label), uint64(len(ls.values)))
+			thSeriesCountByLabelName.push(name(p.label), ls.series)
+		}
+		thSeriesCountByLabelValuePair.push(append(append(name(p.label), '='), p.value...), p.series)
+		if p.label == "" {
+			thSeriesCountByMetricName.push([]byte(p.value), p.series)
+		}
+		if string(name(p.label)) == focusLabel {
+			thSeriesCountByFocusLabelValue.push([]byte(p.value), p.series)
+		}
+	}
+	return &TSDBStatus{
+		TotalSeries:                  totalSeries,
+		TotalLabelValuePairs:         totalLabelValuePairs,
+		SeriesCountByMetricName:      thSeriesCountByMetricName.getSortedResult(),
+		SeriesCountByLabelName:       thSeriesCountByLabelName.getSortedResult(),
+		SeriesCountByFocusLabelValue: thSeriesCountByFocusLabelValue.getSortedResult(),
+		SeriesCountByLabelValuePair:  thSeriesCountByLabelValuePair.getSortedResult(),
+		LabelValueCountByLabelName:   thLabelValueCountByLabelName.getSortedResult(),
+	}, true, nil
 }
 
 // TSDBStatus contains TSDB status data for /api/v1/status/tsdb.

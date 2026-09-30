@@ -89,6 +89,11 @@ var (
 	cacheSizeIndexDBTagFilters = flagutil.NewBytes("storage.cacheSizeIndexDBTagFilters", 0, "Overrides max size for indexdb/tagFiltersToMetricIDs cache. "+
 		"See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cache-tuning")
 
+	maxMetricIDsForDirectTSDBStatus = flag.Int("search.maxMetricIDsForDirectTSDBStatus", 0, "The most series the filters of a /api/v1/status/tsdb request "+
+		"may match on this vmstorage for the status to be counted from the names of these series instead of by scanning the inverted index of the whole day, "+
+		"which costs as much as the day has series however few of them match. Counting from the names reads the name of every series matched, so keep this "+
+		"well below the series a vmstorage gets a day; it allocates about 500 bytes per distinct label value pair while the request runs. "+
+		"0 always scans")
 	disablePerDayIndex = flag.Bool("disablePerDayIndex", false, "Disable per-day index and use global index for all searches. "+
 		"This may improve performance and decrease disk space usage for the use cases with fixed set of timeseries scattered across a "+
 		"big time range (for example, when loading years of historical data). "+
@@ -135,6 +140,7 @@ func main() {
 	storage.SetFinalDedupScheduleInterval(*finalDedupScheduleInterval)
 	storage.SetMetricNamesStatsCacheSize(cacheSizeMetricNamesStats.IntN())
 	storage.SetMetricNameCacheSize(cacheSizeStorageMetricName.IntN())
+	storage.SetMaxMetricIDsForDirectTSDBStatus(*maxMetricIDsForDirectTSDBStatus)
 	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.IntN())
 	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.IntN())
 	mergeset.SetDataBlocksSparseCacheSize(cacheSizeIndexDBDataBlocksSparse.IntN())
