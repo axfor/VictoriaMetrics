@@ -3,6 +3,7 @@ package promrelabel
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
@@ -230,4 +231,57 @@ func TestIfExpressionMismatch(t *testing.T) {
 	f(`'{foo=~"bar|"}'`, `abc{foo="baz"}`)
 	f(`'{foo!~"bar|"}'`, `abc`)
 	f(`'{foo!~"bar|"}'`, `abc{foo="bar"}`)
+}
+
+func TestIfExpressionMetricNames(t *testing.T) {
+	f := func(ifExpr string, namesExpected []string) {
+		t.Helper()
+
+		var ie *IfExpression
+		if ifExpr != "" {
+			ie = &IfExpression{}
+			if err := yaml.UnmarshalStrict([]byte(ifExpr), ie); err != nil {
+				t.Fatalf("unexpected error during unmarshal: %s", err)
+			}
+		}
+		names := ie.MetricNames()
+		if !slices.Equal(names, namesExpected) {
+			t.Fatalf("unexpected names for ifExpr=%s; got %q; want %q", ifExpr, names, namesExpected)
+		}
+		if names == nil {
+			return
+		}
+		// Whatever ie matches must have one of the names.
+		for _, s := range []string{`foo`, `bar`, `other`, `foo{bar="baz"}`, `bar{baz="abc"}`, `other{bar="baz"}`, `{bar="baz"}`} {
+			labels := promutil.MustNewLabelsFromString(s)
+			if ie.Match(labels.GetLabels()) && !slices.Contains(names, labels.Get("__name__")) {
+				t.Fatalf("ifExpr=%s matches %s, whose name is missing in %q", ifExpr, s, names)
+			}
+		}
+	}
+
+	// Every filter group pins the metric name
+	f(`foo`, []string{"foo"})
+	f(`foo{bar="baz",x!="y"}`, []string{"foo"})
+	f(`'{__name__="foo",bar=~"b.+"}'`, []string{"foo"})
+	f(`'{bar="baz",__name__="foo"}'`, []string{"foo"})
+	f(`'{__name__="foo" or __name__="bar"}'`, []string{"foo", "bar"})
+	f(`foo{bar="a" or baz="b"}`, []string{"foo", "foo"})
+	// MetricsQL applies the name to every group of `or`, so does Match
+	f(`'{__name__="foo" or bar="baz"}'`, []string{"foo", "foo"})
+	f(`'{bar="baz" or __name__="foo"}'`, []string{"foo", "foo"})
+	f(`
+- foo
+- bar{baz="abc"}`, []string{"foo", "bar"})
+
+	// Some series with other names can match
+	f(``, nil)
+	f(`'{bar="baz"}'`, nil)
+	f(`'{__name__=~"foo"}'`, nil)
+	f(`'{__name__!="foo"}'`, nil)
+	f(`'{__name__!~"foo"}'`, nil)
+	f(`'{__name__=""}'`, nil)
+	f(`
+- foo
+- '{bar="baz"}'`, nil)
 }

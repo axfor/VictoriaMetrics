@@ -305,6 +305,14 @@ type Config struct {
 type Aggregators struct {
 	as []*aggregator
 
+	// byName maps a metric name to the indexes in as of the aggregators whose match
+	// can select only series with this name or a few other names; unindexed holds
+	// the rest. Push hands a series only to the aggregators listed for its name
+	// and to unindexed. byName is nil if too few aggregators can be indexed.
+	byName    map[string][]int
+	indexed   []int
+	unindexed []*aggregator
+
 	// configData contains marshaled configs.
 	// It is used in Equal() for comparing Aggregators.
 	configData []byte
@@ -353,12 +361,48 @@ func loadFromData(data []byte, filePath string, pushFunc PushFunc, opts *Options
 	}
 
 	metrics.RegisterSet(ms)
+	byName, indexed, unindexed := indexAggregatorsByName(as)
 	return &Aggregators{
 		as:         as,
+		byName:     byName,
+		indexed:    indexed,
+		unindexed:  unindexed,
 		configData: configData,
 		filePath:   filePath,
 		ms:         ms,
 	}, nil
+}
+
+// minIndexedAggregators is the number of aggregators with names in their match
+// from which indexing them pays for looking up the name of every input series.
+const minIndexedAggregators = 2
+
+// indexAggregatorsByName maps metric names to the indexes in as of the aggregators
+// whose match can select only series with these names, returns the indexes of
+// these aggregators, and the other aggregators in unindexed. It returns nil, nil,
+// nil if fewer than minIndexedAggregators can be indexed.
+func indexAggregatorsByName(as []*aggregator) (map[string][]int, []int, []*aggregator) {
+	byName := make(map[string][]int)
+	var indexed []int
+	var unindexed []*aggregator
+	for i, a := range as {
+		names := a.match.MetricNames()
+		if len(names) == 0 {
+			unindexed = append(unindexed, a)
+			continue
+		}
+		indexed = append(indexed, i)
+		for _, name := range names {
+			// Names may repeat; an aggregator must get each series only once.
+			if idxs := byName[name]; len(idxs) == 0 || idxs[len(idxs)-1] != i {
+				byName[name] = append(idxs, i)
+			}
+		}
+	}
+	if len(indexed) < minIndexedAggregators {
+		return nil, nil, nil
+	}
+	return byName, indexed, unindexed
 }
 
 // IsEnabled returns true if Aggregators has at least one configured aggregator
@@ -412,12 +456,165 @@ func (a *Aggregators) Push(tss []prompb.TimeSeries, matchIdxs []byte) []byte {
 		return matchIdxs
 	}
 
-	for _, aggr := range a.as {
+	// MustStop sets a.as to nil, possibly while a push is in flight on a config
+	// reload: read it once, and push nothing to stopped aggregators.
+	as := a.as
+	if len(as) == 0 {
+		return matchIdxs
+	}
+
+	if a.byName == nil {
+		for _, aggr := range as {
+			aggr.Push(tss, matchIdxs)
+		}
+		return matchIdxs
+	}
+
+	for _, aggr := range a.unindexed {
 		aggr.Push(tss, matchIdxs)
 	}
+	a.pushByName(as, tss, matchIdxs)
 
 	return matchIdxs
 }
+
+// pushByName pushes every series in tss to the indexed aggregators listed for its
+// name only. The other indexed aggregators could not match it.
+func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) {
+	ctx := getNameIndexCtx(len(as))
+	defer putNameIndexCtx(ctx)
+
+	// Series of a metric usually come one after another, and a few metrics may take
+	// turns, such as the buckets, the sum and the count of a histogram: look a name
+	// up once per run, and the names of the last few runs not at all.
+	runStart, runName := 0, ""
+	var runIdxs []int
+	for i := range tss {
+		name := getMetricName(tss[i].Labels)
+		if name == runName {
+			continue
+		}
+		ctx.addRun(runIdxs, runStart, i)
+		runStart, runName, runIdxs = i, name, ctx.recent.lookup(a.byName, name)
+	}
+	ctx.addRun(runIdxs, runStart, len(tss))
+
+	for _, aggrIdx := range a.indexed {
+		runs := ctx.runs[aggrIdx]
+		if len(runs) == 0 {
+			// An aggregator records the lag of every push it gets, 0 if nothing
+			// in it matched. Keep recording it for the pushes it is spared.
+			as[aggrIdx].samplesLag.Update(0)
+			continue
+		}
+		if len(runs) == 1 {
+			r := runs[0]
+			as[aggrIdx].Push(tss[r.start:r.end], matchIdxs[r.start:r.end])
+			continue
+		}
+		tssSub := ctx.tss[:0]
+		for _, r := range runs {
+			tssSub = append(tssSub, tss[r.start:r.end]...)
+		}
+		matchIdxsSub := bytesutil.ResizeNoCopyMayOverallocate(ctx.matchIdxs, len(tssSub))
+		clear(matchIdxsSub)
+		as[aggrIdx].Push(tssSub, matchIdxsSub)
+		j := 0
+		for _, r := range runs {
+			for i := r.start; i < r.end; i++ {
+				matchIdxs[i] |= matchIdxsSub[j]
+				j++
+			}
+		}
+		ctx.tss = tssSub[:0]
+		ctx.tssMaxLen = max(ctx.tssMaxLen, len(tssSub))
+		ctx.matchIdxs = matchIdxsSub
+	}
+}
+
+// getMetricName returns the value of the first __name__ label, which is the one
+// promrelabel.IfExpression matches metric names against.
+func getMetricName(labels []prompb.Label) string {
+	for _, label := range labels {
+		if label.Name == "__name__" {
+			return label.Value
+		}
+	}
+	return ""
+}
+
+// seriesRun is the series from start up to end in a pushed batch.
+type seriesRun struct {
+	start, end int
+}
+
+type nameIndexCtx struct {
+	// runs[i] holds the series to push to the aggregator #i.
+	runs [][]seriesRun
+
+	recent recentNames
+
+	tss       []prompb.TimeSeries
+	tssMaxLen int
+	matchIdxs []byte
+}
+
+// recentNames remembers the aggregators of the last few names looked up, nil for
+// names without aggregators. Its zero entries map "" to nil, which is right:
+// byName has no "".
+type recentNames struct {
+	names [4]string
+	idxs  [4][]int
+	next  int
+}
+
+func (rn *recentNames) lookup(byName map[string][]int, name string) []int {
+	for i := range rn.names {
+		if rn.names[i] == name {
+			return rn.idxs[i]
+		}
+	}
+	idxs := byName[name]
+	rn.names[rn.next], rn.idxs[rn.next] = name, idxs
+	rn.next = (rn.next + 1) % len(rn.names)
+	return idxs
+}
+
+// addRun adds the series from start up to end to the aggregators with aggrIdxs.
+func (ctx *nameIndexCtx) addRun(aggrIdxs []int, start, end int) {
+	for _, aggrIdx := range aggrIdxs {
+		runs := ctx.runs[aggrIdx]
+		if n := len(runs); n > 0 && runs[n-1].end == start {
+			runs[n-1].end = end
+		} else {
+			runs = append(runs, seriesRun{start: start, end: end})
+		}
+		ctx.runs[aggrIdx] = runs
+	}
+}
+
+func getNameIndexCtx(aggregators int) *nameIndexCtx {
+	v := nameIndexCtxPool.Get()
+	if v == nil {
+		v = &nameIndexCtx{}
+	}
+	ctx := v.(*nameIndexCtx)
+	ctx.runs = slices.Grow(ctx.runs[:0], aggregators)[:aggregators]
+	return ctx
+}
+
+func putNameIndexCtx(ctx *nameIndexCtx) {
+	for i := range ctx.runs {
+		ctx.runs[i] = ctx.runs[i][:0]
+	}
+	// Do not hold the pushed series and names.
+	ctx.recent = recentNames{}
+	clear(ctx.tss[:ctx.tssMaxLen])
+	ctx.tssMaxLen = 0
+	nameIndexCtxPool.Put(ctx)
+}
+
+var nameIndexCtxPool sync.Pool
 
 type currentState struct {
 

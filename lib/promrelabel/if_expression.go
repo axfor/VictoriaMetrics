@@ -40,6 +40,42 @@ func (ie *IfExpression) Match(labels []prompb.Label) bool {
 	return false
 }
 
+// MetricNames returns the metric names ie can match.
+//
+// It returns nil if ie can match series with any other name: that is unless
+// every filter group in ie has a `__name__="value"` filter with non-empty value.
+// The returned names may repeat.
+func (ie *IfExpression) MetricNames() []string {
+	if ie == nil || len(ie.ies) == 0 {
+		return nil
+	}
+	var names []string
+	for _, ie := range ie.ies {
+		if ie == nil || len(ie.lfss) == 0 {
+			return nil
+		}
+		for _, lfs := range ie.lfss {
+			name := metricNameFilterValue(lfs)
+			if name == "" {
+				return nil
+			}
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// metricNameFilterValue returns the value of the `__name__="value"` filter in lfs,
+// or an empty string if lfs has no such filter.
+func metricNameFilterValue(lfs []*labelFilter) string {
+	for _, lf := range lfs {
+		if lf.label == "" && lf.op == "=" {
+			return lf.value
+		}
+	}
+	return ""
+}
+
 // Parse parses ie from s.
 func (ie *IfExpression) Parse(s string) error {
 	ieLocal, err := newIfExpression(s)
