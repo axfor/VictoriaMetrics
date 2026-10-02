@@ -119,6 +119,16 @@ specified individually per each `-remoteWrite.url`:
   #
   # reset_marker_on_stale: false
 
+  # sample_timestamps instructs to write sum_samples and sum_samples_total at the timestamps of the input
+  # samples instead of at the flush, so samples processed late, when vmagent falls behind, still count
+  # towards the interval they were scraped in rather than the one they were processed in.
+  # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
+  # enable_windows or dedup_interval, which decide timestamps of their own.
+  # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
+  # command-line flags are set; the flags enable it for the aggregations it supports and leave the others alone.
+  #
+  # sample_timestamps: false
+
   # without is an optional list of labels, which must be removed from the output aggregation.
   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
   #

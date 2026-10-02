@@ -178,12 +178,12 @@ func TestAggrValuesKeepBlueAndGreenApart(t *testing.T) {
 // Without shared state there is no green half, as before the entry was
 // flattened, and a single output is held in the entry itself.
 func TestAggrValuesWithoutSharedState(t *testing.T) {
-	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig()}}
+	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(false)}}
 	av := one.newAggrValues()
 	if av.more != nil || len(av.outputs(1, false)) != 1 || av.outputs(1, true) != nil {
 		t.Fatalf("single output: more=%v, blue %d, green %v", av.more != nil, len(av.outputs(1, false)), av.outputs(1, true))
 	}
-	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(), newSumSamplesTotalAggrConfig()}}
+	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(false), newSumSamplesTotalAggrConfig(false)}}
 	av = two.newAggrValues()
 	if len(av.outputs(2, false)) != 2 || av.outputs(2, true) != nil {
 		t.Fatalf("two outputs: blue %d, green %v", len(av.outputs(2, false)), av.outputs(2, true))

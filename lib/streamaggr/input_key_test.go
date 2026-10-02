@@ -38,7 +38,7 @@ func TestOutputsDeclareWhetherTheyNeedTheInputKey(t *testing.T) {
 		{"unique_samples", false},
 	} {
 		t.Run(tc.output, func(t *testing.T) {
-			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0)
+			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0, false)
 			if err != nil {
 				t.Fatalf("%s: %v", tc.output, err)
 			}

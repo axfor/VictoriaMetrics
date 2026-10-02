@@ -146,6 +146,13 @@ type Options struct {
 
 	// EnableWindows enables aggregation in windows
 	EnableWindows bool
+
+	// SampleTimestamps writes sum_samples and sum_samples_total at the timestamps
+	// of the input samples instead of at the flush, so an input processed late
+	// still counts towards the interval it was scraped in.
+	//
+	// This option can be overridden individually per each aggregation via sample_timestamps option.
+	SampleTimestamps bool
 }
 
 // Config is a configuration for a single stream aggregation.
@@ -289,6 +296,9 @@ type Config struct {
 
 	// EnableWindows enables aggregation in windows
 	EnableWindows *bool `yaml:"enable_windows,omitempty"`
+
+	// SampleTimestamps writes the outputs at the timestamps of the input samples instead of at the flush.
+	SampleTimestamps *bool `yaml:"sample_timestamps,omitempty"`
 }
 
 // Aggregators aggregates metrics passed to Push and calls pushFunc for aggregated data.
@@ -440,6 +450,12 @@ type aggregator struct {
 	keepMetricNames  bool
 	ignoreOldSamples bool
 	enableWindows    bool
+	sampleTimestamps bool
+
+	// watermark is the latest input sample timestamp seen, and flushSeq counts
+	// the flushes; both are for sample_timestamps.
+	watermark atomic.Int64
+	flushSeq  atomic.Int64
 
 	by                  []string
 	without             []string
@@ -633,6 +649,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		enableWindows = *v
 	}
 
+	// The global option applies where it can, so one flag covers a config that
+	// also has aggregations it cannot apply to; set on an aggregation, it has to.
+	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval) == nil
+	if v := cfg.SampleTimestamps; v != nil {
+		sampleTimestamps = *v
+		if sampleTimestamps {
+			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Initialize common metric labels
 	name := cfg.Name
 	if name == "" {
@@ -655,7 +683,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	}
 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
 	for i, output := range cfg.Outputs {
-		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval)
+		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, sampleTimestamps)
 		if err != nil {
 			return nil, err
 		}
@@ -712,6 +740,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		keepMetricNames:   keepMetricNames,
 		ignoreOldSamples:  ignoreOldSamples,
 		enableWindows:     enableWindows,
+		sampleTimestamps:  sampleTimestamps,
 		stalenessInterval: stalenessInterval,
 
 		outputHeartbeatInterval: outputHeartbeatInterval,
@@ -793,7 +822,21 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	return a, nil
 }
 
-func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration) (aggrConfig, error) {
+// sampleTimestampsApply returns why sample_timestamps cannot apply to an
+// aggregation, or nil if it can.
+func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration) error {
+	if enableWindows || dedupInterval > 0 {
+		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
+	}
+	for _, o := range outputs {
+		if o != "sum_samples" && o != "sum_samples_total" {
+			return fmt.Errorf("`sample_timestamps` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
+		}
+	}
+	return nil
+}
+
+func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, sampleTimestamps bool) (aggrConfig, error) {
 	// check for duplicated output
 	if _, ok := outputsSeen[output]; ok {
 		return nil, fmt.Errorf("`outputs` list contains duplicate aggregation function: %s", output)
@@ -857,9 +900,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
 	case "stdvar":
 		return newStdvarAggrConfig(), nil
 	case "sum_samples":
-		return newSumSamplesAggrConfig(), nil
+		return newSumSamplesAggrConfig(sampleTimestamps), nil
 	case "sum_samples_total":
-		return newSumSamplesTotalAggrConfig(), nil
+		return newSumSamplesTotalAggrConfig(sampleTimestamps), nil
 	case "total":
 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
 	case "total_prometheus":
@@ -1064,7 +1107,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	enableWindows := a.enableWindows
 	cs := a.cs.Load()
 
-	var maxLagMsec int64
+	var maxLagMsec, maxTimestamp int64
 	for idx, ts := range tss {
 		if !a.match.Match(ts.Labels) {
 			continue
@@ -1111,6 +1154,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 			if lagMsec > maxLagMsec {
 				maxLagMsec = lagMsec
 			}
+			maxTimestamp = max(maxTimestamp, s.Timestamp)
 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
 				ctx.green = append(ctx.green, pushSample{
 					key:       key,
@@ -1132,6 +1176,12 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 		a.muFlushAfter.Unlock()
 	}
 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
+	for {
+		wm := a.watermark.Load()
+		if maxTimestamp <= wm || a.watermark.CompareAndSwap(wm, maxTimestamp) {
+			break
+		}
+	}
 
 	ctx.buf = buf
 
@@ -1246,6 +1296,9 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
 	ctx.pushFunc = pushFunc
 	ctx.flushTimestamp = flushTimestamp
 	ctx.isLast = isLast
+	ctx.now = time.Now().UnixMilli()
+	ctx.watermark = a.watermark.Load()
+	ctx.seq = a.flushSeq.Add(1)
 	return ctx
 }
 
@@ -1264,6 +1317,12 @@ type flushCtx struct {
 	isGreen        bool
 	isLast         bool
 
+	// now, watermark and seq are for sample_timestamps: the wall clock no output
+	// is stamped after, the latest input sample timestamp, and which flush this is.
+	now       int64
+	watermark int64
+	seq       int64
+
 	tss     []prompb.TimeSeries
 	labels  []prompb.Label
 	samples []prompb.Sample
@@ -1276,6 +1335,7 @@ func (ctx *flushCtx) reset() {
 	ctx.isGreen = false
 	ctx.isLast = false
 	ctx.flushTimestamp = 0
+	ctx.now, ctx.watermark, ctx.seq = 0, 0, 0
 	ctx.resetSeries()
 }
 

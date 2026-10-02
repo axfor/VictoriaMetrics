@@ -358,7 +358,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 			}
 			return
 		case tt := <-ticker.C:
-			t := tt.UnixMilli()
+			t := tickTime(tt.UnixMilli(), time.Now().UnixMilli(), scrapeInterval.Milliseconds())
 			if d := math.Abs(float64(t - timestamp)); d > 0 && d/float64(scrapeInterval.Milliseconds()) > 0.1 {
 				// Too big jitter. Adjust timestamp
 				timestamp = t
@@ -366,6 +366,18 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 			sw.scrapeAndLogError(timestamp, t)
 		}
 	}
+}
+
+// tickTime returns when the scrape for a tick fired at tick starts. A tick that
+// waited while the previous scrape was still being processed is stale: the
+// target is scraped now, and stamping its samples with the tick would count
+// everything that happened in between towards the past -- with increments,
+// into an earlier interval, or an earlier hour.
+func tickTime(tick, now, interval int64) int64 {
+	if now-tick > interval/10 {
+		return now
+	}
+	return tick
 }
 
 func (sw *scrapeWork) logError(s string) {

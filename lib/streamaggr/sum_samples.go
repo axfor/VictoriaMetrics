@@ -1,7 +1,9 @@
 package streamaggr
 
 import (
+	"cmp"
 	"math"
+	"slices"
 )
 
 type sumSamplesAggrValue struct {
@@ -21,14 +23,114 @@ func (*sumSamplesAggrValue) state() any {
 	return nil
 }
 
-func newSumSamplesAggrConfig() aggrConfig {
-	return &sumSamplesAggrConfig{}
+func newSumSamplesAggrConfig(sampleTimestamps bool) aggrConfig {
+	return &sumSamplesAggrConfig{sampleTimestamps: sampleTimestamps}
 }
 
-type sumSamplesAggrConfig struct{}
+type sumSamplesAggrConfig struct {
+	sampleTimestamps bool
+}
 
-func (*sumSamplesAggrConfig) getValue(_ any) aggrValue {
+func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
+	if c.sampleTimestamps {
+		return &sumSamplesAtValue{}
+	}
 	return &sumSamplesAggrValue{}
+}
+
+// sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
+// the interval its samples were scraped in, ending at their timestamp, rather
+// than to the one the aggregator happened to process them in.
+type sumSamplesAtValue struct {
+	pending bySampleTime
+}
+
+func (av *sumSamplesAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
+	av.pending.add(sample.timestamp, sample.value)
+}
+
+// flush writes a sum arriving after its interval has been written once already
+// as one more sample a few milliseconds earlier -- each flush backs off by its
+// own sequence number -- so the two don't share a timestamp, which
+// deduplication would keep only one of, and sum_over_time() adds them up.
+// Backing off keeps the sample within the interval, (ts - interval, ts].
+func (av *sumSamplesAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
+	back := ctx.seq % 1000
+	av.pending.drain(func(ts int64, sum float64) {
+		ctx.appendSeriesAt(key, "sum_samples", min(ts, ctx.now)-back, sum)
+	})
+}
+
+func (*sumSamplesAtValue) state() any { return nil }
+
+func (av *sumSamplesAtValue) firstPending() (int64, bool) { return av.pending.first() }
+
+// bySampleTime holds the input sums of one output between two flushes, one per
+// distinct sample timestamp, for sample_timestamps. Scrapes aligned to the
+// interval give every sample of a round the same timestamp, so there is one sum
+// almost always, and more only while the aggregator catches up with rounds it
+// fell behind on.
+type bySampleTime struct {
+	ts   int64 // 0: nothing pending
+	sum  float64
+	more *[]tsSum
+}
+
+type tsSum struct {
+	ts  int64
+	sum float64
+}
+
+func (p *bySampleTime) add(ts int64, v float64) {
+	switch {
+	case p.ts == 0:
+		p.ts, p.sum = ts, v
+	case p.ts == ts:
+		p.sum += v
+	default:
+		if p.more == nil {
+			p.more = &[]tsSum{}
+		}
+		for i := range *p.more {
+			if (*p.more)[i].ts == ts {
+				(*p.more)[i].sum += v
+				return
+			}
+		}
+		*p.more = append(*p.more, tsSum{ts, v})
+	}
+}
+
+// first is the earliest pending timestamp.
+func (p *bySampleTime) first() (int64, bool) {
+	if p.ts == 0 {
+		return 0, false
+	}
+	first := p.ts
+	if p.more != nil {
+		for _, x := range *p.more {
+			first = min(first, x.ts)
+		}
+	}
+	return first, true
+}
+
+// drain calls f for every pending sum in timestamp order and empties p.
+func (p *bySampleTime) drain(f func(ts int64, sum float64)) {
+	if p.ts == 0 {
+		return
+	}
+	if p.more == nil {
+		f(p.ts, p.sum)
+		p.ts, p.sum = 0, 0
+		return
+	}
+	all := append(*p.more, tsSum{p.ts, p.sum})
+	slices.SortFunc(all, func(a, b tsSum) int { return cmp.Compare(a.ts, b.ts) })
+	for _, x := range all {
+		f(x.ts, x.sum)
+	}
+	p.ts, p.sum, p.more = 0, 0, nil
 }
 
 // sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
@@ -104,11 +206,13 @@ func (av *sumSamplesTotalAggrValue) state() any {
 	return av.shared
 }
 
-func newSumSamplesTotalAggrConfig() aggrConfig {
-	return &sumSamplesTotalAggrConfig{}
+func newSumSamplesTotalAggrConfig(sampleTimestamps bool) aggrConfig {
+	return &sumSamplesTotalAggrConfig{sampleTimestamps: sampleTimestamps}
 }
 
-type sumSamplesTotalAggrConfig struct{}
+type sumSamplesTotalAggrConfig struct {
+	sampleTimestamps bool
+}
 
 // sumSamplesTotalOwned is a value together with the shared state it owns when
 // no other value shares it, so the pair costs one allocation instead of two.
@@ -117,7 +221,14 @@ type sumSamplesTotalOwned struct {
 	shared sumSamplesTotalShared
 }
 
-func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+	if c.sampleTimestamps {
+		// sample_timestamps is refused together with enable_windows, the only
+		// source of shared state.
+		o := &sumSamplesTotalAtOwned{}
+		o.v.shared = &o.shared
+		return &o.v
+	}
 	if shared, ok := s.(*sumSamplesTotalShared); ok {
 		return &sumSamplesTotalAggrValue{shared: shared}
 	}
@@ -125,6 +236,66 @@ func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
 	o.v.shared = &o.shared
 	return &o.v
 }
+
+// sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
+// writes the total as of each scrape round it has samples of, in timestamp
+// order, so an increment lands in the interval it was scraped in even when the
+// aggregator processes it minutes later. The written timestamps never go back
+// -- a counter that did would look reset -- so a round whose samples arrive
+// after a later round was written goes to that later one: the error is bounded
+// by how far the targets' rounds are apart in processing, not by how far the
+// aggregator is behind.
+//
+// An unchanged total is written again only as the heartbeat, and then at the
+// latest sample timestamp the aggregator has seen rather than at the wall
+// clock: while it is behind, a heartbeat at the wall clock would push the
+// series ahead of the rounds still to come, and they would all land there.
+type sumSamplesTotalAtValue struct {
+	shared  *sumSamplesTotalShared
+	pending bySampleTime
+}
+
+type sumSamplesTotalAtOwned struct {
+	v      sumSamplesTotalAtValue
+	shared sumSamplesTotalShared
+}
+
+func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
+	av.pending.add(sample.timestamp, sample.value)
+}
+
+func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
+	sh := av.shared
+	wrote := false
+	av.pending.drain(func(ts int64, sum float64) {
+		sh.total += sum
+		if sh.written && sh.total == sh.lastWritten {
+			return
+		}
+		at := max(min(ts, ctx.now), sh.lastWrittenAt)
+		ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
+		sh.lastWritten, sh.lastWrittenAt, sh.written = sh.total, at, true
+		wrote = true
+	})
+	if !wrote && sh.written {
+		at := min(ctx.watermark, ctx.now)
+		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
+		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
+			ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
+			sh.lastWrittenAt = at
+		} else {
+			ctx.a.skippedOutputs.Inc()
+		}
+	}
+	if math.Abs(sh.total) >= (1 << 53) {
+		// It is time to reset the entry, since it starts losing float64 precision
+		sh.total = 0
+	}
+}
+
+func (av *sumSamplesTotalAtValue) state() any { return av.shared }
+
+func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }
 
 // needsInputKey reports that this output looks only at the sample, so the key
 // need not carry the labels the aggregation groups away -- compressing them

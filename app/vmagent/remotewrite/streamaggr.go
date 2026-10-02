@@ -38,6 +38,9 @@ var (
 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
+	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
+		"at the timestamps of the input samples instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
+		"Can be overridden per aggregation via sample_timestamps option")
 
 	// Per URL config
 	streamAggrConfig = flagutil.NewArrayString("remoteWrite.streamAggr.config", "Optional path to file with stream aggregation config for the corresponding -remoteWrite.url. "+
@@ -65,6 +68,9 @@ var (
 	streamAggrEnableWindows = flagutil.NewArrayBool("remoteWrite.streamAggr.enableWindows", "Enables aggregation within fixed windows for all remote write's aggregators. "+
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
+	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
+		"write sum_samples and sum_samples_total at the timestamps of the input samples instead of at the flush, so a sample processed late "+
+		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
 )
 
 // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
@@ -214,6 +220,7 @@ func newStreamAggrConfigGlobal() (*streamaggr.Aggregators, error) {
 		IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
 		KeepInput:            *streamAggrGlobalKeepInput,
 		EnableWindows:        *streamAggrGlobalEnableWindows,
+		SampleTimestamps:     *streamAggrGlobalSampleTimestamps,
 	}
 
 	sas, err := streamaggr.LoadFromFile(path, pushTimeSeriesToRemoteStoragesTrackDropped, opts, "global")
@@ -248,6 +255,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
+		SampleTimestamps:     streamAggrSampleTimestamps.GetOptionalArg(idx),
 	}
 
 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)

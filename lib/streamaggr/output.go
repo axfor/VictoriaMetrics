@@ -192,7 +192,14 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey 
 		}
 		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
 			// The first visible flush of a new output entry: emit a zero one interval earlier.
-			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
+			at := ctx.flushTimestamp
+			if first, ok := av.firstPending(len(ao.configs), ctx.isGreen); ok {
+				// Under sample_timestamps the first sample may be written well
+				// before the flush; the zero has to precede it, or increase()
+				// would read the zero after it as a reset and count it twice.
+				at = min(first, ctx.now)
+			}
+			ao.appendResetMarkers(ctx, av, outputKey, at-ctx.a.interval.Milliseconds())
 			av.started = true
 		}
 		outputs = av.outputs(len(ao.configs), ctx.isGreen)
@@ -256,6 +263,22 @@ func (ao *aggrOutputs) newAggrValues() *aggrValues {
 	}
 	nv.more = &all
 	return nv
+}
+
+// firstPending returns the earliest input sample timestamp waiting in any of
+// av's outputs that write at sample timestamps.
+func (av *aggrValues) firstPending(n int, isGreen bool) (int64, bool) {
+	first, found := int64(0), false
+	for _, o := range av.outputs(n, isGreen) {
+		p, ok := o.(interface{ firstPending() (int64, bool) })
+		if !ok {
+			continue
+		}
+		if ts, ok := p.firstPending(); ok && (!found || ts < first) {
+			first, found = ts, true
+		}
+	}
+	return first, found
 }
 
 // outputs returns the blue or green outputs of av, n being how many outputs the
