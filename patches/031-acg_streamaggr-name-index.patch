@@ -1,0 +1,775 @@
+From 30e2bf044e2daf5511f45e9beec5fe0cddf5df7b Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Fri, 2 Oct 2026 10:03:54 -0700
+Subject: [PATCH 28/28] lib/streamaggr: hand a series only to the aggregators
+ that can match its name
+
+Aggregators.Push hands every batch to every aggregator, and each runs its
+match on every series. With the 102 rules of the ACG config, 100 of which
+pin one metric name, every sample was matched 102 times; in a full-scale
+replay of three targets the loop and the matches took 24% of vmagent's CPU,
+nearly all of it on matches that could not succeed.
+
+promrelabel.IfExpression.MetricNames returns the names an expression can
+match when every filter group pins __name__ to a non-empty literal, as
+MetricsQL applies a name to every group of an `or`; otherwise nil. At load
+the aggregators are indexed by these names. Push hands the whole batch to
+the aggregators that cannot be indexed and, to the others, only the runs
+of series with their names: one run is pushed in place, several are copied
+into a sub-batch whose matchIdxs are OR-ed back. A name is looked up once
+per run, and the last few are remembered, as the buckets, sum and count of
+a histogram take turns. Every aggregator still runs its full match.
+
+Nothing else changes: outputs, matchIdxs and samples lag are the same, as
+aggregators spared a push record a lag of 0 as they did. Push reads the
+aggregators once and pushes nothing once they are stopped, which happens
+on a config reload while pushes may be in flight. With fewer than two
+aggregators to index there is no index.
+
+Outputs and matchIdxs were byte for byte the same with and without the
+index in a full-scale replay of 145 minutes (1.98 billion input series),
+and in a sampled one with and without sample_timestamps. In the full-scale
+replay vmagent took 0.82 cores instead of 1.30 and Aggregators.Push 63%
+less time. Where the index skips nothing, with two or three indexed rules
+whose names make up nearly every batch, reading the names costs about 5ns
+a series and 50ns a push.
+---
+ lib/promrelabel/if_expression.go      |  36 +++
+ lib/promrelabel/if_expression_test.go |  54 ++++
+ lib/streamaggr/name_index_test.go     | 369 ++++++++++++++++++++++++++
+ lib/streamaggr/streamaggr.go          | 199 +++++++++++++-
+ 4 files changed, 657 insertions(+), 1 deletion(-)
+ create mode 100644 lib/streamaggr/name_index_test.go
+
+diff --git a/lib/promrelabel/if_expression.go b/lib/promrelabel/if_expression.go
+index 3afd69f5e..5be876bcf 100644
+--- a/lib/promrelabel/if_expression.go
++++ b/lib/promrelabel/if_expression.go
+@@ -40,6 +40,42 @@ func (ie *IfExpression) Match(labels []prompb.Label) bool {
+ 	return false
+ }
+ 
++// MetricNames returns the metric names ie can match.
++//
++// It returns nil if ie can match series with any other name: that is unless
++// every filter group in ie has a `__name__="value"` filter with non-empty value.
++// The returned names may repeat.
++func (ie *IfExpression) MetricNames() []string {
++	if ie == nil || len(ie.ies) == 0 {
++		return nil
++	}
++	var names []string
++	for _, ie := range ie.ies {
++		if ie == nil || len(ie.lfss) == 0 {
++			return nil
++		}
++		for _, lfs := range ie.lfss {
++			name := metricNameFilterValue(lfs)
++			if name == "" {
++				return nil
++			}
++			names = append(names, name)
++		}
++	}
++	return names
++}
++
++// metricNameFilterValue returns the value of the `__name__="value"` filter in lfs,
++// or an empty string if lfs has no such filter.
++func metricNameFilterValue(lfs []*labelFilter) string {
++	for _, lf := range lfs {
++		if lf.label == "" && lf.op == "=" {
++			return lf.value
++		}
++	}
++	return ""
++}
++
+ // Parse parses ie from s.
+ func (ie *IfExpression) Parse(s string) error {
+ 	ieLocal, err := newIfExpression(s)
+diff --git a/lib/promrelabel/if_expression_test.go b/lib/promrelabel/if_expression_test.go
+index 489c953b4..23bd31398 100644
+--- a/lib/promrelabel/if_expression_test.go
++++ b/lib/promrelabel/if_expression_test.go
+@@ -3,6 +3,7 @@ package promrelabel
+ import (
+ 	"bytes"
+ 	"encoding/json"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
+@@ -231,3 +232,56 @@ func TestIfExpressionMismatch(t *testing.T) {
+ 	f(`'{foo!~"bar|"}'`, `abc`)
+ 	f(`'{foo!~"bar|"}'`, `abc{foo="bar"}`)
+ }
++
++func TestIfExpressionMetricNames(t *testing.T) {
++	f := func(ifExpr string, namesExpected []string) {
++		t.Helper()
++
++		var ie *IfExpression
++		if ifExpr != "" {
++			ie = &IfExpression{}
++			if err := yaml.UnmarshalStrict([]byte(ifExpr), ie); err != nil {
++				t.Fatalf("unexpected error during unmarshal: %s", err)
++			}
++		}
++		names := ie.MetricNames()
++		if !slices.Equal(names, namesExpected) {
++			t.Fatalf("unexpected names for ifExpr=%s; got %q; want %q", ifExpr, names, namesExpected)
++		}
++		if names == nil {
++			return
++		}
++		// Whatever ie matches must have one of the names.
++		for _, s := range []string{`foo`, `bar`, `other`, `foo{bar="baz"}`, `bar{baz="abc"}`, `other{bar="baz"}`, `{bar="baz"}`} {
++			labels := promutil.MustNewLabelsFromString(s)
++			if ie.Match(labels.GetLabels()) && !slices.Contains(names, labels.Get("__name__")) {
++				t.Fatalf("ifExpr=%s matches %s, whose name is missing in %q", ifExpr, s, names)
++			}
++		}
++	}
++
++	// Every filter group pins the metric name
++	f(`foo`, []string{"foo"})
++	f(`foo{bar="baz",x!="y"}`, []string{"foo"})
++	f(`'{__name__="foo",bar=~"b.+"}'`, []string{"foo"})
++	f(`'{bar="baz",__name__="foo"}'`, []string{"foo"})
++	f(`'{__name__="foo" or __name__="bar"}'`, []string{"foo", "bar"})
++	f(`foo{bar="a" or baz="b"}`, []string{"foo", "foo"})
++	// MetricsQL applies the name to every group of `or`, so does Match
++	f(`'{__name__="foo" or bar="baz"}'`, []string{"foo", "foo"})
++	f(`'{bar="baz" or __name__="foo"}'`, []string{"foo", "foo"})
++	f(`
++- foo
++- bar{baz="abc"}`, []string{"foo", "bar"})
++
++	// Some series with other names can match
++	f(``, nil)
++	f(`'{bar="baz"}'`, nil)
++	f(`'{__name__=~"foo"}'`, nil)
++	f(`'{__name__!="foo"}'`, nil)
++	f(`'{__name__!~"foo"}'`, nil)
++	f(`'{__name__=""}'`, nil)
++	f(`
++- foo
++- '{bar="baz"}'`, nil)
++}
+diff --git a/lib/streamaggr/name_index_test.go b/lib/streamaggr/name_index_test.go
+new file mode 100644
+index 000000000..029ea5932
+--- /dev/null
++++ b/lib/streamaggr/name_index_test.go
+@@ -0,0 +1,369 @@
++package streamaggr
++
++import (
++	"bytes"
++	"fmt"
++	"regexp"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// nameIndexTestConfig mixes aggregators that can be indexed by metric name with
++// ones that cannot, several aggregators sharing a name, and names repeated in
++// one match.
++const nameIndexTestConfig = `
++- match: '{env!=""}'
++  interval: 1m
++  without: [instance]
++  outputs: [sum_samples]
++- match: foo
++  interval: 1m
++  by: [job]
++  outputs: [count_samples, sum_samples]
++- match: '{__name__="foo",job!="skip"}'
++  interval: 1m
++  without: [instance]
++  outputs: [sum_samples]
++- match: '{__name__="bar" or __name__="baz" or __name__="bar"}'
++  interval: 1m
++  by: [job]
++  outputs: [sum_samples]
++- match: ['{__name__="baz"}', '{__name__="qux",job="a"}']
++  interval: 1m
++  drop_input_labels: [env]
++  outputs: [count_series]
++- match: ['qux', '{env="y"}']
++  interval: 1m
++  by: [env]
++  outputs: [sum_samples]
++- match: '{__name__=~"ba.*"}'
++  interval: 1m
++  by: [job]
++  outputs: [sum_samples]
++- match: foo
++  interval: 1m
++  input_relabel_configs:
++  - target_label: job
++    replacement: relabeled
++  by: [job]
++  outputs: [sum_samples]
++- match: '{__name__="other",job="none"}'
++  interval: 1m
++  outputs: [count_samples]
++- match: zed
++  interval: 1m
++  by: [job]
++  outputs: [count_samples]
++`
++
++// nameIndexTestSeries returns series with and without names, some matching
++// aggregators by name only, of the same name both in a run and apart, so that
++// aggregators get them both in place and copied.
++func nameIndexTestSeries(round int) []prompb.TimeSeries {
++	var b strings.Builder
++	for i, s := range []string{
++		`foo{job="a",instance="1",env="x"}`,
++		`foo{job="skip",instance="2",env="x"}`,
++		`bar{job="a",instance="1"}`,
++		`baz{job="b",instance="1",env="y"}`,
++		`foo{job="b",instance="3"}`,
++		`qux{job="a",instance="1"}`,
++		`qux{job="b",instance="1"}`,
++		`other{job="a"}`,
++		`bar{job="b",instance="2",env="z"}`,
++		`other{job="b"}`,
++		`zed{job="a"}`,
++		`zed{job="b"}`,
++	} {
++		fmt.Fprintf(&b, "%s %d\n", s, (i+1)*round)
++	}
++	tss := prometheus.MustParsePromMetrics(b.String(), time.Now().UnixMilli())
++	return slices.Insert(tss, 9, prompb.TimeSeries{
++		Labels:  []prompb.Label{{Name: "job", Value: "a"}, {Name: "env", Value: "x"}},
++		Samples: []prompb.Sample{{Value: float64(round), Timestamp: time.Now().UnixMilli()}},
++	})
++}
++
++// nameIndexRun is what aggregators wrote, the matchIdxs of every push and the
++// samples lag they recorded.
++type nameIndexRun struct {
++	output     []string
++	matchIdxs  [][]byte
++	samplesLag string
++}
++
++// pushWithAndWithoutNameIndex pushes the same rounds to aggregators loaded from
++// config with and without the name index.
++func pushWithAndWithoutNameIndex(t *testing.T, config string) (indexed, plain nameIndexRun) {
++	t.Helper()
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		collect := func(dst *[]string) PushFunc {
++			return func(tss []prompb.TimeSeries) {
++				mu.Lock()
++				defer mu.Unlock()
++				for _, ts := range tss {
++					*dst = append(*dst, fmt.Sprintf("%s %s %v", getMetricName(ts.Labels), promLabelsString(ts.Labels), ts.Samples))
++				}
++			}
++		}
++		withIndex, err := LoadFromData([]byte(config), collect(&indexed.output), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		withoutIndex, err := LoadFromData([]byte(config), collect(&plain.output), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		if withIndex.byName == nil {
++			t.Fatalf("the config is not indexed by name")
++		}
++		withoutIndex.byName, withoutIndex.indexed, withoutIndex.unindexed = nil, nil, nil
++
++		for round := 1; round <= 3; round++ {
++			time.Sleep(50 * time.Second)
++			// The second batch has foo only, so the other aggregators are spared it.
++			for _, tss := range [][]prompb.TimeSeries{nameIndexTestSeries(round), nameIndexTestSeries(round)[:2]} {
++				indexed.matchIdxs = append(indexed.matchIdxs, slices.Clone(withIndex.Push(tss, nil)))
++				plain.matchIdxs = append(plain.matchIdxs, slices.Clone(withoutIndex.Push(tss, nil)))
++			}
++		}
++		time.Sleep(2 * time.Minute)
++		indexed.samplesLag = samplesLagMetrics(withIndex)
++		plain.samplesLag = samplesLagMetrics(withoutIndex)
++		withIndex.MustStop()
++		withoutIndex.MustStop()
++	})
++	slices.Sort(indexed.output)
++	slices.Sort(plain.output)
++	return indexed, plain
++}
++
++// samplesLagMetrics returns the vm_streamaggr_samples_lag_seconds lines of a.
++// The outputs label lists the outputs in map order, so they are sorted here.
++func samplesLagMetrics(a *Aggregators) string {
++	var bb bytes.Buffer
++	a.ms.WritePrometheus(&bb)
++	var lines []string
++	for _, line := range strings.Split(bb.String(), "\n") {
++		if !strings.HasPrefix(line, "vm_streamaggr_samples_lag_seconds") {
++			continue
++		}
++		line = outputsLabelRe.ReplaceAllStringFunc(line, func(label string) string {
++			outputs := strings.Split(label[len(`outputs="`):len(label)-1], ",")
++			slices.Sort(outputs)
++			return `outputs="` + strings.Join(outputs, ",") + `"`
++		})
++		lines = append(lines, line)
++	}
++	slices.Sort(lines)
++	return strings.Join(lines, "\n")
++}
++
++var outputsLabelRe = regexp.MustCompile(`outputs="[^"]*"`)
++
++func promLabelsString(labels []prompb.Label) string {
++	var b strings.Builder
++	for _, l := range labels {
++		fmt.Fprintf(&b, "%s=%q,", l.Name, l.Value)
++	}
++	return b.String()
++}
++
++// The name index only skips aggregators that could not match: every aggregator
++// writes what it writes without the index, and the same series count as matched.
++func TestNameIndexChangesNothing(t *testing.T) {
++	for _, config := range []string{
++		nameIndexTestConfig,
++		// One more aggregator without match takes every series.
++		nameIndexTestConfig + "- interval: 1m\n  by: [job]\n  outputs: [count_samples]\n",
++	} {
++		indexed, plain := pushWithAndWithoutNameIndex(t, config)
++		names := map[string]bool{}
++		for _, s := range plain.output {
++			names[s[:strings.Index(s, " ")]] = true
++		}
++		if len(names) < 7 {
++			t.Fatalf("too little output to compare: %d metric names in %q", len(names), plain.output)
++		}
++		if !slices.Equal(indexed.output, plain.output) {
++			t.Fatalf("output differs with the name index\nwith:\n%s\nwithout:\n%s", strings.Join(indexed.output, "\n"), strings.Join(plain.output, "\n"))
++		}
++		for i := range plain.matchIdxs {
++			if !slices.Equal(indexed.matchIdxs[i], plain.matchIdxs[i]) {
++				t.Fatalf("push %d: matchIdxs %v with the name index, %v without", i, indexed.matchIdxs[i], plain.matchIdxs[i])
++			}
++		}
++		// Self-monitoring stays the same too: every aggregator records the lag of
++		// every push, 0 if nothing in it matched.
++		if !strings.Contains(plain.samplesLag, "_count") {
++			t.Fatalf("no samples lag recorded: %q", plain.samplesLag)
++		}
++		if indexed.samplesLag != plain.samplesLag {
++			t.Fatalf("samples lag differs with the name index\nwith:\n%s\nwithout:\n%s", indexed.samplesLag, plain.samplesLag)
++		}
++	}
++}
++
++// Scrape loops push concurrently. Pushes of the same series from several
++// goroutines at once write what as many sequential pushes write: the values are
++// integers, so the order of the additions does not change the sums.
++func TestNameIndexConcurrentPush(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var concurrent, sequential []string
++		collect := func(dst *[]string) PushFunc {
++			return func(tss []prompb.TimeSeries) {
++				mu.Lock()
++				defer mu.Unlock()
++				for _, ts := range tss {
++					*dst = append(*dst, fmt.Sprintf("%s %s %v", getMetricName(ts.Labels), promLabelsString(ts.Labels), ts.Samples))
++				}
++			}
++		}
++		withIndex, err := LoadFromData([]byte(nameIndexTestConfig), collect(&concurrent), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		withoutIndex, err := LoadFromData([]byte(nameIndexTestConfig), collect(&sequential), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		withoutIndex.byName, withoutIndex.indexed, withoutIndex.unindexed = nil, nil, nil
++
++		const goroutines = 8
++		for round := 1; round <= 3; round++ {
++			time.Sleep(50 * time.Second)
++			tss := nameIndexTestSeries(round)
++			want := slices.Clone(withoutIndex.Push(tss, nil))
++			for range goroutines - 1 {
++				withoutIndex.Push(tss, nil)
++			}
++			var wg sync.WaitGroup
++			for range goroutines {
++				wg.Go(func() {
++					if got := withIndex.Push(tss, nil); !slices.Equal(got, want) {
++						t.Errorf("matchIdxs %v, want %v", got, want)
++					}
++				})
++			}
++			wg.Wait()
++		}
++		time.Sleep(2 * time.Minute)
++		withIndex.MustStop()
++		withoutIndex.MustStop()
++		slices.Sort(concurrent)
++		slices.Sort(sequential)
++		if len(sequential) == 0 || !slices.Equal(concurrent, sequential) {
++			t.Fatalf("concurrent pushes write\n%s\nsequential ones\n%s", strings.Join(concurrent, "\n"), strings.Join(sequential, "\n"))
++		}
++	})
++}
++
++// On a config reload vmagent stops the old aggregators while pushes to them may
++// still be in flight. Such pushes must not panic, nor mark series as aggregated
++// by aggregators that will never write them out.
++func TestNameIndexPushAfterMustStop(t *testing.T) {
++	for _, index := range []bool{false, true} {
++		a, err := LoadFromData([]byte(nameIndexTestConfig), func([]prompb.TimeSeries) {}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		if !index {
++			a.byName, a.indexed, a.unindexed = nil, nil, nil
++		}
++		a.MustStop()
++		tss := nameIndexTestSeries(1)
++		matchIdxs := a.Push(tss, nil)
++		if len(matchIdxs) != len(tss) || slices.Contains(matchIdxs, 1) {
++			t.Fatalf("index=%v: matchIdxs %v after MustStop, want %d zeros", index, matchIdxs, len(tss))
++		}
++	}
++}
++
++func TestNameIndexOnlyWhenItPays(t *testing.T) {
++	f := func(config string, indexed bool) {
++		t.Helper()
++		a, err := LoadFromData([]byte(config), func([]prompb.TimeSeries) {}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		defer a.MustStop()
++		if (a.byName != nil) != indexed {
++			t.Fatalf("indexed=%v, want %v for %s", a.byName != nil, indexed, config)
++		}
++	}
++	rule := func(match string) string {
++		return fmt.Sprintf("- match: '%s'\n  interval: 1m\n  outputs: [count_samples]\n", match)
++	}
++	f(rule(`foo`), false)
++	f(rule(`foo`)+rule(`{env!=""}`), false)
++	f(rule(`foo`)+rule(`{__name__=~"bar"}`), false)
++	f(rule(`foo`)+rule(`bar`), true)
++	f(rule(`foo`)+rule(`foo{job="a"}`)+rule(`{env!=""}`), true)
++}
++
++func BenchmarkAggregatorsPushNameIndex(b *testing.B) {
++	rule := func(match, by string) string {
++		return fmt.Sprintf("- match: '%s'\n  interval: 1m\n  by: [%s]\n  outputs: [sum_samples]\n", match, by)
++	}
++	many := rule(`{env!=""}`, "job") + rule(`{env=""}`, "job")
++	for i := range 100 {
++		many += rule(fmt.Sprintf("m%d", i%20), []string{"job", "instance", "env", "job, env", "instance, env"}[i/20])
++	}
++	for _, bc := range []struct {
++		name, config string
++		names        int // series are named m0, m1 ... and come in runs of 50 per name, or one by one if names < 0
++	}{
++		{"one-indexed", rule("m0", "job"), 20},
++		{"two-same-name", rule("m0", "job") + rule("m0", "instance"), 20},
++		{"two-same-name-all-match", rule("m0", "job") + rule("m0", "instance"), 1},
++		{"two-names", rule("m0", "job") + rule("m1", "job"), 20},
++		{"two-names-interleaved", rule("m0", "job") + rule("m1", "job"), -2},
++		{"100-indexed-2-not", many, 20},
++	} {
++		var tss []prompb.TimeSeries
++		for i := range 1000 {
++			name := fmt.Sprintf("m%d", i/50%max(bc.names, 1))
++			if bc.names < 0 {
++				name = fmt.Sprintf("m%d", i%-bc.names)
++			}
++			tss = append(tss, prompb.TimeSeries{
++				Labels: []prompb.Label{
++					{Name: "__name__", Value: name},
++					{Name: "job", Value: fmt.Sprintf("job%d", i%7)},
++					{Name: "instance", Value: fmt.Sprintf("instance%d", i%50)},
++					{Name: "env", Value: fmt.Sprintf("env%d", i%3)},
++				},
++				Samples: []prompb.Sample{{Value: 1, Timestamp: 1}},
++			})
++		}
++		for _, index := range []bool{false, true} {
++			b.Run(fmt.Sprintf("%s/index=%v", bc.name, index), func(b *testing.B) {
++				a, err := LoadFromData([]byte(bc.config), func([]prompb.TimeSeries) {}, nil, "bench")
++				if err != nil {
++					b.Fatalf("cannot load config: %s", err)
++				}
++				defer a.MustStop()
++				if !index {
++					a.byName, a.indexed, a.unindexed = nil, nil, nil
++				}
++				b.ReportAllocs()
++				b.SetBytes(int64(len(tss)))
++				b.RunParallel(func(pb *testing.PB) {
++					var matchIdxs []byte
++					for pb.Next() {
++						matchIdxs = a.Push(tss, matchIdxs)
++					}
++				})
++			})
++		}
++	}
++}
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index a9b4b467e..8ca380afe 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -305,6 +305,14 @@ type Config struct {
+ type Aggregators struct {
+ 	as []*aggregator
+ 
++	// byName maps a metric name to the indexes in as of the aggregators whose match
++	// can select only series with this name or a few other names; unindexed holds
++	// the rest. Push hands a series only to the aggregators listed for its name
++	// and to unindexed. byName is nil if too few aggregators can be indexed.
++	byName    map[string][]int
++	indexed   []int
++	unindexed []*aggregator
++
+ 	// configData contains marshaled configs.
+ 	// It is used in Equal() for comparing Aggregators.
+ 	configData []byte
+@@ -353,14 +361,50 @@ func loadFromData(data []byte, filePath string, pushFunc PushFunc, opts *Options
+ 	}
+ 
+ 	metrics.RegisterSet(ms)
++	byName, indexed, unindexed := indexAggregatorsByName(as)
+ 	return &Aggregators{
+ 		as:         as,
++		byName:     byName,
++		indexed:    indexed,
++		unindexed:  unindexed,
+ 		configData: configData,
+ 		filePath:   filePath,
+ 		ms:         ms,
+ 	}, nil
+ }
+ 
++// minIndexedAggregators is the number of aggregators with names in their match
++// from which indexing them pays for looking up the name of every input series.
++const minIndexedAggregators = 2
++
++// indexAggregatorsByName maps metric names to the indexes in as of the aggregators
++// whose match can select only series with these names, returns the indexes of
++// these aggregators, and the other aggregators in unindexed. It returns nil, nil,
++// nil if fewer than minIndexedAggregators can be indexed.
++func indexAggregatorsByName(as []*aggregator) (map[string][]int, []int, []*aggregator) {
++	byName := make(map[string][]int)
++	var indexed []int
++	var unindexed []*aggregator
++	for i, a := range as {
++		names := a.match.MetricNames()
++		if len(names) == 0 {
++			unindexed = append(unindexed, a)
++			continue
++		}
++		indexed = append(indexed, i)
++		for _, name := range names {
++			// Names may repeat; an aggregator must get each series only once.
++			if idxs := byName[name]; len(idxs) == 0 || idxs[len(idxs)-1] != i {
++				byName[name] = append(idxs, i)
++			}
++		}
++	}
++	if len(indexed) < minIndexedAggregators {
++		return nil, nil, nil
++	}
++	return byName, indexed, unindexed
++}
++
+ // IsEnabled returns true if Aggregators has at least one configured aggregator
+ func (a *Aggregators) IsEnabled() bool {
+ 	if a == nil {
+@@ -412,13 +456,166 @@ func (a *Aggregators) Push(tss []prompb.TimeSeries, matchIdxs []byte) []byte {
+ 		return matchIdxs
+ 	}
+ 
+-	for _, aggr := range a.as {
++	// MustStop sets a.as to nil, possibly while a push is in flight on a config
++	// reload: read it once, and push nothing to stopped aggregators.
++	as := a.as
++	if len(as) == 0 {
++		return matchIdxs
++	}
++
++	if a.byName == nil {
++		for _, aggr := range as {
++			aggr.Push(tss, matchIdxs)
++		}
++		return matchIdxs
++	}
++
++	for _, aggr := range a.unindexed {
+ 		aggr.Push(tss, matchIdxs)
+ 	}
++	a.pushByName(as, tss, matchIdxs)
+ 
+ 	return matchIdxs
+ }
+ 
++// pushByName pushes every series in tss to the indexed aggregators listed for its
++// name only. The other indexed aggregators could not match it.
++func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) {
++	ctx := getNameIndexCtx(len(as))
++	defer putNameIndexCtx(ctx)
++
++	// Series of a metric usually come one after another, and a few metrics may take
++	// turns, such as the buckets, the sum and the count of a histogram: look a name
++	// up once per run, and the names of the last few runs not at all.
++	runStart, runName := 0, ""
++	var runIdxs []int
++	for i := range tss {
++		name := getMetricName(tss[i].Labels)
++		if name == runName {
++			continue
++		}
++		ctx.addRun(runIdxs, runStart, i)
++		runStart, runName, runIdxs = i, name, ctx.recent.lookup(a.byName, name)
++	}
++	ctx.addRun(runIdxs, runStart, len(tss))
++
++	for _, aggrIdx := range a.indexed {
++		runs := ctx.runs[aggrIdx]
++		if len(runs) == 0 {
++			// An aggregator records the lag of every push it gets, 0 if nothing
++			// in it matched. Keep recording it for the pushes it is spared.
++			as[aggrIdx].samplesLag.Update(0)
++			continue
++		}
++		if len(runs) == 1 {
++			r := runs[0]
++			as[aggrIdx].Push(tss[r.start:r.end], matchIdxs[r.start:r.end])
++			continue
++		}
++		tssSub := ctx.tss[:0]
++		for _, r := range runs {
++			tssSub = append(tssSub, tss[r.start:r.end]...)
++		}
++		matchIdxsSub := bytesutil.ResizeNoCopyMayOverallocate(ctx.matchIdxs, len(tssSub))
++		clear(matchIdxsSub)
++		as[aggrIdx].Push(tssSub, matchIdxsSub)
++		j := 0
++		for _, r := range runs {
++			for i := r.start; i < r.end; i++ {
++				matchIdxs[i] |= matchIdxsSub[j]
++				j++
++			}
++		}
++		ctx.tss = tssSub[:0]
++		ctx.tssMaxLen = max(ctx.tssMaxLen, len(tssSub))
++		ctx.matchIdxs = matchIdxsSub
++	}
++}
++
++// getMetricName returns the value of the first __name__ label, which is the one
++// promrelabel.IfExpression matches metric names against.
++func getMetricName(labels []prompb.Label) string {
++	for _, label := range labels {
++		if label.Name == "__name__" {
++			return label.Value
++		}
++	}
++	return ""
++}
++
++// seriesRun is the series from start up to end in a pushed batch.
++type seriesRun struct {
++	start, end int
++}
++
++type nameIndexCtx struct {
++	// runs[i] holds the series to push to the aggregator #i.
++	runs [][]seriesRun
++
++	recent recentNames
++
++	tss       []prompb.TimeSeries
++	tssMaxLen int
++	matchIdxs []byte
++}
++
++// recentNames remembers the aggregators of the last few names looked up, nil for
++// names without aggregators. Its zero entries map "" to nil, which is right:
++// byName has no "".
++type recentNames struct {
++	names [4]string
++	idxs  [4][]int
++	next  int
++}
++
++func (rn *recentNames) lookup(byName map[string][]int, name string) []int {
++	for i := range rn.names {
++		if rn.names[i] == name {
++			return rn.idxs[i]
++		}
++	}
++	idxs := byName[name]
++	rn.names[rn.next], rn.idxs[rn.next] = name, idxs
++	rn.next = (rn.next + 1) % len(rn.names)
++	return idxs
++}
++
++// addRun adds the series from start up to end to the aggregators with aggrIdxs.
++func (ctx *nameIndexCtx) addRun(aggrIdxs []int, start, end int) {
++	for _, aggrIdx := range aggrIdxs {
++		runs := ctx.runs[aggrIdx]
++		if n := len(runs); n > 0 && runs[n-1].end == start {
++			runs[n-1].end = end
++		} else {
++			runs = append(runs, seriesRun{start: start, end: end})
++		}
++		ctx.runs[aggrIdx] = runs
++	}
++}
++
++func getNameIndexCtx(aggregators int) *nameIndexCtx {
++	v := nameIndexCtxPool.Get()
++	if v == nil {
++		v = &nameIndexCtx{}
++	}
++	ctx := v.(*nameIndexCtx)
++	ctx.runs = slices.Grow(ctx.runs[:0], aggregators)[:aggregators]
++	return ctx
++}
++
++func putNameIndexCtx(ctx *nameIndexCtx) {
++	for i := range ctx.runs {
++		ctx.runs[i] = ctx.runs[i][:0]
++	}
++	// Do not hold the pushed series and names.
++	ctx.recent = recentNames{}
++	clear(ctx.tss[:ctx.tssMaxLen])
++	ctx.tssMaxLen = 0
++	nameIndexCtxPool.Put(ctx)
++}
++
++var nameIndexCtxPool sync.Pool
++
+ type currentState struct {
+ 
+ 	// isGreen defines a state, where data sample with minDeadline < timestamp < maxDeadline will be aggregated
+-- 
+2.50.1 (Apple Git-155)
+

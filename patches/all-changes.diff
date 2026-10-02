@@ -1,3 +1,43 @@
+diff --git a/app/vmagent/remotewrite/streamaggr.go b/app/vmagent/remotewrite/streamaggr.go
+index f820486c9..aaab51096 100644
+--- a/app/vmagent/remotewrite/streamaggr.go
++++ b/app/vmagent/remotewrite/streamaggr.go
+@@ -38,6 +38,9 @@ var (
+ 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
++	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
++		"at the timestamps of the input samples instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
++		"Can be overridden per aggregation via sample_timestamps option")
+ 
+ 	// Per URL config
+ 	streamAggrConfig = flagutil.NewArrayString("remoteWrite.streamAggr.config", "Optional path to file with stream aggregation config for the corresponding -remoteWrite.url. "+
+@@ -65,6 +68,9 @@ var (
+ 	streamAggrEnableWindows = flagutil.NewArrayBool("remoteWrite.streamAggr.enableWindows", "Enables aggregation within fixed windows for all remote write's aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
++	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
++		"write sum_samples and sum_samples_total at the timestamps of the input samples instead of at the flush, so a sample processed late "+
++		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
+ )
+ 
+ // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
+@@ -214,6 +220,7 @@ func newStreamAggrConfigGlobal() (*streamaggr.Aggregators, error) {
+ 		IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
+ 		KeepInput:            *streamAggrGlobalKeepInput,
+ 		EnableWindows:        *streamAggrGlobalEnableWindows,
++		SampleTimestamps:     *streamAggrGlobalSampleTimestamps,
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushTimeSeriesToRemoteStoragesTrackDropped, opts, "global")
+@@ -248,6 +255,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
+ 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
+ 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
+ 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
++		SampleTimestamps:     streamAggrSampleTimestamps.GetOptionalArg(idx),
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)
 diff --git a/app/vmstorage/main.go b/app/vmstorage/main.go
 index 94d2ebdd1..b210b650e 100644
 --- a/app/vmstorage/main.go
@@ -38,10 +78,10 @@ index 9fc70b8fb..39f123cd5 100644
  
  Moved to [stream-aggregation/configuration/#total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#total).
 diff --git a/docs/victoriametrics/stream-aggregation/configuration.md b/docs/victoriametrics/stream-aggregation/configuration.md
-index 18e3f47c4..28204b861 100644
+index 18e3f47c4..2cf50096b 100644
 --- a/docs/victoriametrics/stream-aggregation/configuration.md
 +++ b/docs/victoriametrics/stream-aggregation/configuration.md
-@@ -110,6 +110,15 @@ specified individually per each `-remoteWrite.url`:
+@@ -110,6 +110,25 @@ specified individually per each `-remoteWrite.url`:
    #
    # flush_on_shutdown: false
  
@@ -54,10 +94,20 @@ index 18e3f47c4..28204b861 100644
 +  #
 +  # reset_marker_on_stale: false
 +
++  # sample_timestamps instructs to write sum_samples and sum_samples_total at the timestamps of the input
++  # samples instead of at the flush, so samples processed late, when vmagent falls behind, still count
++  # towards the interval they were scraped in rather than the one they were processed in.
++  # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
++  # enable_windows or dedup_interval, which decide timestamps of their own.
++  # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
++  # command-line flags are set; the flags enable it for the aggregations it supports and leave the others alone.
++  #
++  # sample_timestamps: false
++
    # without is an optional list of labels, which must be removed from the output aggregation.
    # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
    #
-@@ -496,6 +505,30 @@ See also:
+@@ -496,6 +515,30 @@ See also:
  - [count_samples](#count_samples)
  - [count_series](#count_series)
  
@@ -962,6 +1012,122 @@ index 000000000..1f8162394
 +		t.Fatalf("window %d bytes (%v), want at most 1 MiB", h.WindowSize, err)
 +	}
 +}
+diff --git a/lib/promrelabel/if_expression.go b/lib/promrelabel/if_expression.go
+index 3afd69f5e..5be876bcf 100644
+--- a/lib/promrelabel/if_expression.go
++++ b/lib/promrelabel/if_expression.go
+@@ -40,6 +40,42 @@ func (ie *IfExpression) Match(labels []prompb.Label) bool {
+ 	return false
+ }
+ 
++// MetricNames returns the metric names ie can match.
++//
++// It returns nil if ie can match series with any other name: that is unless
++// every filter group in ie has a `__name__="value"` filter with non-empty value.
++// The returned names may repeat.
++func (ie *IfExpression) MetricNames() []string {
++	if ie == nil || len(ie.ies) == 0 {
++		return nil
++	}
++	var names []string
++	for _, ie := range ie.ies {
++		if ie == nil || len(ie.lfss) == 0 {
++			return nil
++		}
++		for _, lfs := range ie.lfss {
++			name := metricNameFilterValue(lfs)
++			if name == "" {
++				return nil
++			}
++			names = append(names, name)
++		}
++	}
++	return names
++}
++
++// metricNameFilterValue returns the value of the `__name__="value"` filter in lfs,
++// or an empty string if lfs has no such filter.
++func metricNameFilterValue(lfs []*labelFilter) string {
++	for _, lf := range lfs {
++		if lf.label == "" && lf.op == "=" {
++			return lf.value
++		}
++	}
++	return ""
++}
++
+ // Parse parses ie from s.
+ func (ie *IfExpression) Parse(s string) error {
+ 	ieLocal, err := newIfExpression(s)
+diff --git a/lib/promrelabel/if_expression_test.go b/lib/promrelabel/if_expression_test.go
+index 489c953b4..23bd31398 100644
+--- a/lib/promrelabel/if_expression_test.go
++++ b/lib/promrelabel/if_expression_test.go
+@@ -3,6 +3,7 @@ package promrelabel
+ import (
+ 	"bytes"
+ 	"encoding/json"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
+@@ -231,3 +232,56 @@ func TestIfExpressionMismatch(t *testing.T) {
+ 	f(`'{foo!~"bar|"}'`, `abc`)
+ 	f(`'{foo!~"bar|"}'`, `abc{foo="bar"}`)
+ }
++
++func TestIfExpressionMetricNames(t *testing.T) {
++	f := func(ifExpr string, namesExpected []string) {
++		t.Helper()
++
++		var ie *IfExpression
++		if ifExpr != "" {
++			ie = &IfExpression{}
++			if err := yaml.UnmarshalStrict([]byte(ifExpr), ie); err != nil {
++				t.Fatalf("unexpected error during unmarshal: %s", err)
++			}
++		}
++		names := ie.MetricNames()
++		if !slices.Equal(names, namesExpected) {
++			t.Fatalf("unexpected names for ifExpr=%s; got %q; want %q", ifExpr, names, namesExpected)
++		}
++		if names == nil {
++			return
++		}
++		// Whatever ie matches must have one of the names.
++		for _, s := range []string{`foo`, `bar`, `other`, `foo{bar="baz"}`, `bar{baz="abc"}`, `other{bar="baz"}`, `{bar="baz"}`} {
++			labels := promutil.MustNewLabelsFromString(s)
++			if ie.Match(labels.GetLabels()) && !slices.Contains(names, labels.Get("__name__")) {
++				t.Fatalf("ifExpr=%s matches %s, whose name is missing in %q", ifExpr, s, names)
++			}
++		}
++	}
++
++	// Every filter group pins the metric name
++	f(`foo`, []string{"foo"})
++	f(`foo{bar="baz",x!="y"}`, []string{"foo"})
++	f(`'{__name__="foo",bar=~"b.+"}'`, []string{"foo"})
++	f(`'{bar="baz",__name__="foo"}'`, []string{"foo"})
++	f(`'{__name__="foo" or __name__="bar"}'`, []string{"foo", "bar"})
++	f(`foo{bar="a" or baz="b"}`, []string{"foo", "foo"})
++	// MetricsQL applies the name to every group of `or`, so does Match
++	f(`'{__name__="foo" or bar="baz"}'`, []string{"foo", "foo"})
++	f(`'{bar="baz" or __name__="foo"}'`, []string{"foo", "foo"})
++	f(`
++- foo
++- bar{baz="abc"}`, []string{"foo", "bar"})
++
++	// Some series with other names can match
++	f(``, nil)
++	f(`'{bar="baz"}'`, nil)
++	f(`'{__name__=~"foo"}'`, nil)
++	f(`'{__name__!="foo"}'`, nil)
++	f(`'{__name__!~"foo"}'`, nil)
++	f(`'{__name__=""}'`, nil)
++	f(`
++- foo
++- '{bar="baz"}'`, nil)
++}
 diff --git a/lib/promscrape/client.go b/lib/promscrape/client.go
 index 8b34adf1d..fdd47767e 100644
 --- a/lib/promscrape/client.go
@@ -1239,7 +1405,7 @@ index 000000000..58b66db18
 +	}
 +}
 diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
-index 083b59f70..99d203447 100644
+index 083b59f70..0faf23f80 100644
 --- a/lib/promscrape/scrapework.go
 +++ b/lib/promscrape/scrapework.go
 @@ -6,6 +6,7 @@ import (
@@ -1261,7 +1427,35 @@ index 083b59f70..99d203447 100644
  
  	// PushData is called for pushing collected data.
  	//
-@@ -406,7 +409,17 @@ var (
+@@ -355,7 +358,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
+ 			}
+ 			return
+ 		case tt := <-ticker.C:
+-			t := tt.UnixMilli()
++			t := tickTime(tt.UnixMilli(), time.Now().UnixMilli(), scrapeInterval.Milliseconds())
+ 			if d := math.Abs(float64(t - timestamp)); d > 0 && d/float64(scrapeInterval.Milliseconds()) > 0.1 {
+ 				// Too big jitter. Adjust timestamp
+ 				timestamp = t
+@@ -365,6 +368,18 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
+ 	}
+ }
+ 
++// tickTime returns when the scrape for a tick fired at tick starts. A tick that
++// waited while the previous scrape was still being processed is stale: the
++// target is scraped now, and stamping its samples with the tick would count
++// everything that happened in between towards the past -- with increments,
++// into an earlier interval, or an earlier hour.
++func tickTime(tick, now, interval int64) int64 {
++	if now-tick > interval/10 {
++		return now
++	}
++	return tick
++}
++
+ func (sw *scrapeWork) logError(s string) {
+ 	if !*suppressScrapeErrors {
+ 		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s; "+
+@@ -406,7 +421,17 @@ var (
  	scrapesSkippedBySampleLimit = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_sample_limit_total")
  	scrapesSkippedByLabelLimit  = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_label_limit_total")
  	scrapesFailed               = metrics.NewCounter("vm_promscrape_scrapes_failed_total")
@@ -1280,7 +1474,7 @@ index 083b59f70..99d203447 100644
  )
  
  func (sw *scrapeWork) needStreamParseMode(responseSize int) bool {
-@@ -424,13 +437,13 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+@@ -424,13 +449,13 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
  	cb := chunkedbuffer.Get()
  	defer chunkedbuffer.Put(cb)
  
@@ -1296,7 +1490,7 @@ index 083b59f70..99d203447 100644
  	return bb.B, err
  }
  
-@@ -441,7 +454,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -441,7 +466,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  	// This also allows measuring the real scrape duration, which doesn't include
  	// the time needed for processing of the read response.
  	cb := chunkedbuffer.Get()
@@ -1305,7 +1499,7 @@ index 083b59f70..99d203447 100644
  
  	// Measure scrape duration.
  	endTimestamp := time.Now().UnixMilli()
-@@ -454,11 +467,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -454,11 +479,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  	// without sacrificing the performance.
  	processScrapedDataConcurrencyLimitCh <- struct{}{}
  
@@ -1327,7 +1521,7 @@ index 083b59f70..99d203447 100644
  	}
  	chunkedbuffer.Put(cb)
  
-@@ -470,11 +492,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -470,11 +504,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  		// Process response body from scrape target in streaming manner.
  		// This case is optimized for targets exposing more than ten thousand of metrics per target,
  		// such as kube-state-metrics.
@@ -1341,7 +1535,7 @@ index 083b59f70..99d203447 100644
  		err = sw.processDataOneShot(scrapeTimestamp, realTimestamp, body.B, scrapeDurationSeconds, err)
  	}
  
-@@ -487,20 +511,80 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -487,20 +523,80 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  
  var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
  
@@ -1426,7 +1620,7 @@ index 083b59f70..99d203447 100644
  	}
  	return nil
  }
-@@ -601,6 +685,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
+@@ -601,6 +697,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
  }
  
  func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64) error {
@@ -1442,7 +1636,7 @@ index 083b59f70..99d203447 100644
  	var samplesScraped atomic.Int64
  	var samplesPostRelabeling atomic.Int64
  	var samplesDroppedTotal atomic.Int64
-@@ -612,11 +705,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+@@ -612,11 +717,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
  	bbLastScrape.B = sw.loadLastScrape(bbLastScrape.B)
  	lastScrapeStr := bytesutil.ToUnsafeString(bbLastScrape.B)
  
@@ -1454,7 +1648,7 @@ index 083b59f70..99d203447 100644
  	err := stream.Parse(r, scrapeTimestamp, "", false, prommetadata.IsEnabled(), func(rows []parser.Row, mms []parser.Metadata) error {
  		labelsLen := maxLabelsLen.Load()
  		wc := writeRequestCtxPool.Get(int(labelsLen))
-@@ -677,12 +768,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+@@ -677,12 +780,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
  		// This is a trade-off between performance and accuracy.
  		seriesAdded = getSeriesAdded(lastScrapeStr, bodyString)
  	}
@@ -1472,7 +1666,7 @@ index 083b59f70..99d203447 100644
  		samplesScraped:            int(samplesScraped.Load()),
  		samplesPostRelabeling:     int(samplesPostRelabeling.Load()),
  		seriesAdded:               seriesAdded,
-@@ -699,7 +793,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+@@ -699,7 +805,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
  	}
  	leveledbytebufferpool.Put(bbLastScrape)
  
@@ -1769,6 +1963,30 @@ index dedb92385..bfdcd525f 100644
  		}
  
  		var pushDataCalls atomic.Int64
+diff --git a/lib/promscrape/scrapework_tick_test.go b/lib/promscrape/scrapework_tick_test.go
+new file mode 100644
+index 000000000..c509a9b64
+--- /dev/null
++++ b/lib/promscrape/scrapework_tick_test.go
+@@ -0,0 +1,18 @@
++package promscrape
++
++import "testing"
++
++// A scrape that took longer than the interval leaves the next tick waiting.
++// Its samples are scraped when the loop gets to it, and have to be stamped then.
++func TestTickTimeUsesTheRealTimeForAStaleTick(t *testing.T) {
++	const minute = 60_000
++	if got := tickTime(minute, minute+50, minute); got != minute {
++		t.Fatalf("an on-time tick moved to %d", got)
++	}
++	if got := tickTime(minute, minute+minute/10, minute); got != minute {
++		t.Fatalf("a tick within a tenth of the interval moved to %d", got)
++	}
++	if got := tickTime(minute, 12*minute, minute); got != 12*minute {
++		t.Fatalf("a tick left waiting 11 minutes was stamped %d, not when the scrape ran", got)
++	}
++}
 diff --git a/lib/promscrape/scrapework_timing_test.go b/lib/promscrape/scrapework_timing_test.go
 index fa0454b52..d8177b414 100644
 --- a/lib/promscrape/scrapework_timing_test.go
@@ -2862,7 +3080,7 @@ index f1fa23669..b07b742ca 100644
 +func (*histogramBucketAggrConfig) needsInputKey() bool { return false }
 diff --git a/lib/streamaggr/input_key_test.go b/lib/streamaggr/input_key_test.go
 new file mode 100644
-index 000000000..2a25fa231
+index 000000000..369d68bca
 --- /dev/null
 +++ b/lib/streamaggr/input_key_test.go
 @@ -0,0 +1,169 @@
@@ -2906,7 +3124,7 @@ index 000000000..2a25fa231
 +		{"unique_samples", false},
 +	} {
 +		t.Run(tc.output, func(t *testing.T) {
-+			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0)
++			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0, false)
 +			if err != nil {
 +				t.Fatalf("%s: %v", tc.output, err)
 +			}
@@ -3074,6 +3292,381 @@ index d2223ea24..c0b375393 100644
 +// need not carry the labels the aggregation groups away -- compressing them
 +// costs a hash and two string compares per label per sample, for nothing.
 +func (*minAggrConfig) needsInputKey() bool { return false }
+diff --git a/lib/streamaggr/name_index_test.go b/lib/streamaggr/name_index_test.go
+new file mode 100644
+index 000000000..029ea5932
+--- /dev/null
++++ b/lib/streamaggr/name_index_test.go
+@@ -0,0 +1,369 @@
++package streamaggr
++
++import (
++	"bytes"
++	"fmt"
++	"regexp"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// nameIndexTestConfig mixes aggregators that can be indexed by metric name with
++// ones that cannot, several aggregators sharing a name, and names repeated in
++// one match.
++const nameIndexTestConfig = `
++- match: '{env!=""}'
++  interval: 1m
++  without: [instance]
++  outputs: [sum_samples]
++- match: foo
++  interval: 1m
++  by: [job]
++  outputs: [count_samples, sum_samples]
++- match: '{__name__="foo",job!="skip"}'
++  interval: 1m
++  without: [instance]
++  outputs: [sum_samples]
++- match: '{__name__="bar" or __name__="baz" or __name__="bar"}'
++  interval: 1m
++  by: [job]
++  outputs: [sum_samples]
++- match: ['{__name__="baz"}', '{__name__="qux",job="a"}']
++  interval: 1m
++  drop_input_labels: [env]
++  outputs: [count_series]
++- match: ['qux', '{env="y"}']
++  interval: 1m
++  by: [env]
++  outputs: [sum_samples]
++- match: '{__name__=~"ba.*"}'
++  interval: 1m
++  by: [job]
++  outputs: [sum_samples]
++- match: foo
++  interval: 1m
++  input_relabel_configs:
++  - target_label: job
++    replacement: relabeled
++  by: [job]
++  outputs: [sum_samples]
++- match: '{__name__="other",job="none"}'
++  interval: 1m
++  outputs: [count_samples]
++- match: zed
++  interval: 1m
++  by: [job]
++  outputs: [count_samples]
++`
++
++// nameIndexTestSeries returns series with and without names, some matching
++// aggregators by name only, of the same name both in a run and apart, so that
++// aggregators get them both in place and copied.
++func nameIndexTestSeries(round int) []prompb.TimeSeries {
++	var b strings.Builder
++	for i, s := range []string{
++		`foo{job="a",instance="1",env="x"}`,
++		`foo{job="skip",instance="2",env="x"}`,
++		`bar{job="a",instance="1"}`,
++		`baz{job="b",instance="1",env="y"}`,
++		`foo{job="b",instance="3"}`,
++		`qux{job="a",instance="1"}`,
++		`qux{job="b",instance="1"}`,
++		`other{job="a"}`,
++		`bar{job="b",instance="2",env="z"}`,
++		`other{job="b"}`,
++		`zed{job="a"}`,
++		`zed{job="b"}`,
++	} {
++		fmt.Fprintf(&b, "%s %d\n", s, (i+1)*round)
++	}
++	tss := prometheus.MustParsePromMetrics(b.String(), time.Now().UnixMilli())
++	return slices.Insert(tss, 9, prompb.TimeSeries{
++		Labels:  []prompb.Label{{Name: "job", Value: "a"}, {Name: "env", Value: "x"}},
++		Samples: []prompb.Sample{{Value: float64(round), Timestamp: time.Now().UnixMilli()}},
++	})
++}
++
++// nameIndexRun is what aggregators wrote, the matchIdxs of every push and the
++// samples lag they recorded.
++type nameIndexRun struct {
++	output     []string
++	matchIdxs  [][]byte
++	samplesLag string
++}
++
++// pushWithAndWithoutNameIndex pushes the same rounds to aggregators loaded from
++// config with and without the name index.
++func pushWithAndWithoutNameIndex(t *testing.T, config string) (indexed, plain nameIndexRun) {
++	t.Helper()
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		collect := func(dst *[]string) PushFunc {
++			return func(tss []prompb.TimeSeries) {
++				mu.Lock()
++				defer mu.Unlock()
++				for _, ts := range tss {
++					*dst = append(*dst, fmt.Sprintf("%s %s %v", getMetricName(ts.Labels), promLabelsString(ts.Labels), ts.Samples))
++				}
++			}
++		}
++		withIndex, err := LoadFromData([]byte(config), collect(&indexed.output), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		withoutIndex, err := LoadFromData([]byte(config), collect(&plain.output), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		if withIndex.byName == nil {
++			t.Fatalf("the config is not indexed by name")
++		}
++		withoutIndex.byName, withoutIndex.indexed, withoutIndex.unindexed = nil, nil, nil
++
++		for round := 1; round <= 3; round++ {
++			time.Sleep(50 * time.Second)
++			// The second batch has foo only, so the other aggregators are spared it.
++			for _, tss := range [][]prompb.TimeSeries{nameIndexTestSeries(round), nameIndexTestSeries(round)[:2]} {
++				indexed.matchIdxs = append(indexed.matchIdxs, slices.Clone(withIndex.Push(tss, nil)))
++				plain.matchIdxs = append(plain.matchIdxs, slices.Clone(withoutIndex.Push(tss, nil)))
++			}
++		}
++		time.Sleep(2 * time.Minute)
++		indexed.samplesLag = samplesLagMetrics(withIndex)
++		plain.samplesLag = samplesLagMetrics(withoutIndex)
++		withIndex.MustStop()
++		withoutIndex.MustStop()
++	})
++	slices.Sort(indexed.output)
++	slices.Sort(plain.output)
++	return indexed, plain
++}
++
++// samplesLagMetrics returns the vm_streamaggr_samples_lag_seconds lines of a.
++// The outputs label lists the outputs in map order, so they are sorted here.
++func samplesLagMetrics(a *Aggregators) string {
++	var bb bytes.Buffer
++	a.ms.WritePrometheus(&bb)
++	var lines []string
++	for _, line := range strings.Split(bb.String(), "\n") {
++		if !strings.HasPrefix(line, "vm_streamaggr_samples_lag_seconds") {
++			continue
++		}
++		line = outputsLabelRe.ReplaceAllStringFunc(line, func(label string) string {
++			outputs := strings.Split(label[len(`outputs="`):len(label)-1], ",")
++			slices.Sort(outputs)
++			return `outputs="` + strings.Join(outputs, ",") + `"`
++		})
++		lines = append(lines, line)
++	}
++	slices.Sort(lines)
++	return strings.Join(lines, "\n")
++}
++
++var outputsLabelRe = regexp.MustCompile(`outputs="[^"]*"`)
++
++func promLabelsString(labels []prompb.Label) string {
++	var b strings.Builder
++	for _, l := range labels {
++		fmt.Fprintf(&b, "%s=%q,", l.Name, l.Value)
++	}
++	return b.String()
++}
++
++// The name index only skips aggregators that could not match: every aggregator
++// writes what it writes without the index, and the same series count as matched.
++func TestNameIndexChangesNothing(t *testing.T) {
++	for _, config := range []string{
++		nameIndexTestConfig,
++		// One more aggregator without match takes every series.
++		nameIndexTestConfig + "- interval: 1m\n  by: [job]\n  outputs: [count_samples]\n",
++	} {
++		indexed, plain := pushWithAndWithoutNameIndex(t, config)
++		names := map[string]bool{}
++		for _, s := range plain.output {
++			names[s[:strings.Index(s, " ")]] = true
++		}
++		if len(names) < 7 {
++			t.Fatalf("too little output to compare: %d metric names in %q", len(names), plain.output)
++		}
++		if !slices.Equal(indexed.output, plain.output) {
++			t.Fatalf("output differs with the name index\nwith:\n%s\nwithout:\n%s", strings.Join(indexed.output, "\n"), strings.Join(plain.output, "\n"))
++		}
++		for i := range plain.matchIdxs {
++			if !slices.Equal(indexed.matchIdxs[i], plain.matchIdxs[i]) {
++				t.Fatalf("push %d: matchIdxs %v with the name index, %v without", i, indexed.matchIdxs[i], plain.matchIdxs[i])
++			}
++		}
++		// Self-monitoring stays the same too: every aggregator records the lag of
++		// every push, 0 if nothing in it matched.
++		if !strings.Contains(plain.samplesLag, "_count") {
++			t.Fatalf("no samples lag recorded: %q", plain.samplesLag)
++		}
++		if indexed.samplesLag != plain.samplesLag {
++			t.Fatalf("samples lag differs with the name index\nwith:\n%s\nwithout:\n%s", indexed.samplesLag, plain.samplesLag)
++		}
++	}
++}
++
++// Scrape loops push concurrently. Pushes of the same series from several
++// goroutines at once write what as many sequential pushes write: the values are
++// integers, so the order of the additions does not change the sums.
++func TestNameIndexConcurrentPush(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var concurrent, sequential []string
++		collect := func(dst *[]string) PushFunc {
++			return func(tss []prompb.TimeSeries) {
++				mu.Lock()
++				defer mu.Unlock()
++				for _, ts := range tss {
++					*dst = append(*dst, fmt.Sprintf("%s %s %v", getMetricName(ts.Labels), promLabelsString(ts.Labels), ts.Samples))
++				}
++			}
++		}
++		withIndex, err := LoadFromData([]byte(nameIndexTestConfig), collect(&concurrent), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		withoutIndex, err := LoadFromData([]byte(nameIndexTestConfig), collect(&sequential), nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		withoutIndex.byName, withoutIndex.indexed, withoutIndex.unindexed = nil, nil, nil
++
++		const goroutines = 8
++		for round := 1; round <= 3; round++ {
++			time.Sleep(50 * time.Second)
++			tss := nameIndexTestSeries(round)
++			want := slices.Clone(withoutIndex.Push(tss, nil))
++			for range goroutines - 1 {
++				withoutIndex.Push(tss, nil)
++			}
++			var wg sync.WaitGroup
++			for range goroutines {
++				wg.Go(func() {
++					if got := withIndex.Push(tss, nil); !slices.Equal(got, want) {
++						t.Errorf("matchIdxs %v, want %v", got, want)
++					}
++				})
++			}
++			wg.Wait()
++		}
++		time.Sleep(2 * time.Minute)
++		withIndex.MustStop()
++		withoutIndex.MustStop()
++		slices.Sort(concurrent)
++		slices.Sort(sequential)
++		if len(sequential) == 0 || !slices.Equal(concurrent, sequential) {
++			t.Fatalf("concurrent pushes write\n%s\nsequential ones\n%s", strings.Join(concurrent, "\n"), strings.Join(sequential, "\n"))
++		}
++	})
++}
++
++// On a config reload vmagent stops the old aggregators while pushes to them may
++// still be in flight. Such pushes must not panic, nor mark series as aggregated
++// by aggregators that will never write them out.
++func TestNameIndexPushAfterMustStop(t *testing.T) {
++	for _, index := range []bool{false, true} {
++		a, err := LoadFromData([]byte(nameIndexTestConfig), func([]prompb.TimeSeries) {}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		if !index {
++			a.byName, a.indexed, a.unindexed = nil, nil, nil
++		}
++		a.MustStop()
++		tss := nameIndexTestSeries(1)
++		matchIdxs := a.Push(tss, nil)
++		if len(matchIdxs) != len(tss) || slices.Contains(matchIdxs, 1) {
++			t.Fatalf("index=%v: matchIdxs %v after MustStop, want %d zeros", index, matchIdxs, len(tss))
++		}
++	}
++}
++
++func TestNameIndexOnlyWhenItPays(t *testing.T) {
++	f := func(config string, indexed bool) {
++		t.Helper()
++		a, err := LoadFromData([]byte(config), func([]prompb.TimeSeries) {}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		defer a.MustStop()
++		if (a.byName != nil) != indexed {
++			t.Fatalf("indexed=%v, want %v for %s", a.byName != nil, indexed, config)
++		}
++	}
++	rule := func(match string) string {
++		return fmt.Sprintf("- match: '%s'\n  interval: 1m\n  outputs: [count_samples]\n", match)
++	}
++	f(rule(`foo`), false)
++	f(rule(`foo`)+rule(`{env!=""}`), false)
++	f(rule(`foo`)+rule(`{__name__=~"bar"}`), false)
++	f(rule(`foo`)+rule(`bar`), true)
++	f(rule(`foo`)+rule(`foo{job="a"}`)+rule(`{env!=""}`), true)
++}
++
++func BenchmarkAggregatorsPushNameIndex(b *testing.B) {
++	rule := func(match, by string) string {
++		return fmt.Sprintf("- match: '%s'\n  interval: 1m\n  by: [%s]\n  outputs: [sum_samples]\n", match, by)
++	}
++	many := rule(`{env!=""}`, "job") + rule(`{env=""}`, "job")
++	for i := range 100 {
++		many += rule(fmt.Sprintf("m%d", i%20), []string{"job", "instance", "env", "job, env", "instance, env"}[i/20])
++	}
++	for _, bc := range []struct {
++		name, config string
++		names        int // series are named m0, m1 ... and come in runs of 50 per name, or one by one if names < 0
++	}{
++		{"one-indexed", rule("m0", "job"), 20},
++		{"two-same-name", rule("m0", "job") + rule("m0", "instance"), 20},
++		{"two-same-name-all-match", rule("m0", "job") + rule("m0", "instance"), 1},
++		{"two-names", rule("m0", "job") + rule("m1", "job"), 20},
++		{"two-names-interleaved", rule("m0", "job") + rule("m1", "job"), -2},
++		{"100-indexed-2-not", many, 20},
++	} {
++		var tss []prompb.TimeSeries
++		for i := range 1000 {
++			name := fmt.Sprintf("m%d", i/50%max(bc.names, 1))
++			if bc.names < 0 {
++				name = fmt.Sprintf("m%d", i%-bc.names)
++			}
++			tss = append(tss, prompb.TimeSeries{
++				Labels: []prompb.Label{
++					{Name: "__name__", Value: name},
++					{Name: "job", Value: fmt.Sprintf("job%d", i%7)},
++					{Name: "instance", Value: fmt.Sprintf("instance%d", i%50)},
++					{Name: "env", Value: fmt.Sprintf("env%d", i%3)},
++				},
++				Samples: []prompb.Sample{{Value: 1, Timestamp: 1}},
++			})
++		}
++		for _, index := range []bool{false, true} {
++			b.Run(fmt.Sprintf("%s/index=%v", bc.name, index), func(b *testing.B) {
++				a, err := LoadFromData([]byte(bc.config), func([]prompb.TimeSeries) {}, nil, "bench")
++				if err != nil {
++					b.Fatalf("cannot load config: %s", err)
++				}
++				defer a.MustStop()
++				if !index {
++					a.byName, a.indexed, a.unindexed = nil, nil, nil
++				}
++				b.ReportAllocs()
++				b.SetBytes(int64(len(tss)))
++				b.RunParallel(func(pb *testing.PB) {
++					var matchIdxs []byte
++					for pb.Next() {
++						matchIdxs = a.Push(tss, matchIdxs)
++					}
++				})
++			})
++		}
++	}
++}
 diff --git a/lib/streamaggr/outage_test.go b/lib/streamaggr/outage_test.go
 new file mode 100644
 index 000000000..df96d560f
@@ -3186,7 +3779,7 @@ index 000000000..df96d560f
 +	}
 +}
 diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
-index 3fcb9f6a3..75a81fb5f 100644
+index 3fcb9f6a3..520f4ff4f 100644
 --- a/lib/streamaggr/output.go
 +++ b/lib/streamaggr/output.go
 @@ -3,18 +3,66 @@ package streamaggr
@@ -3277,18 +3870,18 @@ index 3fcb9f6a3..75a81fb5f 100644
 -			}
 -			if ao.useSharedState {
 -				nv.green = make([]aggrValue, len(ao.configs))
+-			}
+-			for idx, ac := range ao.configs {
+-				nv.blue[idx] = ac.getValue(nil)
+-				if ao.useSharedState {
+-					nv.green[idx] = ac.getValue(nv.blue[idx].state())
+-				}
 +			nv = ao.newAggrValues()
 +			key := bytesutil.InternString(outputKey)
 +			sh.mu.Lock()
 +			if sh.m == nil {
 +				sh.m = make(map[string]*aggrValues)
  			}
--			for idx, ac := range ao.configs {
--				nv.blue[idx] = ac.getValue(nil)
--				if ao.useSharedState {
--					nv.green[idx] = ac.getValue(nv.blue[idx].state())
--				}
--			}
 -			v = nv
 -			outputKey = bytesutil.InternString(outputKey)
 -			vNew, loaded := ao.m.LoadOrStore(outputKey, v)
@@ -3315,7 +3908,7 @@ index 3fcb9f6a3..75a81fb5f 100644
  			for idx, o := range outputs {
  				o.pushSample(ao.configs[idx], sample, inputKey, deleteDeadline)
  			}
-@@ -88,49 +127,164 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+@@ -88,49 +127,187 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
  	}
  }
  
@@ -3396,7 +3989,14 @@ index 3fcb9f6a3..75a81fb5f 100644
 -			outputs = av.blue
 +		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
 +			// The first visible flush of a new output entry: emit a zero one interval earlier.
-+			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
++			at := ctx.flushTimestamp
++			if first, ok := av.firstPending(len(ao.configs), ctx.isGreen); ok {
++				// Under sample_timestamps the first sample may be written well
++				// before the flush; the zero has to precede it, or increase()
++				// would read the zero after it as a reset and count it twice.
++				at = min(first, ctx.now)
++			}
++			ao.appendResetMarkers(ctx, av, outputKey, at-ctx.a.interval.Milliseconds())
 +			av.started = true
  		}
 +		outputs = av.outputs(len(ao.configs), ctx.isGreen)
@@ -3407,9 +4007,7 @@ index 3fcb9f6a3..75a81fb5f 100644
  		if ctx.isLast {
 -			m.Delete(k)
 +			sh.removeEntry(outputKey, av)
- 		}
--		return true
--	})
++		}
 +	}
 +}
 +
@@ -3424,7 +4022,9 @@ index 3fcb9f6a3..75a81fb5f 100644
 +	for i := range outputs {
 +		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
 +			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
-+		}
+ 		}
+-		return true
+-	})
 +	}
  }
  
@@ -3465,6 +4065,22 @@ index 3fcb9f6a3..75a81fb5f 100644
 +	}
 +	nv.more = &all
 +	return nv
++}
++
++// firstPending returns the earliest input sample timestamp waiting in any of
++// av's outputs that write at sample timestamps.
++func (av *aggrValues) firstPending(n int, isGreen bool) (int64, bool) {
++	first, found := int64(0), false
++	for _, o := range av.outputs(n, isGreen) {
++		p, ok := o.(interface{ firstPending() (int64, bool) })
++		if !ok {
++			continue
++		}
++		if ts, ok := p.firstPending(); ok && (!found || ts < first) {
++			first, found = ts, true
++		}
++	}
++	return first, found
 +}
 +
 +// outputs returns the blue or green outputs of av, n being how many outputs the
@@ -3602,7 +4218,7 @@ index 000000000..597082dac
 +}
 diff --git a/lib/streamaggr/output_shards_test.go b/lib/streamaggr/output_shards_test.go
 new file mode 100644
-index 000000000..e3c103f78
+index 000000000..c4c62f9a5
 --- /dev/null
 +++ b/lib/streamaggr/output_shards_test.go
 @@ -0,0 +1,191 @@
@@ -3786,12 +4402,12 @@ index 000000000..e3c103f78
 +// Without shared state there is no green half, as before the entry was
 +// flattened, and a single output is held in the entry itself.
 +func TestAggrValuesWithoutSharedState(t *testing.T) {
-+	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig()}}
++	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(false)}}
 +	av := one.newAggrValues()
 +	if av.more != nil || len(av.outputs(1, false)) != 1 || av.outputs(1, true) != nil {
 +		t.Fatalf("single output: more=%v, blue %d, green %v", av.more != nil, len(av.outputs(1, false)), av.outputs(1, true))
 +	}
-+	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(), newSumSamplesTotalAggrConfig()}}
++	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(false), newSumSamplesTotalAggrConfig(false)}}
 +	av = two.newAggrValues()
 +	if len(av.outputs(2, false)) != 2 || av.outputs(2, true) != nil {
 +		t.Fatalf("two outputs: blue %d, green %v", len(av.outputs(2, false)), av.outputs(2, true))
@@ -4194,6 +4810,240 @@ index 000000000..db2faecaf
 +		}
 +	})
 +}
+diff --git a/lib/streamaggr/sample_timestamps_test.go b/lib/streamaggr/sample_timestamps_test.go
+new file mode 100644
+index 000000000..49a20b7f2
+--- /dev/null
++++ b/lib/streamaggr/sample_timestamps_test.go
+@@ -0,0 +1,228 @@
++package streamaggr
++
++import (
++	"sort"
++	"strings"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// latePush is a push made at wall time at of samples scraped at sampleAt, both
++// relative to the start; an aggregator that has fallen behind makes them apart.
++type latePush struct {
++	at, sampleAt time.Duration
++	metrics      string
++}
++
++type outSample struct {
++	at    time.Duration // the output timestamp relative to the start
++	value float64
++}
++
++// runLateScenario feeds pushes to the aggregators in config under a fake clock
++// that starts on a minute and returns their output samples by metric name, in
++// timestamp order.
++func runLateScenario(t *testing.T, config string, pushes []latePush, until time.Duration) map[string][]outSample {
++	t.Helper()
++	out := map[string][]outSample{}
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var tss []prompb.TimeSeries
++		pushFunc := func(src []prompb.TimeSeries) {
++			mu.Lock()
++			tss = appendClonedTimeseries(tss, src)
++			mu.Unlock()
++		}
++		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		start := time.Now()
++		for _, p := range pushes {
++			time.Sleep(start.Add(p.at).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(p.metrics, start.Add(p.sampleAt).UnixMilli()), nil)
++		}
++		time.Sleep(start.Add(until).Sub(time.Now()))
++		a.MustStop()
++
++		mu.Lock()
++		defer mu.Unlock()
++		for _, ts := range tss {
++			name := ""
++			for _, l := range ts.Labels {
++				if l.Name == "__name__" {
++					name = l.Value
++				}
++			}
++			for _, s := range ts.Samples {
++				out[name] = append(out[name], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++			}
++		}
++		for name := range out {
++			sort.SliceStable(out[name], func(i, j int) bool { return out[name][i].at < out[name][j].at })
++		}
++	})
++	return out
++}
++
++// sumIn adds up the samples within (from, to], as sum_over_time() does after
++// VM's deduplication has kept the biggest of the samples sharing a timestamp.
++func sumIn(samples []outSample, from, to time.Duration) float64 {
++	kept := map[time.Duration]float64{}
++	for _, s := range samples {
++		if v, ok := kept[s.at]; s.at > from && s.at <= to && (!ok || s.value > v) {
++			kept[s.at] = s.value
++		}
++	}
++	var sum float64
++	for _, v := range kept {
++		sum += v
++	}
++	return sum
++}
++
++// increaseIn is the increase of a counter over (from, to]: the last value at or
++// before to minus the last value at or before from. VM keeps the biggest of
++// samples sharing a timestamp, and so does this.
++func increaseIn(samples []outSample, from, to time.Duration) float64 {
++	last := func(at time.Duration) float64 {
++		var v float64
++		lastAt, found := time.Duration(0), false
++		for _, s := range samples {
++			if s.at > at {
++				break
++			}
++			if !found || s.at > lastAt || s.value > v {
++				v, lastAt, found = s.value, s.at, true
++			}
++		}
++		return v
++	}
++	return last(to) - last(from)
++}
++
++// Rounds the aggregator processes four minutes late still count towards the
++// minutes they were scraped in, and a sum arriving for a minute already written
++// adds to it instead of replacing it.
++func TestSampleTimestampsSumSamplesKeepsTheScrapeMinute(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
++	pushes := []latePush{
++		// Rounds scraped at minutes 1 to 4, all processed at 5m10s.
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 1 * time.Minute, metrics: `foo 1`},
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 2`},
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 3`},
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 4 * time.Minute, metrics: `foo 4`},
++		// Another target's share of minute 2 arrives after minute 2 was written.
++		{at: 6*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 20`},
++	}
++	got := runLateScenario(t, cfg, pushes, 8*time.Minute)["foo"]
++	for m, want := range map[int]float64{1: 1, 2: 22, 3: 3, 4: 4, 5: 0, 6: 0} {
++		to := time.Duration(m) * time.Minute
++		if sum := sumIn(got, to-time.Minute, to); sum != want {
++			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
++		}
++	}
++}
++
++// Eleven rounds processed at once, eleven minutes late, land each in its own
++// minute: the increase over any window is exactly the rounds scraped in it, and
++// the counter never goes back. A heartbeat due while the aggregator was stuck
++// does not push the series ahead of the rounds still to come.
++func TestSampleTimestampsTotalAttributesLateRoundsToTheirMinute(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
++	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: `foo 1`}}
++	for i := 1; i <= 11; i++ {
++		pushes = append(pushes, latePush{at: 12*time.Minute + 5*time.Second, sampleAt: time.Duration(i) * time.Minute, metrics: `foo 1`})
++	}
++	got := runLateScenario(t, cfg, pushes, 14*time.Minute)["foo"]
++	for i := 1; i < len(got); i++ {
++		if got[i].value < got[i-1].value && got[i].value != 0 {
++			t.Fatalf("the counter goes back from %v to %v: %v", got[i-1], got[i], got)
++		}
++	}
++	if inc := increaseIn(got, 0, 3*time.Minute); inc != 3 {
++		t.Errorf("increase over (0, 3m] is %v, want 3 (rounds 1-3); samples %v", inc, got)
++	}
++	if inc := increaseIn(got, 0, 5*time.Minute); inc != 5 {
++		t.Errorf("increase over (0, 5m] is %v, want 5 (rounds 1-5); samples %v", inc, got)
++	}
++	if inc := increaseIn(got, 5*time.Minute, 11*time.Minute); inc != 6 {
++		t.Errorf("increase over (5m, 11m] is %v, want 6 (rounds 6-11); samples %v", inc, got)
++	}
++}
++
++// One target's round 2 is processed after round 3 was written. It cannot be
++// written at 2m, after 3m in the series: the counter would go back. It goes to
++// 3m, off by the gap between the two targets rather than lost or misplaced.
++func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  sample_timestamps: true\n"
++	pushes := []latePush{
++		{at: 3*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 1`},
++		{at: 4*time.Minute + 30*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 1`},
++	}
++	got := runLateScenario(t, cfg, pushes, 6*time.Minute)["foo"]
++	for i := 1; i < len(got); i++ {
++		if got[i].value < got[i-1].value {
++			t.Fatalf("the counter goes back from %v to %v: %v", got[i-1], got[i], got)
++		}
++	}
++	if inc := increaseIn(got, 0, 6*time.Minute); inc != 2 {
++		t.Fatalf("increase is %v, want 2; samples %v", inc, got)
++	}
++}
++
++// The zero written before the first sample of a new output precedes it even
++// when that sample is minutes older than the flush that writes it; a zero after
++// it would read as a reset and count the value twice.
++func TestSampleTimestampsResetMarkerPrecedesTheFirstSample(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
++	got := runLateScenario(t, cfg, []latePush{{at: 7*time.Minute + 5*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 5`}}, 9*time.Minute)["foo"]
++	if len(got) < 2 || got[0].value != 0 || got[1].value != 5 || got[0].at >= got[1].at || got[1].at != 2*time.Minute {
++		t.Fatalf("want a zero, then 5 at 2m; got %v", got)
++	}
++	if inc := increaseIn(got, 0, 9*time.Minute); inc != 5 {
++		t.Fatalf("increase is %v, want 5; samples %v", inc, got)
++	}
++}
++
++func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
++	for _, cfg := range []string{
++		"- match: foo\n  interval: 1m\n  outputs: [total]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
++	} {
++		a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, nil, "test")
++		if err == nil {
++			a.MustStop()
++			t.Errorf("accepted %q", strings.ReplaceAll(cfg, "\n", " "))
++		}
++	}
++}
++
++// The global option is one flag over a whole config: it leaves alone the
++// aggregations it cannot apply to, such as a gauge de-duplicated per interval,
++// and takes the rest.
++func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n" +
++		"- match: bar\n  interval: 1m\n  dedup_interval: 60s\n  outputs: [sum_samples]\n" +
++		"- match: baz\n  interval: 1m\n  outputs: [max]\n"
++	a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, &Options{SampleTimestamps: true}, "test")
++	if err != nil {
++		t.Fatalf("the global option refused the config: %s", err)
++	}
++	defer a.MustStop()
++	for i, want := range []bool{true, false, false} {
++		if got := a.as[i].sampleTimestamps; got != want {
++			t.Errorf("aggregation %d: sample timestamps %v, want %v", i, got, want)
++		}
++	}
++}
 diff --git a/lib/streamaggr/std.go b/lib/streamaggr/std.go
 index af259b8c0..2128494f6 100644
 --- a/lib/streamaggr/std.go
@@ -4208,7 +5058,7 @@ index af259b8c0..2128494f6 100644
 +// costs a hash and two string compares per label per sample, for nothing.
 +func (*stdAggrConfig) needsInputKey() bool { return false }
 diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
-index 2c9ccc38d..d8910ea3c 100644
+index 2c9ccc38d..8ca380afe 100644
 --- a/lib/streamaggr/streamaggr.go
 +++ b/lib/streamaggr/streamaggr.go
 @@ -47,6 +47,7 @@ var supportedOutputs = []string{
@@ -4219,7 +5069,21 @@ index 2c9ccc38d..d8910ea3c 100644
  	"total",
  	"total_prometheus",
  	"unique_samples",
-@@ -184,6 +185,39 @@ type Config struct {
+@@ -145,6 +146,13 @@ type Options struct {
+ 
+ 	// EnableWindows enables aggregation in windows
+ 	EnableWindows bool
++
++	// SampleTimestamps writes sum_samples and sum_samples_total at the timestamps
++	// of the input samples instead of at the flush, so an input processed late
++	// still counts towards the interval it was scraped in.
++	//
++	// This option can be overridden individually per each aggregation via sample_timestamps option.
++	SampleTimestamps bool
+ }
+ 
+ // Config is a configuration for a single stream aggregation.
+@@ -184,6 +192,39 @@ type Config struct {
  	// This parameter is relevant only for the following outputs: total, total_prometheus, increase, increase_prometheus, and histogram_bucket.
  	IgnoreFirstSampleInterval string `yaml:"ignore_first_sample_interval,omitempty"`
  
@@ -4259,7 +5123,250 @@ index 2c9ccc38d..d8910ea3c 100644
  	// Outputs is a list of output aggregate functions to produce.
  	//
  	// The following names are allowed:
-@@ -401,6 +435,7 @@ type aggregator struct {
+@@ -255,12 +296,23 @@ type Config struct {
+ 
+ 	// EnableWindows enables aggregation in windows
+ 	EnableWindows *bool `yaml:"enable_windows,omitempty"`
++
++	// SampleTimestamps writes the outputs at the timestamps of the input samples instead of at the flush.
++	SampleTimestamps *bool `yaml:"sample_timestamps,omitempty"`
+ }
+ 
+ // Aggregators aggregates metrics passed to Push and calls pushFunc for aggregated data.
+ type Aggregators struct {
+ 	as []*aggregator
+ 
++	// byName maps a metric name to the indexes in as of the aggregators whose match
++	// can select only series with this name or a few other names; unindexed holds
++	// the rest. Push hands a series only to the aggregators listed for its name
++	// and to unindexed. byName is nil if too few aggregators can be indexed.
++	byName    map[string][]int
++	indexed   []int
++	unindexed []*aggregator
++
+ 	// configData contains marshaled configs.
+ 	// It is used in Equal() for comparing Aggregators.
+ 	configData []byte
+@@ -309,14 +361,50 @@ func loadFromData(data []byte, filePath string, pushFunc PushFunc, opts *Options
+ 	}
+ 
+ 	metrics.RegisterSet(ms)
++	byName, indexed, unindexed := indexAggregatorsByName(as)
+ 	return &Aggregators{
+ 		as:         as,
++		byName:     byName,
++		indexed:    indexed,
++		unindexed:  unindexed,
+ 		configData: configData,
+ 		filePath:   filePath,
+ 		ms:         ms,
+ 	}, nil
+ }
+ 
++// minIndexedAggregators is the number of aggregators with names in their match
++// from which indexing them pays for looking up the name of every input series.
++const minIndexedAggregators = 2
++
++// indexAggregatorsByName maps metric names to the indexes in as of the aggregators
++// whose match can select only series with these names, returns the indexes of
++// these aggregators, and the other aggregators in unindexed. It returns nil, nil,
++// nil if fewer than minIndexedAggregators can be indexed.
++func indexAggregatorsByName(as []*aggregator) (map[string][]int, []int, []*aggregator) {
++	byName := make(map[string][]int)
++	var indexed []int
++	var unindexed []*aggregator
++	for i, a := range as {
++		names := a.match.MetricNames()
++		if len(names) == 0 {
++			unindexed = append(unindexed, a)
++			continue
++		}
++		indexed = append(indexed, i)
++		for _, name := range names {
++			// Names may repeat; an aggregator must get each series only once.
++			if idxs := byName[name]; len(idxs) == 0 || idxs[len(idxs)-1] != i {
++				byName[name] = append(idxs, i)
++			}
++		}
++	}
++	if len(indexed) < minIndexedAggregators {
++		return nil, nil, nil
++	}
++	return byName, indexed, unindexed
++}
++
+ // IsEnabled returns true if Aggregators has at least one configured aggregator
+ func (a *Aggregators) IsEnabled() bool {
+ 	if a == nil {
+@@ -368,13 +456,166 @@ func (a *Aggregators) Push(tss []prompb.TimeSeries, matchIdxs []byte) []byte {
+ 		return matchIdxs
+ 	}
+ 
+-	for _, aggr := range a.as {
++	// MustStop sets a.as to nil, possibly while a push is in flight on a config
++	// reload: read it once, and push nothing to stopped aggregators.
++	as := a.as
++	if len(as) == 0 {
++		return matchIdxs
++	}
++
++	if a.byName == nil {
++		for _, aggr := range as {
++			aggr.Push(tss, matchIdxs)
++		}
++		return matchIdxs
++	}
++
++	for _, aggr := range a.unindexed {
+ 		aggr.Push(tss, matchIdxs)
+ 	}
++	a.pushByName(as, tss, matchIdxs)
+ 
+ 	return matchIdxs
+ }
+ 
++// pushByName pushes every series in tss to the indexed aggregators listed for its
++// name only. The other indexed aggregators could not match it.
++func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) {
++	ctx := getNameIndexCtx(len(as))
++	defer putNameIndexCtx(ctx)
++
++	// Series of a metric usually come one after another, and a few metrics may take
++	// turns, such as the buckets, the sum and the count of a histogram: look a name
++	// up once per run, and the names of the last few runs not at all.
++	runStart, runName := 0, ""
++	var runIdxs []int
++	for i := range tss {
++		name := getMetricName(tss[i].Labels)
++		if name == runName {
++			continue
++		}
++		ctx.addRun(runIdxs, runStart, i)
++		runStart, runName, runIdxs = i, name, ctx.recent.lookup(a.byName, name)
++	}
++	ctx.addRun(runIdxs, runStart, len(tss))
++
++	for _, aggrIdx := range a.indexed {
++		runs := ctx.runs[aggrIdx]
++		if len(runs) == 0 {
++			// An aggregator records the lag of every push it gets, 0 if nothing
++			// in it matched. Keep recording it for the pushes it is spared.
++			as[aggrIdx].samplesLag.Update(0)
++			continue
++		}
++		if len(runs) == 1 {
++			r := runs[0]
++			as[aggrIdx].Push(tss[r.start:r.end], matchIdxs[r.start:r.end])
++			continue
++		}
++		tssSub := ctx.tss[:0]
++		for _, r := range runs {
++			tssSub = append(tssSub, tss[r.start:r.end]...)
++		}
++		matchIdxsSub := bytesutil.ResizeNoCopyMayOverallocate(ctx.matchIdxs, len(tssSub))
++		clear(matchIdxsSub)
++		as[aggrIdx].Push(tssSub, matchIdxsSub)
++		j := 0
++		for _, r := range runs {
++			for i := r.start; i < r.end; i++ {
++				matchIdxs[i] |= matchIdxsSub[j]
++				j++
++			}
++		}
++		ctx.tss = tssSub[:0]
++		ctx.tssMaxLen = max(ctx.tssMaxLen, len(tssSub))
++		ctx.matchIdxs = matchIdxsSub
++	}
++}
++
++// getMetricName returns the value of the first __name__ label, which is the one
++// promrelabel.IfExpression matches metric names against.
++func getMetricName(labels []prompb.Label) string {
++	for _, label := range labels {
++		if label.Name == "__name__" {
++			return label.Value
++		}
++	}
++	return ""
++}
++
++// seriesRun is the series from start up to end in a pushed batch.
++type seriesRun struct {
++	start, end int
++}
++
++type nameIndexCtx struct {
++	// runs[i] holds the series to push to the aggregator #i.
++	runs [][]seriesRun
++
++	recent recentNames
++
++	tss       []prompb.TimeSeries
++	tssMaxLen int
++	matchIdxs []byte
++}
++
++// recentNames remembers the aggregators of the last few names looked up, nil for
++// names without aggregators. Its zero entries map "" to nil, which is right:
++// byName has no "".
++type recentNames struct {
++	names [4]string
++	idxs  [4][]int
++	next  int
++}
++
++func (rn *recentNames) lookup(byName map[string][]int, name string) []int {
++	for i := range rn.names {
++		if rn.names[i] == name {
++			return rn.idxs[i]
++		}
++	}
++	idxs := byName[name]
++	rn.names[rn.next], rn.idxs[rn.next] = name, idxs
++	rn.next = (rn.next + 1) % len(rn.names)
++	return idxs
++}
++
++// addRun adds the series from start up to end to the aggregators with aggrIdxs.
++func (ctx *nameIndexCtx) addRun(aggrIdxs []int, start, end int) {
++	for _, aggrIdx := range aggrIdxs {
++		runs := ctx.runs[aggrIdx]
++		if n := len(runs); n > 0 && runs[n-1].end == start {
++			runs[n-1].end = end
++		} else {
++			runs = append(runs, seriesRun{start: start, end: end})
++		}
++		ctx.runs[aggrIdx] = runs
++	}
++}
++
++func getNameIndexCtx(aggregators int) *nameIndexCtx {
++	v := nameIndexCtxPool.Get()
++	if v == nil {
++		v = &nameIndexCtx{}
++	}
++	ctx := v.(*nameIndexCtx)
++	ctx.runs = slices.Grow(ctx.runs[:0], aggregators)[:aggregators]
++	return ctx
++}
++
++func putNameIndexCtx(ctx *nameIndexCtx) {
++	for i := range ctx.runs {
++		ctx.runs[i] = ctx.runs[i][:0]
++	}
++	// Do not hold the pushed series and names.
++	ctx.recent = recentNames{}
++	clear(ctx.tss[:ctx.tssMaxLen])
++	ctx.tssMaxLen = 0
++	nameIndexCtxPool.Put(ctx)
++}
++
++var nameIndexCtxPool sync.Pool
++
+ type currentState struct {
+ 
+ 	// isGreen defines a state, where data sample with minDeadline < timestamp < maxDeadline will be aggregated
+@@ -401,10 +642,17 @@ type aggregator struct {
  	inputRelabeling   *promrelabel.ParsedConfigs
  	outputRelabeling  *promrelabel.ParsedConfigs
  	stalenessInterval time.Duration
@@ -4267,7 +5374,17 @@ index 2c9ccc38d..d8910ea3c 100644
  
  	keepMetricNames  bool
  	ignoreOldSamples bool
-@@ -446,6 +481,7 @@ type aggregator struct {
+ 	enableWindows    bool
++	sampleTimestamps bool
++
++	// watermark is the latest input sample timestamp seen, and flushSeq counts
++	// the flushes; both are for sample_timestamps.
++	watermark atomic.Int64
++	flushSeq  atomic.Int64
+ 
+ 	by                  []string
+ 	without             []string
+@@ -446,6 +694,7 @@ type aggregator struct {
  	samplesLag    *metrics.Histogram
  
  	flushTimeouts     *metrics.Counter
@@ -4275,7 +5392,7 @@ index 2c9ccc38d..d8910ea3c 100644
  	ignoredOldSamples *metrics.Counter
  	ignoredNaNSamples *metrics.Counter
  	matchedSamples    *metrics.Counter
-@@ -494,6 +530,22 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -494,6 +743,22 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  		return nil, fmt.Errorf("interval=%s must be a multiple of dedup_interval=%s", interval, dedupInterval)
  	}
  
@@ -4298,7 +5415,26 @@ index 2c9ccc38d..d8910ea3c 100644
  	// check cfg.StalenessInterval
  	stalenessInterval := interval * 2
  	if cfg.StalenessInterval != "" {
-@@ -595,9 +647,11 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -581,6 +846,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		enableWindows = *v
+ 	}
+ 
++	// The global option applies where it can, so one flag covers a config that
++	// also has aggregations it cannot apply to; set on an aggregation, it has to.
++	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval) == nil
++	if v := cfg.SampleTimestamps; v != nil {
++		sampleTimestamps = *v
++		if sampleTimestamps {
++			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval); err != nil {
++				return nil, err
++			}
++		}
++	}
++
+ 	// Initialize common metric labels
+ 	name := cfg.Name
+ 	if name == "" {
+@@ -595,18 +872,43 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  	useInputKey := dedupInterval <= 0
  	useSharedState := enableWindows && useInputKey
  	aggrOutputs := &aggrOutputs{
@@ -4313,7 +5449,10 @@ index 2c9ccc38d..d8910ea3c 100644
  	}
  	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
  	for i, output := range cfg.Outputs {
-@@ -607,6 +661,29 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+-		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval)
++		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, sampleTimestamps)
+ 		if err != nil {
+ 			return nil, err
  		}
  		aggrOutputs.configs[i] = ac
  	}
@@ -4343,8 +5482,11 @@ index 2c9ccc38d..d8910ea3c 100644
  	outputsLabels := make([]string, 0, len(outputsSeen))
  	for o := range outputsSeen {
  		outputsLabels = append(outputsLabels, o)
-@@ -637,6 +714,8 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -635,8 +937,11 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		keepMetricNames:   keepMetricNames,
+ 		ignoreOldSamples:  ignoreOldSamples,
  		enableWindows:     enableWindows,
++		sampleTimestamps:  sampleTimestamps,
  		stalenessInterval: stalenessInterval,
  
 +		outputHeartbeatInterval: outputHeartbeatInterval,
@@ -4352,7 +5494,7 @@ index 2c9ccc38d..d8910ea3c 100644
  		by:                  by,
  		without:             without,
  		aggregateOnlyByTime: aggregateOnlyByTime,
-@@ -655,6 +734,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -655,6 +960,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  
  		matchedSamples:    ms.NewCounter(fmt.Sprintf(`vm_streamaggr_matched_samples_total{%s}`, metricLabels)),
  		flushTimeouts:     ms.NewCounter(fmt.Sprintf(`vm_streamaggr_flush_timeouts_total{%s}`, metricLabels)),
@@ -4360,16 +5502,41 @@ index 2c9ccc38d..d8910ea3c 100644
  		ignoredNaNSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="nan",%s}`, metricLabels)),
  		ignoredOldSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="too_old",%s}`, metricLabels)),
  	}
-@@ -778,6 +858,8 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+@@ -713,7 +1019,21 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 	return a, nil
+ }
+ 
+-func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration) (aggrConfig, error) {
++// sampleTimestampsApply returns why sample_timestamps cannot apply to an
++// aggregation, or nil if it can.
++func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration) error {
++	if enableWindows || dedupInterval > 0 {
++		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
++	}
++	for _, o := range outputs {
++		if o != "sum_samples" && o != "sum_samples_total" {
++			return fmt.Errorf("`sample_timestamps` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
++		}
++	}
++	return nil
++}
++
++func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, sampleTimestamps bool) (aggrConfig, error) {
+ 	// check for duplicated output
+ 	if _, ok := outputsSeen[output]; ok {
+ 		return nil, fmt.Errorf("`outputs` list contains duplicate aggregation function: %s", output)
+@@ -777,7 +1097,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+ 	case "stdvar":
  		return newStdvarAggrConfig(), nil
  	case "sum_samples":
- 		return newSumSamplesAggrConfig(), nil
+-		return newSumSamplesAggrConfig(), nil
++		return newSumSamplesAggrConfig(sampleTimestamps), nil
 +	case "sum_samples_total":
-+		return newSumSamplesTotalAggrConfig(), nil
++		return newSumSamplesTotalAggrConfig(sampleTimestamps), nil
  	case "total":
  		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
  	case "total_prometheus":
-@@ -848,6 +930,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+@@ -848,6 +1170,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
  			} else {
  				a.flush(pf, flushTime, cs, false)
  			}
@@ -4379,7 +5546,7 @@ index 2c9ccc38d..d8910ea3c 100644
  			for time.Now().After(flushTime) {
  				flushTime = flushTime.Add(a.interval)
  			}
-@@ -885,6 +970,14 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+@@ -885,6 +1210,14 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
  	if skipIncompleteFlush || ignoreFirstIntervals > 0 {
  		pf = nil
  	}
@@ -4394,7 +5561,7 @@ index 2c9ccc38d..d8910ea3c 100644
  	a.flush(pf, flushTime, cs, true)
  }
  
-@@ -965,6 +1058,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+@@ -965,12 +1298,13 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  	deleteDeadlineMsec := deleteDeadline.UnixMilli()
  
  	minDeadline := a.minDeadline.Load()
@@ -4402,7 +5569,14 @@ index 2c9ccc38d..d8910ea3c 100644
  	dropLabels := a.dropInputLabels
  	ignoreOldSamples := a.ignoreOldSamples
  	enableWindows := a.enableWindows
-@@ -998,7 +1092,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	cs := a.cs.Load()
+ 
+-	var maxLagMsec int64
++	var maxLagMsec, maxTimestamp int64
+ 	for idx, ts := range tss {
+ 		if !a.match.Match(ts.Labels) {
+ 			continue
+@@ -998,7 +1332,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  		}
  
  		bufLen := len(buf)
@@ -4411,7 +5585,28 @@ index 2c9ccc38d..d8910ea3c 100644
  		// key remains valid only by the end of this function and can't be reused after
  		// do not intern key because number of unique keys could be too high
  		key := bytesutil.ToUnsafeString(buf[bufLen:])
-@@ -1057,13 +1151,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+@@ -1017,6 +1351,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 			if lagMsec > maxLagMsec {
+ 				maxLagMsec = lagMsec
+ 			}
++			maxTimestamp = max(maxTimestamp, s.Timestamp)
+ 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
+ 				ctx.green = append(ctx.green, pushSample{
+ 					key:       key,
+@@ -1038,6 +1373,12 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 		a.muFlushAfter.Unlock()
+ 	}
+ 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
++	for {
++		wm := a.watermark.Load()
++		if maxTimestamp <= wm || a.watermark.CompareAndSwap(wm, maxTimestamp) {
++			break
++		}
++	}
+ 
+ 	ctx.buf = buf
+ 
+@@ -1057,13 +1398,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  	}
  }
  
@@ -4435,7 +5630,7 @@ index 2c9ccc38d..d8910ea3c 100644
  	return dst
  }
  
-@@ -1078,6 +1179,7 @@ type pushCtx struct {
+@@ -1078,6 +1426,7 @@ type pushCtx struct {
  	inputLabels  promutil.Labels
  	outputLabels promutil.Labels
  	buf          []byte
@@ -4443,7 +5638,38 @@ index 2c9ccc38d..d8910ea3c 100644
  }
  
  func (ctx *pushCtx) reset() {
-@@ -1230,6 +1332,10 @@ func (ctx *flushCtx) flushSeries() {
+@@ -1144,6 +1493,9 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
+ 	ctx.pushFunc = pushFunc
+ 	ctx.flushTimestamp = flushTimestamp
+ 	ctx.isLast = isLast
++	ctx.now = time.Now().UnixMilli()
++	ctx.watermark = a.watermark.Load()
++	ctx.seq = a.flushSeq.Add(1)
+ 	return ctx
+ }
+ 
+@@ -1162,6 +1514,12 @@ type flushCtx struct {
+ 	isGreen        bool
+ 	isLast         bool
+ 
++	// now, watermark and seq are for sample_timestamps: the wall clock no output
++	// is stamped after, the latest input sample timestamp, and which flush this is.
++	now       int64
++	watermark int64
++	seq       int64
++
+ 	tss     []prompb.TimeSeries
+ 	labels  []prompb.Label
+ 	samples []prompb.Sample
+@@ -1174,6 +1532,7 @@ func (ctx *flushCtx) reset() {
+ 	ctx.isGreen = false
+ 	ctx.isLast = false
+ 	ctx.flushTimestamp = 0
++	ctx.now, ctx.watermark, ctx.seq = 0, 0, 0
+ 	ctx.resetSeries()
+ }
+ 
+@@ -1230,6 +1589,10 @@ func (ctx *flushCtx) flushSeries() {
  }
  
  func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
@@ -4454,7 +5680,7 @@ index 2c9ccc38d..d8910ea3c 100644
  	labelsLen := len(ctx.labels)
  	samplesLen := len(ctx.samples)
  	ctx.labels = decompressLabels(ctx.labels, key)
-@@ -1237,7 +1343,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+@@ -1237,7 +1600,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
  		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
  	}
  	ctx.samples = append(ctx.samples, prompb.Sample{
@@ -4476,23 +5702,138 @@ index 01a4f5423..0fe01bcf7 100644
  	"total_prometheus",
  	"unique_samples",
 diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
-index 8ec63e679..8b068c6d6 100644
+index 8ec63e679..58dc1455a 100644
 --- a/lib/streamaggr/sum_samples.go
 +++ b/lib/streamaggr/sum_samples.go
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,11 @@
  package streamaggr
  
 +import (
++	"cmp"
 +	"math"
++	"slices"
 +)
 +
  type sumSamplesAggrValue struct {
  	sum float64
  }
-@@ -26,3 +30,108 @@ type sumSamplesAggrConfig struct{}
- func (*sumSamplesAggrConfig) getValue(_ any) aggrValue {
+@@ -17,12 +23,286 @@ func (*sumSamplesAggrValue) state() any {
+ 	return nil
+ }
+ 
+-func newSumSamplesAggrConfig() aggrConfig {
+-	return &sumSamplesAggrConfig{}
++func newSumSamplesAggrConfig(sampleTimestamps bool) aggrConfig {
++	return &sumSamplesAggrConfig{sampleTimestamps: sampleTimestamps}
+ }
+ 
+-type sumSamplesAggrConfig struct{}
++type sumSamplesAggrConfig struct {
++	sampleTimestamps bool
++}
+ 
+-func (*sumSamplesAggrConfig) getValue(_ any) aggrValue {
++func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
++	if c.sampleTimestamps {
++		return &sumSamplesAtValue{}
++	}
  	return &sumSamplesAggrValue{}
  }
++
++// sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
++// the interval its samples were scraped in, ending at their timestamp, rather
++// than to the one the aggregator happened to process them in.
++type sumSamplesAtValue struct {
++	pending bySampleTime
++}
++
++func (av *sumSamplesAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
++	av.pending.add(sample.timestamp, sample.value)
++}
++
++// flush writes a sum arriving after its interval has been written once already
++// as one more sample a few milliseconds earlier -- each flush backs off by its
++// own sequence number -- so the two don't share a timestamp, which
++// deduplication would keep only one of, and sum_over_time() adds them up.
++// Backing off keeps the sample within the interval, (ts - interval, ts].
++func (av *sumSamplesAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	back := ctx.seq % 1000
++	av.pending.drain(func(ts int64, sum float64) {
++		ctx.appendSeriesAt(key, "sum_samples", min(ts, ctx.now)-back, sum)
++	})
++}
++
++func (*sumSamplesAtValue) state() any { return nil }
++
++func (av *sumSamplesAtValue) firstPending() (int64, bool) { return av.pending.first() }
++
++// bySampleTime holds the input sums of one output between two flushes, one per
++// distinct sample timestamp, for sample_timestamps. Scrapes aligned to the
++// interval give every sample of a round the same timestamp, so there is one sum
++// almost always, and more only while the aggregator catches up with rounds it
++// fell behind on.
++type bySampleTime struct {
++	ts   int64 // 0: nothing pending
++	sum  float64
++	more *[]tsSum
++}
++
++type tsSum struct {
++	ts  int64
++	sum float64
++}
++
++func (p *bySampleTime) add(ts int64, v float64) {
++	switch {
++	case p.ts == 0:
++		p.ts, p.sum = ts, v
++	case p.ts == ts:
++		p.sum += v
++	default:
++		if p.more == nil {
++			p.more = &[]tsSum{}
++		}
++		for i := range *p.more {
++			if (*p.more)[i].ts == ts {
++				(*p.more)[i].sum += v
++				return
++			}
++		}
++		*p.more = append(*p.more, tsSum{ts, v})
++	}
++}
++
++// first is the earliest pending timestamp.
++func (p *bySampleTime) first() (int64, bool) {
++	if p.ts == 0 {
++		return 0, false
++	}
++	first := p.ts
++	if p.more != nil {
++		for _, x := range *p.more {
++			first = min(first, x.ts)
++		}
++	}
++	return first, true
++}
++
++// drain calls f for every pending sum in timestamp order and empties p.
++func (p *bySampleTime) drain(f func(ts int64, sum float64)) {
++	if p.ts == 0 {
++		return
++	}
++	if p.more == nil {
++		f(p.ts, p.sum)
++		p.ts, p.sum = 0, 0
++		return
++	}
++	all := append(*p.more, tsSum{p.ts, p.sum})
++	slices.SortFunc(all, func(a, b tsSum) int { return cmp.Compare(a.ts, b.ts) })
++	for _, x := range all {
++		f(x.ts, x.sum)
++	}
++	p.ts, p.sum, p.more = 0, 0, nil
++}
 +
 +// sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
 +// so the output is a cumulative counter.
@@ -4567,11 +5908,13 @@ index 8ec63e679..8b068c6d6 100644
 +	return av.shared
 +}
 +
-+func newSumSamplesTotalAggrConfig() aggrConfig {
-+	return &sumSamplesTotalAggrConfig{}
++func newSumSamplesTotalAggrConfig(sampleTimestamps bool) aggrConfig {
++	return &sumSamplesTotalAggrConfig{sampleTimestamps: sampleTimestamps}
 +}
 +
-+type sumSamplesTotalAggrConfig struct{}
++type sumSamplesTotalAggrConfig struct {
++	sampleTimestamps bool
++}
 +
 +// sumSamplesTotalOwned is a value together with the shared state it owns when
 +// no other value shares it, so the pair costs one allocation instead of two.
@@ -4580,7 +5923,14 @@ index 8ec63e679..8b068c6d6 100644
 +	shared sumSamplesTotalShared
 +}
 +
-+func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
++func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
++	if c.sampleTimestamps {
++		// sample_timestamps is refused together with enable_windows, the only
++		// source of shared state.
++		o := &sumSamplesTotalAtOwned{}
++		o.v.shared = &o.shared
++		return &o.v
++	}
 +	if shared, ok := s.(*sumSamplesTotalShared); ok {
 +		return &sumSamplesTotalAggrValue{shared: shared}
 +	}
@@ -4588,6 +5938,66 @@ index 8ec63e679..8b068c6d6 100644
 +	o.v.shared = &o.shared
 +	return &o.v
 +}
++
++// sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
++// writes the total as of each scrape round it has samples of, in timestamp
++// order, so an increment lands in the interval it was scraped in even when the
++// aggregator processes it minutes later. The written timestamps never go back
++// -- a counter that did would look reset -- so a round whose samples arrive
++// after a later round was written goes to that later one: the error is bounded
++// by how far the targets' rounds are apart in processing, not by how far the
++// aggregator is behind.
++//
++// An unchanged total is written again only as the heartbeat, and then at the
++// latest sample timestamp the aggregator has seen rather than at the wall
++// clock: while it is behind, a heartbeat at the wall clock would push the
++// series ahead of the rounds still to come, and they would all land there.
++type sumSamplesTotalAtValue struct {
++	shared  *sumSamplesTotalShared
++	pending bySampleTime
++}
++
++type sumSamplesTotalAtOwned struct {
++	v      sumSamplesTotalAtValue
++	shared sumSamplesTotalShared
++}
++
++func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
++	av.pending.add(sample.timestamp, sample.value)
++}
++
++func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	sh := av.shared
++	wrote := false
++	av.pending.drain(func(ts int64, sum float64) {
++		sh.total += sum
++		if sh.written && sh.total == sh.lastWritten {
++			return
++		}
++		at := max(min(ts, ctx.now), sh.lastWrittenAt)
++		ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
++		sh.lastWritten, sh.lastWrittenAt, sh.written = sh.total, at, true
++		wrote = true
++	})
++	if !wrote && sh.written {
++		at := min(ctx.watermark, ctx.now)
++		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
++		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
++			ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
++			sh.lastWrittenAt = at
++		} else {
++			ctx.a.skippedOutputs.Inc()
++		}
++	}
++	if math.Abs(sh.total) >= (1 << 53) {
++		// It is time to reset the entry, since it starts losing float64 precision
++		sh.total = 0
++	}
++}
++
++func (av *sumSamplesTotalAtValue) state() any { return av.shared }
++
++func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }
 +
 +// needsInputKey reports that this output looks only at the sample, so the key
 +// need not carry the labels the aggregation groups away -- compressing them

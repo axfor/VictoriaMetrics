@@ -1,0 +1,889 @@
+From fd7c4e1bfca47ec4d798b9c064af1960c00b4fdb Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Fri, 2 Oct 2026 09:25:18 -0700
+Subject: [PATCH 27/27] lib/streamaggr: write sums at the timestamps of the
+ samples, not of the flush
+
+Stream aggregation stamps every output with the time of the flush that
+writes it. When vmagent falls behind, a round scraped at 10:59 is
+aggregated and written at 11:02, and its usage counts towards the wrong
+minute, or the wrong hour once a recording rule cuts the series by hour.
+
+The new sample_timestamps option, also set for all aggregations it applies
+to by -remoteWrite.streamAggr.sampleTimestamps and -streamAggr.sampleTimestamps,
+writes sum_samples and sum_samples_total at the timestamps of their input
+samples instead:
+
+- sum_samples writes one sum per distinct sample timestamp. A sum arriving
+  after its interval was already written goes out as one more sample a few
+  milliseconds earlier, so that deduplication keeps both and
+  sum_over_time() adds them up.
+- sum_samples_total writes the total as of each scrape round, in timestamp
+  order. Written timestamps never go back, which would look like a counter
+  reset, so a round that arrives after a later one was written goes to that
+  later one: the error is bounded by how far the targets are apart, not by
+  how far the aggregator is behind. The heartbeat goes out at the latest
+  sample timestamp seen rather than at the wall clock, and the reset marker
+  before a new output precedes its first sample.
+
+The per-aggregation option refuses outputs, enable_windows and
+dedup_interval it cannot honour; the flags skip such aggregations. Without
+the option nothing changes, and the new state lives in separate types, so
+the default path keeps its memory per output series.
+
+The scrape loop also stamped a round with its tick even when the tick had
+waited behind a slow previous round, counting the time in between towards
+the past. A tick more than a tenth of the interval late is now replaced by
+the time the scrape actually starts.
+---
+ app/vmagent/remotewrite/streamaggr.go         |   8 +
+ .../stream-aggregation/configuration.md       |  10 +
+ lib/promscrape/scrapework.go                  |  14 +-
+ lib/promscrape/scrapework_tick_test.go        |  18 ++
+ lib/streamaggr/input_key_test.go              |   2 +-
+ lib/streamaggr/output.go                      |  25 +-
+ lib/streamaggr/output_shards_test.go          |   4 +-
+ lib/streamaggr/sample_timestamps_test.go      | 228 ++++++++++++++++++
+ lib/streamaggr/streamaggr.go                  |  70 +++++-
+ lib/streamaggr/sum_samples.go                 | 187 +++++++++++++-
+ 10 files changed, 548 insertions(+), 18 deletions(-)
+ create mode 100644 lib/promscrape/scrapework_tick_test.go
+ create mode 100644 lib/streamaggr/sample_timestamps_test.go
+
+diff --git a/app/vmagent/remotewrite/streamaggr.go b/app/vmagent/remotewrite/streamaggr.go
+index f820486c9..aaab51096 100644
+--- a/app/vmagent/remotewrite/streamaggr.go
++++ b/app/vmagent/remotewrite/streamaggr.go
+@@ -38,6 +38,9 @@ var (
+ 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
++	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
++		"at the timestamps of the input samples instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
++		"Can be overridden per aggregation via sample_timestamps option")
+ 
+ 	// Per URL config
+ 	streamAggrConfig = flagutil.NewArrayString("remoteWrite.streamAggr.config", "Optional path to file with stream aggregation config for the corresponding -remoteWrite.url. "+
+@@ -65,6 +68,9 @@ var (
+ 	streamAggrEnableWindows = flagutil.NewArrayBool("remoteWrite.streamAggr.enableWindows", "Enables aggregation within fixed windows for all remote write's aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
++	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
++		"write sum_samples and sum_samples_total at the timestamps of the input samples instead of at the flush, so a sample processed late "+
++		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
+ )
+ 
+ // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
+@@ -214,6 +220,7 @@ func newStreamAggrConfigGlobal() (*streamaggr.Aggregators, error) {
+ 		IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
+ 		KeepInput:            *streamAggrGlobalKeepInput,
+ 		EnableWindows:        *streamAggrGlobalEnableWindows,
++		SampleTimestamps:     *streamAggrGlobalSampleTimestamps,
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushTimeSeriesToRemoteStoragesTrackDropped, opts, "global")
+@@ -248,6 +255,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
+ 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
+ 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
+ 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
++		SampleTimestamps:     streamAggrSampleTimestamps.GetOptionalArg(idx),
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)
+diff --git a/docs/victoriametrics/stream-aggregation/configuration.md b/docs/victoriametrics/stream-aggregation/configuration.md
+index 28204b861..2cf50096b 100644
+--- a/docs/victoriametrics/stream-aggregation/configuration.md
++++ b/docs/victoriametrics/stream-aggregation/configuration.md
+@@ -119,6 +119,16 @@ specified individually per each `-remoteWrite.url`:
+   #
+   # reset_marker_on_stale: false
+ 
++  # sample_timestamps instructs to write sum_samples and sum_samples_total at the timestamps of the input
++  # samples instead of at the flush, so samples processed late, when vmagent falls behind, still count
++  # towards the interval they were scraped in rather than the one they were processed in.
++  # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
++  # enable_windows or dedup_interval, which decide timestamps of their own.
++  # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
++  # command-line flags are set; the flags enable it for the aggregations it supports and leave the others alone.
++  #
++  # sample_timestamps: false
++
+   # without is an optional list of labels, which must be removed from the output aggregation.
+   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
+   #
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index 99d203447..0faf23f80 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -358,7 +358,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
+ 			}
+ 			return
+ 		case tt := <-ticker.C:
+-			t := tt.UnixMilli()
++			t := tickTime(tt.UnixMilli(), time.Now().UnixMilli(), scrapeInterval.Milliseconds())
+ 			if d := math.Abs(float64(t - timestamp)); d > 0 && d/float64(scrapeInterval.Milliseconds()) > 0.1 {
+ 				// Too big jitter. Adjust timestamp
+ 				timestamp = t
+@@ -368,6 +368,18 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
+ 	}
+ }
+ 
++// tickTime returns when the scrape for a tick fired at tick starts. A tick that
++// waited while the previous scrape was still being processed is stale: the
++// target is scraped now, and stamping its samples with the tick would count
++// everything that happened in between towards the past -- with increments,
++// into an earlier interval, or an earlier hour.
++func tickTime(tick, now, interval int64) int64 {
++	if now-tick > interval/10 {
++		return now
++	}
++	return tick
++}
++
+ func (sw *scrapeWork) logError(s string) {
+ 	if !*suppressScrapeErrors {
+ 		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s; "+
+diff --git a/lib/promscrape/scrapework_tick_test.go b/lib/promscrape/scrapework_tick_test.go
+new file mode 100644
+index 000000000..c509a9b64
+--- /dev/null
++++ b/lib/promscrape/scrapework_tick_test.go
+@@ -0,0 +1,18 @@
++package promscrape
++
++import "testing"
++
++// A scrape that took longer than the interval leaves the next tick waiting.
++// Its samples are scraped when the loop gets to it, and have to be stamped then.
++func TestTickTimeUsesTheRealTimeForAStaleTick(t *testing.T) {
++	const minute = 60_000
++	if got := tickTime(minute, minute+50, minute); got != minute {
++		t.Fatalf("an on-time tick moved to %d", got)
++	}
++	if got := tickTime(minute, minute+minute/10, minute); got != minute {
++		t.Fatalf("a tick within a tenth of the interval moved to %d", got)
++	}
++	if got := tickTime(minute, 12*minute, minute); got != 12*minute {
++		t.Fatalf("a tick left waiting 11 minutes was stamped %d, not when the scrape ran", got)
++	}
++}
+diff --git a/lib/streamaggr/input_key_test.go b/lib/streamaggr/input_key_test.go
+index 2a25fa231..369d68bca 100644
+--- a/lib/streamaggr/input_key_test.go
++++ b/lib/streamaggr/input_key_test.go
+@@ -38,7 +38,7 @@ func TestOutputsDeclareWhetherTheyNeedTheInputKey(t *testing.T) {
+ 		{"unique_samples", false},
+ 	} {
+ 		t.Run(tc.output, func(t *testing.T) {
+-			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0)
++			ac, err := newOutputConfig(tc.output, map[string]struct{}{}, false, 0, false)
+ 			if err != nil {
+ 				t.Fatalf("%s: %v", tc.output, err)
+ 			}
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index 75a81fb5f..520f4ff4f 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -192,7 +192,14 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey
+ 		}
+ 		if ao.resetMarkerOnStale && !av.started && ctx.pushFunc != nil {
+ 			// The first visible flush of a new output entry: emit a zero one interval earlier.
+-			ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp-ctx.a.interval.Milliseconds())
++			at := ctx.flushTimestamp
++			if first, ok := av.firstPending(len(ao.configs), ctx.isGreen); ok {
++				// Under sample_timestamps the first sample may be written well
++				// before the flush; the zero has to precede it, or increase()
++				// would read the zero after it as a reset and count it twice.
++				at = min(first, ctx.now)
++			}
++			ao.appendResetMarkers(ctx, av, outputKey, at-ctx.a.interval.Milliseconds())
+ 			av.started = true
+ 		}
+ 		outputs = av.outputs(len(ao.configs), ctx.isGreen)
+@@ -258,6 +265,22 @@ func (ao *aggrOutputs) newAggrValues() *aggrValues {
+ 	return nv
+ }
+ 
++// firstPending returns the earliest input sample timestamp waiting in any of
++// av's outputs that write at sample timestamps.
++func (av *aggrValues) firstPending(n int, isGreen bool) (int64, bool) {
++	first, found := int64(0), false
++	for _, o := range av.outputs(n, isGreen) {
++		p, ok := o.(interface{ firstPending() (int64, bool) })
++		if !ok {
++			continue
++		}
++		if ts, ok := p.firstPending(); ok && (!found || ts < first) {
++			first, found = ts, true
++		}
++	}
++	return first, found
++}
++
+ // outputs returns the blue or green outputs of av, n being how many outputs the
+ // aggregator has. Without shared state there are no green ones, as before.
+ func (av *aggrValues) outputs(n int, isGreen bool) []aggrValue {
+diff --git a/lib/streamaggr/output_shards_test.go b/lib/streamaggr/output_shards_test.go
+index e3c103f78..c4c62f9a5 100644
+--- a/lib/streamaggr/output_shards_test.go
++++ b/lib/streamaggr/output_shards_test.go
+@@ -178,12 +178,12 @@ func TestAggrValuesKeepBlueAndGreenApart(t *testing.T) {
+ // Without shared state there is no green half, as before the entry was
+ // flattened, and a single output is held in the entry itself.
+ func TestAggrValuesWithoutSharedState(t *testing.T) {
+-	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig()}}
++	one := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(false)}}
+ 	av := one.newAggrValues()
+ 	if av.more != nil || len(av.outputs(1, false)) != 1 || av.outputs(1, true) != nil {
+ 		t.Fatalf("single output: more=%v, blue %d, green %v", av.more != nil, len(av.outputs(1, false)), av.outputs(1, true))
+ 	}
+-	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(), newSumSamplesTotalAggrConfig()}}
++	two := &aggrOutputs{configs: []aggrConfig{newSumSamplesTotalAggrConfig(false), newSumSamplesTotalAggrConfig(false)}}
+ 	av = two.newAggrValues()
+ 	if len(av.outputs(2, false)) != 2 || av.outputs(2, true) != nil {
+ 		t.Fatalf("two outputs: blue %d, green %v", len(av.outputs(2, false)), av.outputs(2, true))
+diff --git a/lib/streamaggr/sample_timestamps_test.go b/lib/streamaggr/sample_timestamps_test.go
+new file mode 100644
+index 000000000..49a20b7f2
+--- /dev/null
++++ b/lib/streamaggr/sample_timestamps_test.go
+@@ -0,0 +1,228 @@
++package streamaggr
++
++import (
++	"sort"
++	"strings"
++	"sync"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// latePush is a push made at wall time at of samples scraped at sampleAt, both
++// relative to the start; an aggregator that has fallen behind makes them apart.
++type latePush struct {
++	at, sampleAt time.Duration
++	metrics      string
++}
++
++type outSample struct {
++	at    time.Duration // the output timestamp relative to the start
++	value float64
++}
++
++// runLateScenario feeds pushes to the aggregators in config under a fake clock
++// that starts on a minute and returns their output samples by metric name, in
++// timestamp order.
++func runLateScenario(t *testing.T, config string, pushes []latePush, until time.Duration) map[string][]outSample {
++	t.Helper()
++	out := map[string][]outSample{}
++	synctest.Test(t, func(t *testing.T) {
++		var mu sync.Mutex
++		var tss []prompb.TimeSeries
++		pushFunc := func(src []prompb.TimeSeries) {
++			mu.Lock()
++			tss = appendClonedTimeseries(tss, src)
++			mu.Unlock()
++		}
++		a, err := LoadFromData([]byte(config), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		start := time.Now()
++		for _, p := range pushes {
++			time.Sleep(start.Add(p.at).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(p.metrics, start.Add(p.sampleAt).UnixMilli()), nil)
++		}
++		time.Sleep(start.Add(until).Sub(time.Now()))
++		a.MustStop()
++
++		mu.Lock()
++		defer mu.Unlock()
++		for _, ts := range tss {
++			name := ""
++			for _, l := range ts.Labels {
++				if l.Name == "__name__" {
++					name = l.Value
++				}
++			}
++			for _, s := range ts.Samples {
++				out[name] = append(out[name], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++			}
++		}
++		for name := range out {
++			sort.SliceStable(out[name], func(i, j int) bool { return out[name][i].at < out[name][j].at })
++		}
++	})
++	return out
++}
++
++// sumIn adds up the samples within (from, to], as sum_over_time() does after
++// VM's deduplication has kept the biggest of the samples sharing a timestamp.
++func sumIn(samples []outSample, from, to time.Duration) float64 {
++	kept := map[time.Duration]float64{}
++	for _, s := range samples {
++		if v, ok := kept[s.at]; s.at > from && s.at <= to && (!ok || s.value > v) {
++			kept[s.at] = s.value
++		}
++	}
++	var sum float64
++	for _, v := range kept {
++		sum += v
++	}
++	return sum
++}
++
++// increaseIn is the increase of a counter over (from, to]: the last value at or
++// before to minus the last value at or before from. VM keeps the biggest of
++// samples sharing a timestamp, and so does this.
++func increaseIn(samples []outSample, from, to time.Duration) float64 {
++	last := func(at time.Duration) float64 {
++		var v float64
++		lastAt, found := time.Duration(0), false
++		for _, s := range samples {
++			if s.at > at {
++				break
++			}
++			if !found || s.at > lastAt || s.value > v {
++				v, lastAt, found = s.value, s.at, true
++			}
++		}
++		return v
++	}
++	return last(to) - last(from)
++}
++
++// Rounds the aggregator processes four minutes late still count towards the
++// minutes they were scraped in, and a sum arriving for a minute already written
++// adds to it instead of replacing it.
++func TestSampleTimestampsSumSamplesKeepsTheScrapeMinute(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
++	pushes := []latePush{
++		// Rounds scraped at minutes 1 to 4, all processed at 5m10s.
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 1 * time.Minute, metrics: `foo 1`},
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 2`},
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 3`},
++		{at: 5*time.Minute + 10*time.Second, sampleAt: 4 * time.Minute, metrics: `foo 4`},
++		// Another target's share of minute 2 arrives after minute 2 was written.
++		{at: 6*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 20`},
++	}
++	got := runLateScenario(t, cfg, pushes, 8*time.Minute)["foo"]
++	for m, want := range map[int]float64{1: 1, 2: 22, 3: 3, 4: 4, 5: 0, 6: 0} {
++		to := time.Duration(m) * time.Minute
++		if sum := sumIn(got, to-time.Minute, to); sum != want {
++			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
++		}
++	}
++}
++
++// Eleven rounds processed at once, eleven minutes late, land each in its own
++// minute: the increase over any window is exactly the rounds scraped in it, and
++// the counter never goes back. A heartbeat due while the aggregator was stuck
++// does not push the series ahead of the rounds still to come.
++func TestSampleTimestampsTotalAttributesLateRoundsToTheirMinute(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
++	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: `foo 1`}}
++	for i := 1; i <= 11; i++ {
++		pushes = append(pushes, latePush{at: 12*time.Minute + 5*time.Second, sampleAt: time.Duration(i) * time.Minute, metrics: `foo 1`})
++	}
++	got := runLateScenario(t, cfg, pushes, 14*time.Minute)["foo"]
++	for i := 1; i < len(got); i++ {
++		if got[i].value < got[i-1].value && got[i].value != 0 {
++			t.Fatalf("the counter goes back from %v to %v: %v", got[i-1], got[i], got)
++		}
++	}
++	if inc := increaseIn(got, 0, 3*time.Minute); inc != 3 {
++		t.Errorf("increase over (0, 3m] is %v, want 3 (rounds 1-3); samples %v", inc, got)
++	}
++	if inc := increaseIn(got, 0, 5*time.Minute); inc != 5 {
++		t.Errorf("increase over (0, 5m] is %v, want 5 (rounds 1-5); samples %v", inc, got)
++	}
++	if inc := increaseIn(got, 5*time.Minute, 11*time.Minute); inc != 6 {
++		t.Errorf("increase over (5m, 11m] is %v, want 6 (rounds 6-11); samples %v", inc, got)
++	}
++}
++
++// One target's round 2 is processed after round 3 was written. It cannot be
++// written at 2m, after 3m in the series: the counter would go back. It goes to
++// 3m, off by the gap between the two targets rather than lost or misplaced.
++func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  sample_timestamps: true\n"
++	pushes := []latePush{
++		{at: 3*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 1`},
++		{at: 4*time.Minute + 30*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 1`},
++	}
++	got := runLateScenario(t, cfg, pushes, 6*time.Minute)["foo"]
++	for i := 1; i < len(got); i++ {
++		if got[i].value < got[i-1].value {
++			t.Fatalf("the counter goes back from %v to %v: %v", got[i-1], got[i], got)
++		}
++	}
++	if inc := increaseIn(got, 0, 6*time.Minute); inc != 2 {
++		t.Fatalf("increase is %v, want 2; samples %v", inc, got)
++	}
++}
++
++// The zero written before the first sample of a new output precedes it even
++// when that sample is minutes older than the flush that writes it; a zero after
++// it would read as a reset and count the value twice.
++func TestSampleTimestampsResetMarkerPrecedesTheFirstSample(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
++	got := runLateScenario(t, cfg, []latePush{{at: 7*time.Minute + 5*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 5`}}, 9*time.Minute)["foo"]
++	if len(got) < 2 || got[0].value != 0 || got[1].value != 5 || got[0].at >= got[1].at || got[1].at != 2*time.Minute {
++		t.Fatalf("want a zero, then 5 at 2m; got %v", got)
++	}
++	if inc := increaseIn(got, 0, 9*time.Minute); inc != 5 {
++		t.Fatalf("increase is %v, want 5; samples %v", inc, got)
++	}
++}
++
++func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
++	for _, cfg := range []string{
++		"- match: foo\n  interval: 1m\n  outputs: [total]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
++	} {
++		a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, nil, "test")
++		if err == nil {
++			a.MustStop()
++			t.Errorf("accepted %q", strings.ReplaceAll(cfg, "\n", " "))
++		}
++	}
++}
++
++// The global option is one flag over a whole config: it leaves alone the
++// aggregations it cannot apply to, such as a gauge de-duplicated per interval,
++// and takes the rest.
++func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n" +
++		"- match: bar\n  interval: 1m\n  dedup_interval: 60s\n  outputs: [sum_samples]\n" +
++		"- match: baz\n  interval: 1m\n  outputs: [max]\n"
++	a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, &Options{SampleTimestamps: true}, "test")
++	if err != nil {
++		t.Fatalf("the global option refused the config: %s", err)
++	}
++	defer a.MustStop()
++	for i, want := range []bool{true, false, false} {
++		if got := a.as[i].sampleTimestamps; got != want {
++			t.Errorf("aggregation %d: sample timestamps %v, want %v", i, got, want)
++		}
++	}
++}
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index d8910ea3c..a9b4b467e 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -146,6 +146,13 @@ type Options struct {
+ 
+ 	// EnableWindows enables aggregation in windows
+ 	EnableWindows bool
++
++	// SampleTimestamps writes sum_samples and sum_samples_total at the timestamps
++	// of the input samples instead of at the flush, so an input processed late
++	// still counts towards the interval it was scraped in.
++	//
++	// This option can be overridden individually per each aggregation via sample_timestamps option.
++	SampleTimestamps bool
+ }
+ 
+ // Config is a configuration for a single stream aggregation.
+@@ -289,6 +296,9 @@ type Config struct {
+ 
+ 	// EnableWindows enables aggregation in windows
+ 	EnableWindows *bool `yaml:"enable_windows,omitempty"`
++
++	// SampleTimestamps writes the outputs at the timestamps of the input samples instead of at the flush.
++	SampleTimestamps *bool `yaml:"sample_timestamps,omitempty"`
+ }
+ 
+ // Aggregators aggregates metrics passed to Push and calls pushFunc for aggregated data.
+@@ -440,6 +450,12 @@ type aggregator struct {
+ 	keepMetricNames  bool
+ 	ignoreOldSamples bool
+ 	enableWindows    bool
++	sampleTimestamps bool
++
++	// watermark is the latest input sample timestamp seen, and flushSeq counts
++	// the flushes; both are for sample_timestamps.
++	watermark atomic.Int64
++	flushSeq  atomic.Int64
+ 
+ 	by                  []string
+ 	without             []string
+@@ -633,6 +649,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		enableWindows = *v
+ 	}
+ 
++	// The global option applies where it can, so one flag covers a config that
++	// also has aggregations it cannot apply to; set on an aggregation, it has to.
++	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval) == nil
++	if v := cfg.SampleTimestamps; v != nil {
++		sampleTimestamps = *v
++		if sampleTimestamps {
++			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval); err != nil {
++				return nil, err
++			}
++		}
++	}
++
+ 	// Initialize common metric labels
+ 	name := cfg.Name
+ 	if name == "" {
+@@ -655,7 +683,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 	}
+ 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
+ 	for i, output := range cfg.Outputs {
+-		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval)
++		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, sampleTimestamps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -712,6 +740,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		keepMetricNames:   keepMetricNames,
+ 		ignoreOldSamples:  ignoreOldSamples,
+ 		enableWindows:     enableWindows,
++		sampleTimestamps:  sampleTimestamps,
+ 		stalenessInterval: stalenessInterval,
+ 
+ 		outputHeartbeatInterval: outputHeartbeatInterval,
+@@ -793,7 +822,21 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 	return a, nil
+ }
+ 
+-func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration) (aggrConfig, error) {
++// sampleTimestampsApply returns why sample_timestamps cannot apply to an
++// aggregation, or nil if it can.
++func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration) error {
++	if enableWindows || dedupInterval > 0 {
++		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
++	}
++	for _, o := range outputs {
++		if o != "sum_samples" && o != "sum_samples_total" {
++			return fmt.Errorf("`sample_timestamps` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
++		}
++	}
++	return nil
++}
++
++func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, sampleTimestamps bool) (aggrConfig, error) {
+ 	// check for duplicated output
+ 	if _, ok := outputsSeen[output]; ok {
+ 		return nil, fmt.Errorf("`outputs` list contains duplicate aggregation function: %s", output)
+@@ -857,9 +900,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+ 	case "stdvar":
+ 		return newStdvarAggrConfig(), nil
+ 	case "sum_samples":
+-		return newSumSamplesAggrConfig(), nil
++		return newSumSamplesAggrConfig(sampleTimestamps), nil
+ 	case "sum_samples_total":
+-		return newSumSamplesTotalAggrConfig(), nil
++		return newSumSamplesTotalAggrConfig(sampleTimestamps), nil
+ 	case "total":
+ 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
+ 	case "total_prometheus":
+@@ -1064,7 +1107,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	enableWindows := a.enableWindows
+ 	cs := a.cs.Load()
+ 
+-	var maxLagMsec int64
++	var maxLagMsec, maxTimestamp int64
+ 	for idx, ts := range tss {
+ 		if !a.match.Match(ts.Labels) {
+ 			continue
+@@ -1111,6 +1154,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 			if lagMsec > maxLagMsec {
+ 				maxLagMsec = lagMsec
+ 			}
++			maxTimestamp = max(maxTimestamp, s.Timestamp)
+ 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
+ 				ctx.green = append(ctx.green, pushSample{
+ 					key:       key,
+@@ -1132,6 +1176,12 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 		a.muFlushAfter.Unlock()
+ 	}
+ 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
++	for {
++		wm := a.watermark.Load()
++		if maxTimestamp <= wm || a.watermark.CompareAndSwap(wm, maxTimestamp) {
++			break
++		}
++	}
+ 
+ 	ctx.buf = buf
+ 
+@@ -1246,6 +1296,9 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
+ 	ctx.pushFunc = pushFunc
+ 	ctx.flushTimestamp = flushTimestamp
+ 	ctx.isLast = isLast
++	ctx.now = time.Now().UnixMilli()
++	ctx.watermark = a.watermark.Load()
++	ctx.seq = a.flushSeq.Add(1)
+ 	return ctx
+ }
+ 
+@@ -1264,6 +1317,12 @@ type flushCtx struct {
+ 	isGreen        bool
+ 	isLast         bool
+ 
++	// now, watermark and seq are for sample_timestamps: the wall clock no output
++	// is stamped after, the latest input sample timestamp, and which flush this is.
++	now       int64
++	watermark int64
++	seq       int64
++
+ 	tss     []prompb.TimeSeries
+ 	labels  []prompb.Label
+ 	samples []prompb.Sample
+@@ -1276,6 +1335,7 @@ func (ctx *flushCtx) reset() {
+ 	ctx.isGreen = false
+ 	ctx.isLast = false
+ 	ctx.flushTimestamp = 0
++	ctx.now, ctx.watermark, ctx.seq = 0, 0, 0
+ 	ctx.resetSeries()
+ }
+ 
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index 8b068c6d6..58dc1455a 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -1,7 +1,9 @@
+ package streamaggr
+ 
+ import (
++	"cmp"
+ 	"math"
++	"slices"
+ )
+ 
+ type sumSamplesAggrValue struct {
+@@ -21,16 +23,116 @@ func (*sumSamplesAggrValue) state() any {
+ 	return nil
+ }
+ 
+-func newSumSamplesAggrConfig() aggrConfig {
+-	return &sumSamplesAggrConfig{}
++func newSumSamplesAggrConfig(sampleTimestamps bool) aggrConfig {
++	return &sumSamplesAggrConfig{sampleTimestamps: sampleTimestamps}
+ }
+ 
+-type sumSamplesAggrConfig struct{}
++type sumSamplesAggrConfig struct {
++	sampleTimestamps bool
++}
+ 
+-func (*sumSamplesAggrConfig) getValue(_ any) aggrValue {
++func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
++	if c.sampleTimestamps {
++		return &sumSamplesAtValue{}
++	}
+ 	return &sumSamplesAggrValue{}
+ }
+ 
++// sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
++// the interval its samples were scraped in, ending at their timestamp, rather
++// than to the one the aggregator happened to process them in.
++type sumSamplesAtValue struct {
++	pending bySampleTime
++}
++
++func (av *sumSamplesAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
++	av.pending.add(sample.timestamp, sample.value)
++}
++
++// flush writes a sum arriving after its interval has been written once already
++// as one more sample a few milliseconds earlier -- each flush backs off by its
++// own sequence number -- so the two don't share a timestamp, which
++// deduplication would keep only one of, and sum_over_time() adds them up.
++// Backing off keeps the sample within the interval, (ts - interval, ts].
++func (av *sumSamplesAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	back := ctx.seq % 1000
++	av.pending.drain(func(ts int64, sum float64) {
++		ctx.appendSeriesAt(key, "sum_samples", min(ts, ctx.now)-back, sum)
++	})
++}
++
++func (*sumSamplesAtValue) state() any { return nil }
++
++func (av *sumSamplesAtValue) firstPending() (int64, bool) { return av.pending.first() }
++
++// bySampleTime holds the input sums of one output between two flushes, one per
++// distinct sample timestamp, for sample_timestamps. Scrapes aligned to the
++// interval give every sample of a round the same timestamp, so there is one sum
++// almost always, and more only while the aggregator catches up with rounds it
++// fell behind on.
++type bySampleTime struct {
++	ts   int64 // 0: nothing pending
++	sum  float64
++	more *[]tsSum
++}
++
++type tsSum struct {
++	ts  int64
++	sum float64
++}
++
++func (p *bySampleTime) add(ts int64, v float64) {
++	switch {
++	case p.ts == 0:
++		p.ts, p.sum = ts, v
++	case p.ts == ts:
++		p.sum += v
++	default:
++		if p.more == nil {
++			p.more = &[]tsSum{}
++		}
++		for i := range *p.more {
++			if (*p.more)[i].ts == ts {
++				(*p.more)[i].sum += v
++				return
++			}
++		}
++		*p.more = append(*p.more, tsSum{ts, v})
++	}
++}
++
++// first is the earliest pending timestamp.
++func (p *bySampleTime) first() (int64, bool) {
++	if p.ts == 0 {
++		return 0, false
++	}
++	first := p.ts
++	if p.more != nil {
++		for _, x := range *p.more {
++			first = min(first, x.ts)
++		}
++	}
++	return first, true
++}
++
++// drain calls f for every pending sum in timestamp order and empties p.
++func (p *bySampleTime) drain(f func(ts int64, sum float64)) {
++	if p.ts == 0 {
++		return
++	}
++	if p.more == nil {
++		f(p.ts, p.sum)
++		p.ts, p.sum = 0, 0
++		return
++	}
++	all := append(*p.more, tsSum{p.ts, p.sum})
++	slices.SortFunc(all, func(a, b tsSum) int { return cmp.Compare(a.ts, b.ts) })
++	for _, x := range all {
++		f(x.ts, x.sum)
++	}
++	p.ts, p.sum, p.more = 0, 0, nil
++}
++
+ // sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
+ // so the output is a cumulative counter.
+ //
+@@ -104,11 +206,13 @@ func (av *sumSamplesTotalAggrValue) state() any {
+ 	return av.shared
+ }
+ 
+-func newSumSamplesTotalAggrConfig() aggrConfig {
+-	return &sumSamplesTotalAggrConfig{}
++func newSumSamplesTotalAggrConfig(sampleTimestamps bool) aggrConfig {
++	return &sumSamplesTotalAggrConfig{sampleTimestamps: sampleTimestamps}
+ }
+ 
+-type sumSamplesTotalAggrConfig struct{}
++type sumSamplesTotalAggrConfig struct {
++	sampleTimestamps bool
++}
+ 
+ // sumSamplesTotalOwned is a value together with the shared state it owns when
+ // no other value shares it, so the pair costs one allocation instead of two.
+@@ -117,7 +221,14 @@ type sumSamplesTotalOwned struct {
+ 	shared sumSamplesTotalShared
+ }
+ 
+-func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
++func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
++	if c.sampleTimestamps {
++		// sample_timestamps is refused together with enable_windows, the only
++		// source of shared state.
++		o := &sumSamplesTotalAtOwned{}
++		o.v.shared = &o.shared
++		return &o.v
++	}
+ 	if shared, ok := s.(*sumSamplesTotalShared); ok {
+ 		return &sumSamplesTotalAggrValue{shared: shared}
+ 	}
+@@ -126,6 +237,66 @@ func (*sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+ 	return &o.v
+ }
+ 
++// sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
++// writes the total as of each scrape round it has samples of, in timestamp
++// order, so an increment lands in the interval it was scraped in even when the
++// aggregator processes it minutes later. The written timestamps never go back
++// -- a counter that did would look reset -- so a round whose samples arrive
++// after a later round was written goes to that later one: the error is bounded
++// by how far the targets' rounds are apart in processing, not by how far the
++// aggregator is behind.
++//
++// An unchanged total is written again only as the heartbeat, and then at the
++// latest sample timestamp the aggregator has seen rather than at the wall
++// clock: while it is behind, a heartbeat at the wall clock would push the
++// series ahead of the rounds still to come, and they would all land there.
++type sumSamplesTotalAtValue struct {
++	shared  *sumSamplesTotalShared
++	pending bySampleTime
++}
++
++type sumSamplesTotalAtOwned struct {
++	v      sumSamplesTotalAtValue
++	shared sumSamplesTotalShared
++}
++
++func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
++	av.pending.add(sample.timestamp, sample.value)
++}
++
++func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	sh := av.shared
++	wrote := false
++	av.pending.drain(func(ts int64, sum float64) {
++		sh.total += sum
++		if sh.written && sh.total == sh.lastWritten {
++			return
++		}
++		at := max(min(ts, ctx.now), sh.lastWrittenAt)
++		ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
++		sh.lastWritten, sh.lastWrittenAt, sh.written = sh.total, at, true
++		wrote = true
++	})
++	if !wrote && sh.written {
++		at := min(ctx.watermark, ctx.now)
++		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
++		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
++			ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
++			sh.lastWrittenAt = at
++		} else {
++			ctx.a.skippedOutputs.Inc()
++		}
++	}
++	if math.Abs(sh.total) >= (1 << 53) {
++		// It is time to reset the entry, since it starts losing float64 precision
++		sh.total = 0
++	}
++}
++
++func (av *sumSamplesTotalAtValue) state() any { return av.shared }
++
++func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }
++
+ // needsInputKey reports that this output looks only at the sample, so the key
+ // need not carry the labels the aggregation groups away -- compressing them
+ // costs a hash and two string compares per label per sample, for nothing.
+-- 
+2.50.1 (Apple Git-155)
+

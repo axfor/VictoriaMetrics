@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/integration.md`。
 
-二十六个补丁,**按编号顺序打**。004~027 是 vmagent 的,028 是 vmselect 的,029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+二十八个补丁,**按编号顺序打**。004~027、030、031 是 vmagent 的,028 是 vmselect 的,029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -34,12 +34,15 @@
 | `027-acg_streamaggr-inline-single-output` | 单个输出直接放在条目里,`sum_samples_total` 的值与状态一次分配。每条输出序列 360 → 313 字节(两条合计 −28%) | 建议,纯内存;依赖 026 |
 | `028-acg_httpserver-zstd-response` | 客户端在 `Accept-Encoding` 里给 zstd 的权重高于 gzip(或相同且排在前面)时,响应改用 zstd 压缩(第八部分);其余客户端照旧拿 gzip | 可选,ruler 读导出时省 vmselect 的 CPU;没有它 ruler 退回 gzip |
 | `029-acg_storage-tsdb-status-from-names` | 带 `match[]` 的 `/api/v1/status/tsdb` 在匹配数不超过新参数时从匹配序列的指标名统计,不再扫当天全部倒排索引(第九部分)。实验集群 2.4 亿序列的一天:29–41 秒 → 0.06–0.38 秒,结果逐项相同 | **建议**(ruler 切分片要问它),需在 vmstorage 上加参数才生效 |
+| `030-acg_streamaggr-sample-timestamps` | 新增 `sample_timestamps`:`sum_samples`、`sum_samples_total` 按样本的抓取时刻打时间戳,vmagent 处理落后时用量仍记在抓取的那一分钟;抓取 tick 晚于间隔十分之一时改用实际开始时刻(第十部分) | **建议**,配合 ruler 推迟到 :10 / 00:30;要加参数才生效 |
+| `031-acg_streamaggr-name-index` | 流式聚合按 `match` 里写死的指标名索引规则,每条样本只交给可能命中它的规则,输出逐条不变(第十一部分)。ACG 的 102 条规则全规模本机复现:vmagent CPU 1.30 → 0.82 核 | **建议**,纯性能,不用改配置 |
 
-只动源码的是 26 个文件:028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
+只动源码的是 28 个文件:028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
+030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(7 个补丁碰它)和 `output.go`(6 个)。
+冲突热点是 `streamaggr.go`(11 个补丁碰它)和 `output.go`(8 个)。
 
 ## 基线:为什么是集群版
 
@@ -439,3 +442,79 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
   实验集群 5 个真实选择器的返回和打补丁前逐字段相同(修复后的版本复核过)。
 - 实测(修复后的版本):29–41 秒 → 0.06–0.38 秒,重启后第一次 0.4–4.4 秒。ruler 三个副本首次补算一整天 2133 → 1271 秒,
   其中导出也快了 45%,因为扫描不再和导出抢 vmstorage 的 CPU(这一组是修复前的版本测的)。
+
+## 十、聚合输出按样本的抓取时刻打时间戳(030)
+
+### 解决什么
+
+聚合输出的时间戳原来是刷出的时刻。vmagent 处理不过来时(全规模下抓取处理排队),10:59 抓的一轮可能 11:02 才聚合写出,
+用量记进了后面的分钟;ruler 按整点切小时,还会落进下一个小时。
+
+### 改了什么
+
+- 新配置项 `sample_timestamps`(单条规则),以及参数 `-remoteWrite.streamAggr.sampleTimestamps`、`-streamAggr.sampleTimestamps`
+  (对能用的规则全部打开,不能用的跳过)。只支持 `sum_samples` 和 `sum_samples_total`,
+  不能和 `enable_windows`、`dedup_interval` 一起用,它们自己决定时间戳;单条规则这样配会报错,全局参数则跳过这些规则。
+- `sum_samples`:按样本时间戳分组,每组写在自己的时间戳上。某一分钟已经写出后又到的部分,写成提前几毫秒的另一个样本,
+  去重时两条都保留,`sum_over_time` 把它们相加。
+- `sum_samples_total`:按抓取轮次依次写出累计值。写出的时间戳不回退(回退会被当成计数器重置),
+  所以比后一轮还晚到的轮次记到后一轮上,误差以各目标之间处理的先后为界,与落后多久无关。
+  心跳写在已见过的最新样本时刻,而不是墙钟;新输出前补的 0 在它第一个样本之前。
+- 不开时行为不变。新状态放在单独的类型里,默认路径每条输出序列的内存不变。
+- 抓取循环:上一轮处理太久时,下一个 tick 等到的时候已经晚了,原来仍用 tick 的时间打戳,把中间那段算到过去;
+  现在 tick 晚于间隔的十分之一,就用实际开始抓取的时刻。
+
+### 已做的验证
+
+- 6 个测试在假时钟下覆盖:落后 4 分钟的各轮记回各自的分钟,晚到的部分累加而不覆盖,累计值不回退,
+  补 0 在第一个样本之前,单条规则配错时拒绝,全局参数跳过带 `dedup_interval` 的 gauge 规则;另有 tick 的测试。
+  7 处变异全部被抓到。
+- 本机端到端(vmagent 1 核、处理落后):`_1m_by_global` 的点落在抓取时刻前 1–7 毫秒;
+  `_1m` 的合计与原始增量一致(905,580 对 905,580,input tokens 1,060,993,780 两边相同),只差最后一轮,
+  那是 `_1m` 规则没配 `flush_on_shutdown` 造成的。
+
+### 用法与约束
+
+- 内网在 vmagent 的 `extraArgs` 加 `remoteWrite.streamAggr.sampleTimestamps: "true"`:两条合并规则和 `_1m_by_*` 都生效,
+  gauge 那条(带 `dedup_interval`)自动跳过。
+- 换回不认识这个参数的旧镜像之前,先去掉它。
+
+## 十一、流式聚合按指标名索引规则(031)
+
+### 解决什么
+
+每批样本原来要交给每条规则,逐条比对 `match`。ACG 的配置有 102 条规则,其中 100 条各写死一个指标名,
+每条样本却要和全部 102 条比。全规模本机复现(3 个实例、3 核)的 profile 里,遍历和比对占 vmagent CPU 的 24%,
+几乎都是不可能命中的比对。
+
+### 改了什么
+
+- `promrelabel.IfExpression.MetricNames()`:每个过滤组都含 `__name__="非空字面量"` 时返回这些名字,否则返回 nil。
+  与 `Match` 的语义一致:MetricsQL 会把 `or` 前面的名字补进每一组。
+- 加载配置时按名字建表。`Push` 把整批交给不能索引的规则,其余规则只拿名字对得上的那几段:
+  只有一段就原地切片,多段则拷进子批,再把结果"或"回整批的 `matchIdxs`。同名连续的样本只查一次表,并记住最近 4 个名字。
+  规则内部照旧执行完整的 `match`。
+- 能索引的规则少于 2 条时不建表。推送开头只读一次规则列表,已停止的规则不再收样本(热加载时旧规则可能正在被停止)。
+  被跳过的规则照旧给 `vm_streamaggr_samples_lag_seconds` 记 0,自监控指标不变。
+- 通用机制:只看 `match` 的结构,不认任何指标名或规则名;配置不用改,不加参数。
+
+### 已做的验证
+
+- 等价:通用配置下,有索引和无索引两条路径的输出、`matchIdxs`、`samples_lag` 逐条相同;
+  8 个协程并发推送与顺序推送相同,`-race` 通过;14 处变异全部被抓到。
+- 三路对抗审核(语义、并发与内存、性能),发现并已修复:热加载时推送越界崩溃、最近名字缓存漏记没有规则的名字、
+  `samples_lag` 观测次数变化。
+- 回放:全规模 145 分钟长场景(19.8 亿条输入、9.6 亿个输出样本),两条路径的输出逐字节一致;
+  按 apikey 抽样的长场景写进 VM 再读回,序列和时间戳完全一致,值相同或差 1 ULP
+  (同一份数据写两次 VM 也是这样,来自 VM 存浮点时按块共用十进制指数)。
+  与 030 合并后,在抽样长场景上把 `sample_timestamps` 关闭、打开各回放一遍,两条路径都逐字节一致
+  (关闭时 1.61 亿、打开时 3.39 亿个输出样本);关闭时的输出与只打 031 时逐字节相同,即 030 不开参数时不改变任何输出。
+- 性能:全规模本机复现 vmagent CPU 1.30 → 0.82 核(−37%),`Aggregators.Push` −63%;
+  基准(每批 1000 条)ACG 形态 −49.7%,两条规则 −42% ~ −44%。只有 2–3 条可索引规则、而一批几乎全是这几个名字时,
+  索引跳不过任何比对,多出读名字的开销,约每条 5 ns、每次推送 50 ns(这类窄形态多 1–16%)。
+
+### 用法与约束
+
+不用改配置,不加参数。设计与全部实测见 ACGCluster `docs/apikey-usage/vmagent-rule-index.md`,
+回放与比对工具在 `vm/vmagent/verify/`。
+
