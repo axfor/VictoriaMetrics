@@ -1,6 +1,6 @@
 # VictoriaMetrics 补丁:vmagent、vmselect、vmstorage(基于 **v1.126.0-cluster**)
 
-> 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/integration.md`。
+> 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
 二十八个补丁,**按编号顺序打**。004~027、030、031 是 vmagent 的,028 是 vmselect 的,029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
@@ -34,7 +34,7 @@
 | `027-acg_streamaggr-inline-single-output` | 单个输出直接放在条目里,`sum_samples_total` 的值与状态一次分配。每条输出序列 360 → 313 字节(两条合计 −28%) | 建议,纯内存;依赖 026 |
 | `028-acg_httpserver-zstd-response` | 客户端在 `Accept-Encoding` 里给 zstd 的权重高于 gzip(或相同且排在前面)时,响应改用 zstd 压缩(第八部分);其余客户端照旧拿 gzip | 可选,ruler 读导出时省 vmselect 的 CPU;没有它 ruler 退回 gzip |
 | `029-acg_storage-tsdb-status-from-names` | 带 `match[]` 的 `/api/v1/status/tsdb` 在匹配数不超过新参数时从匹配序列的指标名统计,不再扫当天全部倒排索引(第九部分)。实验集群 2.4 亿序列的一天:29–41 秒 → 0.06–0.38 秒,结果逐项相同 | **建议**(ruler 切分片要问它),需在 vmstorage 上加参数才生效 |
-| `030-acg_streamaggr-sample-timestamps` | 新增 `sample_timestamps`:`sum_samples`、`sum_samples_total` 按样本的抓取时刻打时间戳,vmagent 处理落后时用量仍记在抓取的那一分钟;抓取 tick 晚于间隔十分之一时改用实际开始时刻(第十部分) | **建议**,配合 ruler 推迟到 :10 / 00:30;要加参数才生效 |
+| `030-acg_streamaggr-sample-timestamps` | 新增 `sample_timestamps`:`sum_samples`、`sum_samples_total` 按样本的抓取时刻打时间戳,vmagent 处理落后时用量仍记在抓取的那一分钟;抓取 tick 晚于间隔十分之一时改用实际开始时刻(第十部分) | 补丁要打(不开参数时行为不变),**参数暂不打开**:跟不上时打开反而更慢,见第十部分 |
 | `031-acg_streamaggr-name-index` | 流式聚合按 `match` 里写死的指标名索引规则,每条样本只交给可能命中它的规则,输出逐条不变(第十一部分)。ACG 的 102 条规则全规模本机复现:vmagent CPU 1.30 → 0.82 核 | **建议**,纯性能,不用改配置 |
 
 只动源码的是 28 个文件:028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
@@ -475,7 +475,11 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
 
 ### 用法与约束
 
-- 内网在 vmagent 的 `extraArgs` 加 `remoteWrite.streamAggr.sampleTimestamps: "true"`:两条合并规则和 `_1m_by_*` 都生效,
+- **暂不打开**(2026-10-02 实验集群实测):vmagent 跟不上时,打开它反而更慢、内存更高。全规模回放下,
+  不开时每分钟聚合 1787 万条(跟上 89%)、没有重启;打开后只有 1053 万条,比 1027 的 1227 万还少,刷出超时 2.6 次/分钟,
+  两次因内存到 5 GiB 被 OOM。原因是落后时每条输出要按每个待写的抓取轮次分开累加、分开刷出。优化这部分并重新验证之前不开;
+  不开时 030 不改变任何输出(回放逐字节一致)。
+- 打开的方法:在 vmagent 的 `extraArgs` 加 `remoteWrite.streamAggr.sampleTimestamps: "true"`,两条合并规则和 `_1m_by_*` 都生效,
   gauge 那条(带 `dedup_interval`)自动跳过。
 - 换回不认识这个参数的旧镜像之前,先去掉它。
 
