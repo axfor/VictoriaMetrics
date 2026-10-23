@@ -1,0 +1,373 @@
+From e643e25cbbe766d8d6f30bfad13e1e36af699d2c Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Thu, 22 Oct 2026 21:09:09 -0700
+Subject: [PATCH 30/30] lib/promscrape: acknowledge the rounds of targets
+ exposing increments
+
+A target exposing increments with client_golang's promhttp/delta commits
+a round once its response is written, and written is not received: a
+response in the socket's send buffer when the scrape timeout passes is
+committed there and thrown away here, and the target's usage for that
+scrape is lost. The target status page fetches a target's response to
+show it, which for such a target took a round with it every time.
+
+Such a target now names each round in X-Prometheus-Delta-Round, and holds
+it until vmagent's next request says in X-Prometheus-Delta-Ack whether it
+was processed; one that was not is reported again. vmagent sends "new"
+before a target has named a round, then the last round processed in
+full, a scrape processed in full being one that ends with up=1, or
+"<session>:0" when none of a session was; the status page sends "peek",
+which the target rolls back at once without touching the round the
+scrape loop is on. ReadDeltaData carries the round of each request with
+it, so a look at the status page never acknowledges what it fetched.
+Other targets ignore the header; -promscrape.deltaAck=false turns it off.
+
+End to end, the fork's sidecar and this vmagent, scraping every 2s with a
+1s timeout, the sidecar stalling every third scrape past it after writing
+the whole response and the status page opened five times: 3892 written,
+3892 received, against 1266 (-67.5%) with -promscrape.deltaAck=false.
+---
+ lib/promscrape/client.go         |  43 +++++++++---
+ lib/promscrape/delta_ack_test.go | 117 +++++++++++++++++++++++++++++++
+ lib/promscrape/scraper.go        |   3 +
+ lib/promscrape/scrapework.go     |  57 ++++++++++++++-
+ 4 files changed, 208 insertions(+), 12 deletions(-)
+ create mode 100644 lib/promscrape/delta_ack_test.go
+
+diff --git a/lib/promscrape/client.go b/lib/promscrape/client.go
+index fdd47767e..c03e4d650 100644
+--- a/lib/promscrape/client.go
++++ b/lib/promscrape/client.go
+@@ -26,6 +26,10 @@ var (
+ 	zstdCompression = flag.Bool("promscrape.zstdCompression", false, "Whether to send 'Accept-Encoding: zstd, gzip' instead of 'Accept-Encoding: gzip' to all the scrape targets. "+
+ 		"zstd usually needs less CPU on scrape targets than gzip for the same or better compression ratio. "+
+ 		"Targets without zstd support may keep responding with gzip. This flag has no effect for targets with disabled compression")
++	deltaAck = flag.Bool("promscrape.deltaAck", true, "Whether to acknowledge the rounds of targets exposing increments with client_golang's promhttp/delta, "+
++		"which answer with the X-Prometheus-Delta-Round header: each scrape names the last round processed in full, so a round whose response was written "+
++		"but not processed, as when the scrape times out, is reported again instead of lost, and the target status page no longer takes a round with it. "+
++		"Other targets ignore the header")
+ 	disableKeepAlive = flag.Bool("promscrape.disableKeepAlive", false, "Whether to disable HTTP keep-alive connections when scraping all the targets. "+
+ 		"This may be useful when targets has no support for HTTP keep-alive connection. "+
+ 		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control. "+
+@@ -119,13 +123,33 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
+ }
+ 
+ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
++	contentEncoding, _, err := c.ReadDeltaData(dst, "")
++	return contentEncoding, err
++}
++
++// The headers of acknowledged delivery with targets exposing increments through
++// client_golang's promhttp/delta; see its ack.go.
++const (
++	deltaRoundHeader = "X-Prometheus-Delta-Round"
++	deltaAckHeader   = "X-Prometheus-Delta-Ack"
++	deltaAckNew      = "new"  // no round of this target was had yet
++	deltaAckPeek     = "peek" // the response is looked at, not processed
++)
++
++// ReadDeltaData is ReadData that also sends ack, when not empty, as the
++// acknowledgement of the last round processed, and returns the round the
++// response carries, "" when it carries none.
++func (c *client) ReadDeltaData(dst *chunkedbuffer.Buffer, ack string) (string, string, error) {
+ 	deadline := time.Now().Add(c.c.Timeout)
+ 	ctx, cancel := context.WithDeadline(c.ctx, deadline)
+ 	defer cancel()
+ 
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
+ 	if err != nil {
+-		return "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++	}
++	if ack != "" {
++		req.Header.Set(deltaAckHeader, ack)
+ 	}
+ 	// The following `Accept` header has been copied from Prometheus sources.
+ 	// See https://github.com/prometheus/prometheus/blob/f9d21f10ecd2a343a381044f131ea4e46381ce09/scrape/scrape.go#L532 .
+@@ -138,10 +162,10 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
+ 	req.Header.Set("User-Agent", "vm_promscrape")
+ 	if err := c.setHeaders(req); err != nil {
+-		return "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+ 	}
+ 	if err := c.setProxyHeaders(req); err != nil {
+-		return "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+ 	}
+ 	if !c.disableCompression {
+ 		if *zstdCompression {
+@@ -157,7 +181,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+ 			scrapesTimedout.Inc()
+ 		}
+-		return "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
+ 	}
+ 	defer resp.Body.Close()
+ 
+@@ -167,7 +191,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ 		if err != nil {
+ 			respBody = []byte(err.Error())
+ 		}
+-		return "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
++		return "", "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
+ 			c.scrapeURL, resp.StatusCode, http.StatusOK, respBody)
+ 	}
+ 	scrapesOK.Inc()
+@@ -179,22 +203,23 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
+ 			scrapesTimedout.Inc()
+ 		}
+-		return "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
+ 	}
+ 	if int64(dst.Len()) >= c.maxScrapeSize {
+ 		maxScrapeSizeExceeded.Inc()
+-		return "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
++		return "", "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
+ 			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
+ 			"increase max_scrape_size value in scrape config for the given target", c.scrapeURL, c.maxScrapeSize)
+ 	}
+ 
+ 	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
+ 	// Any other Content-Encoding is treated as uncompressed data, like before.
++	round := resp.Header.Get(deltaRoundHeader)
+ 	switch ce := resp.Header.Get("Content-Encoding"); ce {
+ 	case "gzip", "zstd":
+-		return ce, nil
++		return ce, round, nil
+ 	default:
+-		return "", nil
++		return "", round, nil
+ 	}
+ }
+ 
+diff --git a/lib/promscrape/delta_ack_test.go b/lib/promscrape/delta_ack_test.go
+new file mode 100644
+index 000000000..c1a0af7b7
+--- /dev/null
++++ b/lib/promscrape/delta_ack_test.go
+@@ -0,0 +1,117 @@
++package promscrape
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// The client sends the acknowledgement it is given and returns the round the
++// response names; without one it sends no header.
++func TestClientReadDeltaData(t *testing.T) {
++	var gotAck []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotAck = r.Header.Values(deltaAckHeader)
++		w.Header().Set(deltaRoundHeader, "s1:7")
++		fmt.Fprintln(w, "foo 1")
++	}))
++	defer srv.Close()
++	c, err := newClient(context.Background(), &ScrapeWork{
++		ScrapeURL:          srv.URL,
++		ScrapeTimeout:      5 * time.Second,
++		AuthConfig:         newTestAuthConfig(t, false, nil),
++		ProxyAuthConfig:    newTestAuthConfig(t, false, nil),
++		MaxScrapeSize:      16000,
++		DisableCompression: true,
++	})
++	if err != nil {
++		t.Fatalf("cannot create client: %s", err)
++	}
++	var cb chunkedbuffer.Buffer
++	_, round, err := c.ReadDeltaData(&cb, "s1:6")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if round != "s1:7" || len(gotAck) != 1 || gotAck[0] != "s1:6" {
++		t.Fatalf("round %q, ack sent %q; want round s1:7 and ack s1:6", round, gotAck)
++	}
++	cb.Reset()
++	if _, err := c.ReadData(&cb); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if len(gotAck) != 0 {
++		t.Fatalf("ReadData sent ack %q; want none", gotAck)
++	}
++}
++
++// What a scrape acknowledges: AckNew before a target has named a round, then the
++// last round processed in full; a scrape that fails leaves the last one
++// processed, or "<session>:0" when none of the session was. A look at the
++// target's response sends AckPeek and changes nothing.
++func TestScrapeWorkDeltaAck(t *testing.T) {
++	var sw scrapeWork
++	sw.Config = &ScrapeWork{ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
++	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
++	var sent []string
++	nextRound, nextBody, nextErr := "", "foo 1\n", error(nil)
++	sw.ReadDeltaData = func(dst *chunkedbuffer.Buffer, ack string) (string, string, error) {
++		sent = append(sent, ack)
++		if nextErr != nil {
++			return "", nextRound, nextErr
++		}
++		_, _ = dst.Write([]byte(nextBody))
++		return "", nextRound, nil
++	}
++	scrape := func(round, body string, err error) {
++		t.Helper()
++		nextRound, nextBody, nextErr = round, body, err
++		tsmGlobal.Register(&sw)
++		_ = sw.scrapeInternal(123000, 123000)
++		tsmGlobal.Unregister(&sw)
++	}
++
++	scrape("", "foo 1\n", nil)                   // a target that names no rounds
++	scrape("s1:1", "foo 1\n", nil)               // processed
++	scrape("s1:2", "foo 1\n", fmt.Errorf("eof")) // fetched, not processed
++	scrape("s1:3", "foo{\n", nil)                // not even parsed: still processed, as the scrape is up
++	if _, err := sw.getTargetResponse(); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	scrape("s2:1", "foo 1\n", fmt.Errorf("eof")) // the target restarted, and this failed
++	scrape("s2:2", "foo 1\n", nil)
++	scrape("s2:3", "foo 1\n", nil)
++
++	want := []string{deltaAckNew, deltaAckNew, "s1:1", "s1:1", deltaAckPeek, "s1:3", "s2:0", "s2:2"}
++	if fmt.Sprint(sent) != fmt.Sprint(want) {
++		t.Fatalf("acknowledged\n%q\nwant\n%q", sent, want)
++	}
++}
++
++// With ReadDeltaData unset, as in a vmagent run with -promscrape.deltaAck=false,
++// scraping goes through ReadData and acknowledges nothing.
++func TestScrapeWorkWithoutDeltaAck(t *testing.T) {
++	var sw scrapeWork
++	sw.Config = &ScrapeWork{ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
++	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
++	calls := 0
++	sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
++		calls++
++		_, _ = dst.Write([]byte("foo 1\n"))
++		return "", nil
++	}
++	tsmGlobal.Register(&sw)
++	if err := sw.scrapeInternal(123000, 123000); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	tsmGlobal.Unregister(&sw)
++	if calls != 1 || sw.deltaAck.Load() != nil {
++		t.Fatalf("ReadData called %d times, ack %v; want once and no ack", calls, sw.deltaAck.Load())
++	}
++}
+diff --git a/lib/promscrape/scraper.go b/lib/promscrape/scraper.go
+index bcaab8c6c..65e156c04 100644
+--- a/lib/promscrape/scraper.go
++++ b/lib/promscrape/scraper.go
+@@ -464,6 +464,9 @@ func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *
+ 	sc.sw.Config = sw
+ 	sc.sw.ScrapeGroup = group
+ 	sc.sw.ReadData = c.ReadData
++	if *deltaAck {
++		sc.sw.ReadDeltaData = c.ReadDeltaData
++	}
+ 	sc.sw.PushData = pushData
+ 	return sc, nil
+ }
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index 0faf23f80..7b636bdf2 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -201,6 +201,19 @@ type scrapeWork struct {
+ 	// It returns the Content-Encoding of the read data: "gzip", "zstd" or "" for uncompressed data.
+ 	ReadData func(dst *chunkedbuffer.Buffer) (string, error)
+ 
++	// ReadDeltaData, when set, is used instead of ReadData. It also sends ack as
++	// the acknowledgement of the last round of the target processed, and returns
++	// the round the response carries, "" when it carries none. See deltaAck.
++	ReadDeltaData func(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error)
++
++	// deltaAck is what the next scrape acknowledges to a target exposing
++	// increments through client_golang's promhttp/delta: nil before it has
++	// answered with a round, then the last round processed in full, or
++	// "<session>:0" when none of its session was. Such a target holds each round
++	// until the next request names it, and reports it again otherwise; see
++	// -promscrape.deltaAck.
++	deltaAck atomic.Pointer[string]
++
+ 	// PushData is called for pushing collected data.
+ 	//
+ 	// The PushData must be safe for calling from multiple concurrent goroutines.
+@@ -449,7 +462,9 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+ 	cb := chunkedbuffer.Get()
+ 	defer chunkedbuffer.Put(cb)
+ 
+-	contentEncoding, err := sw.ReadData(cb)
++	// The response is only looked at: a target exposing increments must not
++	// count it as processed, nor settle the round the scrape loop is processing.
++	contentEncoding, _, err := sw.readData(cb, deltaAckPeek)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -459,14 +474,50 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+ 	return bb.B, err
+ }
+ 
+-func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error {
++// readData reads the scrape response into dst, acknowledging ack, or the last
++// round processed when ack is empty, to a target that exposes rounds.
++func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error) {
++	if sw.ReadDeltaData == nil {
++		contentEncoding, err = sw.ReadData(dst)
++		return contentEncoding, "", err
++	}
++	if ack == "" {
++		ack = deltaAckNew
++		if p := sw.deltaAck.Load(); p != nil {
++			ack = *p
++		}
++	}
++	return sw.ReadDeltaData(dst, ack)
++}
++
++// processedDeltaRound records what the next scrape acknowledges after one that
++// got round, "" when the response carried none, processed in full or not.
++func (sw *scrapeWork) processedDeltaRound(round string, processed bool) {
++	if round == "" {
++		return
++	}
++	if processed {
++		sw.deltaAck.Store(&round)
++		return
++	}
++	// A round of a session none of whose rounds was processed yet, as after
++	// the target restarted, acknowledges nothing of it.
++	session, _, _ := strings.Cut(round, ":")
++	if p := sw.deltaAck.Load(); p == nil || !strings.HasPrefix(*p, session+":") {
++		none := session + ":0"
++		sw.deltaAck.Store(&none)
++	}
++}
++
++func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) (err error) {
+ 	// Read the whole scrape response into cb.
+ 	// It is OK to do this for stream parsing mode, since the most of RAM
+ 	// is occupied during parsing of the read response body below.
+ 	// This also allows measuring the real scrape duration, which doesn't include
+ 	// the time needed for processing of the read response.
+ 	cb := chunkedbuffer.Get()
+-	contentEncoding, err := sw.ReadData(cb)
++	contentEncoding, round, err := sw.readData(cb, "")
++	defer func() { sw.processedDeltaRound(round, err == nil) }()
+ 
+ 	// Measure scrape duration.
+ 	endTimestamp := time.Now().UnixMilli()
+-- 
+2.50.1 (Apple Git-155)
+

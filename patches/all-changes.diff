@@ -1,5 +1,5 @@
 diff --git a/app/vmagent/remotewrite/streamaggr.go b/app/vmagent/remotewrite/streamaggr.go
-index f820486c9..aaab51096 100644
+index f820486c9..6c66b18f2 100644
 --- a/app/vmagent/remotewrite/streamaggr.go
 +++ b/app/vmagent/remotewrite/streamaggr.go
 @@ -38,6 +38,9 @@ var (
@@ -7,7 +7,7 @@ index f820486c9..aaab51096 100644
  		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
  		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
 +	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
-+		"at the timestamps of the input samples instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
++		"at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
 +		"Can be overridden per aggregation via sample_timestamps option")
  
  	// Per URL config
@@ -17,7 +17,7 @@ index f820486c9..aaab51096 100644
  		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
  		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
 +	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
-+		"write sum_samples and sum_samples_total at the timestamps of the input samples instead of at the flush, so a sample processed late "+
++		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late "+
 +		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
  )
  
@@ -78,10 +78,10 @@ index 9fc70b8fb..39f123cd5 100644
  
  Moved to [stream-aggregation/configuration/#total](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/configuration/#total).
 diff --git a/docs/victoriametrics/stream-aggregation/configuration.md b/docs/victoriametrics/stream-aggregation/configuration.md
-index 18e3f47c4..2cf50096b 100644
+index 18e3f47c4..ace66ea9e 100644
 --- a/docs/victoriametrics/stream-aggregation/configuration.md
 +++ b/docs/victoriametrics/stream-aggregation/configuration.md
-@@ -110,6 +110,25 @@ specified individually per each `-remoteWrite.url`:
+@@ -110,6 +110,26 @@ specified individually per each `-remoteWrite.url`:
    #
    # flush_on_shutdown: false
  
@@ -94,9 +94,10 @@ index 18e3f47c4..2cf50096b 100644
 +  #
 +  # reset_marker_on_stale: false
 +
-+  # sample_timestamps instructs to write sum_samples and sum_samples_total at the timestamps of the input
-+  # samples instead of at the flush, so samples processed late, when vmagent falls behind, still count
-+  # towards the interval they were scraped in rather than the one they were processed in.
++  # sample_timestamps instructs to write sum_samples and sum_samples_total at the end of the interval
++  # the input samples' timestamps fall in, instead of at the flush, so samples processed late, when vmagent
++  # falls behind, still count towards the interval they were scraped in rather than the one they were processed in.
++  # Samples of all the targets within one interval are summed together and written once.
 +  # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
 +  # enable_windows or dedup_interval, which decide timestamps of their own.
 +  # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
@@ -107,7 +108,7 @@ index 18e3f47c4..2cf50096b 100644
    # without is an optional list of labels, which must be removed from the output aggregation.
    # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
    #
-@@ -496,6 +515,30 @@ See also:
+@@ -496,6 +516,30 @@ See also:
  - [count_samples](#count_samples)
  - [count_series](#count_series)
  
@@ -402,10 +403,10 @@ index d1e2ecfab..e261b9bd6 100644
  
 diff --git a/lib/httpserver/zstd.go b/lib/httpserver/zstd.go
 new file mode 100644
-index 000000000..4b1997980
+index 000000000..cda9c880d
 --- /dev/null
 +++ b/lib/httpserver/zstd.go
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,247 @@
 +package httpserver
 +
 +import (
@@ -613,6 +614,13 @@ index 000000000..4b1997980
 +	return hj.Hijack()
 +}
 +
++// Unwrap returns the wrapped ResponseWriter, so that http.NewResponseController
++// reaches what it does not implement itself, such as write deadlines, as it does
++// through the gzip wrapper.
++func (zw *zstdResponseWriter) Unwrap() http.ResponseWriter {
++	return zw.ResponseWriter
++}
++
 +func (zw *zstdResponseWriter) close() {
 +	if !zw.hijacked {
 +		if !zw.decided {
@@ -648,10 +656,10 @@ index 000000000..4b1997980
 +}
 diff --git a/lib/httpserver/zstd_test.go b/lib/httpserver/zstd_test.go
 new file mode 100644
-index 000000000..1f8162394
+index 000000000..fc5f8d531
 --- /dev/null
 +++ b/lib/httpserver/zstd_test.go
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,385 @@
 +package httpserver
 +
 +import (
@@ -1012,6 +1020,31 @@ index 000000000..1f8162394
 +		t.Fatalf("window %d bytes (%v), want at most 1 MiB", h.WindowSize, err)
 +	}
 +}
++
++// http.NewResponseController reaches the server's writer through the zstd
++// wrapper, as it does through the gzip one: a handler setting a write deadline
++// must not fail only for clients preferring zstd.
++func TestZstdResponseWriterUnwrap(t *testing.T) {
++	var deadlineErr error
++	h := compressHandlerWrapper(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		deadlineErr = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Minute))
++		_, _ = w.Write([]byte("ok"))
++	}))
++	srv := httptest.NewServer(h)
++	defer srv.Close()
++	for _, enc := range []string{"zstd", "gzip"} {
++		req, _ := http.NewRequest("GET", srv.URL, nil)
++		req.Header.Set("Accept-Encoding", enc)
++		resp, err := http.DefaultClient.Do(req)
++		if err != nil {
++			t.Fatalf("%s: %s", enc, err)
++		}
++		_ = resp.Body.Close()
++		if deadlineErr != nil {
++			t.Fatalf("%s: cannot set a write deadline through the wrapper: %s", enc, deadlineErr)
++		}
++	}
++}
 diff --git a/lib/promrelabel/if_expression.go b/lib/promrelabel/if_expression.go
 index 3afd69f5e..5be876bcf 100644
 --- a/lib/promrelabel/if_expression.go
@@ -1129,25 +1162,46 @@ index 489c953b4..23bd31398 100644
 +- '{bar="baz"}'`, nil)
 +}
 diff --git a/lib/promscrape/client.go b/lib/promscrape/client.go
-index 8b34adf1d..fdd47767e 100644
+index 8b34adf1d..c03e4d650 100644
 --- a/lib/promscrape/client.go
 +++ b/lib/promscrape/client.go
-@@ -23,6 +23,9 @@ var (
+@@ -23,6 +23,13 @@ var (
  	disableCompression     = flag.Bool("promscrape.disableCompression", false, "Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. "+
  		"This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. "+
  		"It is possible to set 'disable_compression: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control")
 +	zstdCompression = flag.Bool("promscrape.zstdCompression", false, "Whether to send 'Accept-Encoding: zstd, gzip' instead of 'Accept-Encoding: gzip' to all the scrape targets. "+
 +		"zstd usually needs less CPU on scrape targets than gzip for the same or better compression ratio. "+
 +		"Targets without zstd support may keep responding with gzip. This flag has no effect for targets with disabled compression")
++	deltaAck = flag.Bool("promscrape.deltaAck", true, "Whether to acknowledge the rounds of targets exposing increments with client_golang's promhttp/delta, "+
++		"which answer with the X-Prometheus-Delta-Round header: each scrape names the last round processed in full, so a round whose response was written "+
++		"but not processed, as when the scrape times out, is reported again instead of lost, and the target status page no longer takes a round with it. "+
++		"Other targets ignore the header")
  	disableKeepAlive = flag.Bool("promscrape.disableKeepAlive", false, "Whether to disable HTTP keep-alive connections when scraping all the targets. "+
  		"This may be useful when targets has no support for HTTP keep-alive connection. "+
  		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control. "+
-@@ -115,14 +118,14 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
+@@ -115,14 +122,34 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
  	return c, nil
  }
  
 -func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
 +func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
++	contentEncoding, _, err := c.ReadDeltaData(dst, "")
++	return contentEncoding, err
++}
++
++// The headers of acknowledged delivery with targets exposing increments through
++// client_golang's promhttp/delta; see its ack.go.
++const (
++	deltaRoundHeader = "X-Prometheus-Delta-Round"
++	deltaAckHeader   = "X-Prometheus-Delta-Ack"
++	deltaAckNew      = "new"  // no round of this target was had yet
++	deltaAckPeek     = "peek" // the response is looked at, not processed
++)
++
++// ReadDeltaData is ReadData that also sends ack, when not empty, as the
++// acknowledgement of the last round processed, and returns the round the
++// response carries, "" when it carries none.
++func (c *client) ReadDeltaData(dst *chunkedbuffer.Buffer, ack string) (string, string, error) {
  	deadline := time.Now().Add(c.c.Timeout)
  	ctx, cancel := context.WithDeadline(c.ctx, deadline)
  	defer cancel()
@@ -1155,20 +1209,23 @@ index 8b34adf1d..fdd47767e 100644
  	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
  	if err != nil {
 -		return false, fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
-+		return "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++	}
++	if ack != "" {
++		req.Header.Set(deltaAckHeader, ack)
  	}
  	// The following `Accept` header has been copied from Prometheus sources.
  	// See https://github.com/prometheus/prometheus/blob/f9d21f10ecd2a343a381044f131ea4e46381ce09/scrape/scrape.go#L532 .
-@@ -135,13 +138,17 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+@@ -135,13 +162,17 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
  	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
  	req.Header.Set("User-Agent", "vm_promscrape")
  	if err := c.setHeaders(req); err != nil {
 -		return false, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
-+		return "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
  	}
  	if err := c.setProxyHeaders(req); err != nil {
 -		return false, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
-+		return "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
  	}
  	if !c.disableCompression {
 -		req.Header.Set("Accept-Encoding", "gzip")
@@ -1180,35 +1237,35 @@ index 8b34adf1d..fdd47767e 100644
  	}
  
  	scrapeRequests.Inc()
-@@ -150,7 +157,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+@@ -150,7 +181,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
  		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
  			scrapesTimedout.Inc()
  		}
 -		return false, fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
-+		return "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
  	}
  	defer resp.Body.Close()
  
-@@ -160,7 +167,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+@@ -160,7 +191,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
  		if err != nil {
  			respBody = []byte(err.Error())
  		}
 -		return false, fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
-+		return "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
++		return "", "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
  			c.scrapeURL, resp.StatusCode, http.StatusOK, respBody)
  	}
  	scrapesOK.Inc()
-@@ -172,17 +179,23 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
+@@ -172,17 +203,24 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (bool, error) {
  		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
  			scrapesTimedout.Inc()
  		}
 -		return false, fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
-+		return "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
++		return "", "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
  	}
  	if int64(dst.Len()) >= c.maxScrapeSize {
  		maxScrapeSizeExceeded.Inc()
 -		return false, fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
-+		return "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
++		return "", "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
  			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
  			"increase max_scrape_size value in scrape config for the given target", c.scrapeURL, c.maxScrapeSize)
  	}
@@ -1217,11 +1274,12 @@ index 8b34adf1d..fdd47767e 100644
 -	return isGzipped, nil
 +	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
 +	// Any other Content-Encoding is treated as uncompressed data, like before.
++	round := resp.Header.Get(deltaRoundHeader)
 +	switch ce := resp.Header.Get("Content-Encoding"); ce {
 +	case "gzip", "zstd":
-+		return ce, nil
++		return ce, round, nil
 +	default:
-+		return "", nil
++		return "", round, nil
 +	}
  }
  
@@ -1360,6 +1418,129 @@ index 000000000..6266f9c37
 +	// zstd is enabled, but the target doesn't compress responses.
 +	f(true, "", "zstd, gzip", "")
 +}
+diff --git a/lib/promscrape/delta_ack_test.go b/lib/promscrape/delta_ack_test.go
+new file mode 100644
+index 000000000..c1a0af7b7
+--- /dev/null
++++ b/lib/promscrape/delta_ack_test.go
+@@ -0,0 +1,117 @@
++package promscrape
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// The client sends the acknowledgement it is given and returns the round the
++// response names; without one it sends no header.
++func TestClientReadDeltaData(t *testing.T) {
++	var gotAck []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotAck = r.Header.Values(deltaAckHeader)
++		w.Header().Set(deltaRoundHeader, "s1:7")
++		fmt.Fprintln(w, "foo 1")
++	}))
++	defer srv.Close()
++	c, err := newClient(context.Background(), &ScrapeWork{
++		ScrapeURL:          srv.URL,
++		ScrapeTimeout:      5 * time.Second,
++		AuthConfig:         newTestAuthConfig(t, false, nil),
++		ProxyAuthConfig:    newTestAuthConfig(t, false, nil),
++		MaxScrapeSize:      16000,
++		DisableCompression: true,
++	})
++	if err != nil {
++		t.Fatalf("cannot create client: %s", err)
++	}
++	var cb chunkedbuffer.Buffer
++	_, round, err := c.ReadDeltaData(&cb, "s1:6")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if round != "s1:7" || len(gotAck) != 1 || gotAck[0] != "s1:6" {
++		t.Fatalf("round %q, ack sent %q; want round s1:7 and ack s1:6", round, gotAck)
++	}
++	cb.Reset()
++	if _, err := c.ReadData(&cb); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if len(gotAck) != 0 {
++		t.Fatalf("ReadData sent ack %q; want none", gotAck)
++	}
++}
++
++// What a scrape acknowledges: AckNew before a target has named a round, then the
++// last round processed in full; a scrape that fails leaves the last one
++// processed, or "<session>:0" when none of the session was. A look at the
++// target's response sends AckPeek and changes nothing.
++func TestScrapeWorkDeltaAck(t *testing.T) {
++	var sw scrapeWork
++	sw.Config = &ScrapeWork{ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
++	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
++	var sent []string
++	nextRound, nextBody, nextErr := "", "foo 1\n", error(nil)
++	sw.ReadDeltaData = func(dst *chunkedbuffer.Buffer, ack string) (string, string, error) {
++		sent = append(sent, ack)
++		if nextErr != nil {
++			return "", nextRound, nextErr
++		}
++		_, _ = dst.Write([]byte(nextBody))
++		return "", nextRound, nil
++	}
++	scrape := func(round, body string, err error) {
++		t.Helper()
++		nextRound, nextBody, nextErr = round, body, err
++		tsmGlobal.Register(&sw)
++		_ = sw.scrapeInternal(123000, 123000)
++		tsmGlobal.Unregister(&sw)
++	}
++
++	scrape("", "foo 1\n", nil)                   // a target that names no rounds
++	scrape("s1:1", "foo 1\n", nil)               // processed
++	scrape("s1:2", "foo 1\n", fmt.Errorf("eof")) // fetched, not processed
++	scrape("s1:3", "foo{\n", nil)                // not even parsed: still processed, as the scrape is up
++	if _, err := sw.getTargetResponse(); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	scrape("s2:1", "foo 1\n", fmt.Errorf("eof")) // the target restarted, and this failed
++	scrape("s2:2", "foo 1\n", nil)
++	scrape("s2:3", "foo 1\n", nil)
++
++	want := []string{deltaAckNew, deltaAckNew, "s1:1", "s1:1", deltaAckPeek, "s1:3", "s2:0", "s2:2"}
++	if fmt.Sprint(sent) != fmt.Sprint(want) {
++		t.Fatalf("acknowledged\n%q\nwant\n%q", sent, want)
++	}
++}
++
++// With ReadDeltaData unset, as in a vmagent run with -promscrape.deltaAck=false,
++// scraping goes through ReadData and acknowledges nothing.
++func TestScrapeWorkWithoutDeltaAck(t *testing.T) {
++	var sw scrapeWork
++	sw.Config = &ScrapeWork{ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
++	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
++	calls := 0
++	sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
++		calls++
++		_, _ = dst.Write([]byte("foo 1\n"))
++		return "", nil
++	}
++	tsmGlobal.Register(&sw)
++	if err := sw.scrapeInternal(123000, 123000); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	tsmGlobal.Unregister(&sw)
++	if calls != 1 || sw.deltaAck.Load() != nil {
++		t.Fatalf("ReadData called %d times, ack %v; want once and no ack", calls, sw.deltaAck.Load())
++	}
++}
 diff --git a/lib/promscrape/parse_mode_test.go b/lib/promscrape/parse_mode_test.go
 new file mode 100644
 index 000000000..58b66db18
@@ -1404,8 +1585,22 @@ index 000000000..58b66db18
 +		})
 +	}
 +}
+diff --git a/lib/promscrape/scraper.go b/lib/promscrape/scraper.go
+index bcaab8c6c..65e156c04 100644
+--- a/lib/promscrape/scraper.go
++++ b/lib/promscrape/scraper.go
+@@ -464,6 +464,9 @@ func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *
+ 	sc.sw.Config = sw
+ 	sc.sw.ScrapeGroup = group
+ 	sc.sw.ReadData = c.ReadData
++	if *deltaAck {
++		sc.sw.ReadDeltaData = c.ReadDeltaData
++	}
+ 	sc.sw.PushData = pushData
+ 	return sc, nil
+ }
 diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
-index 083b59f70..0faf23f80 100644
+index 083b59f70..7b636bdf2 100644
 --- a/lib/promscrape/scrapework.go
 +++ b/lib/promscrape/scrapework.go
 @@ -6,6 +6,7 @@ import (
@@ -1416,7 +1611,7 @@ index 083b59f70..0faf23f80 100644
  	"math"
  	"math/bits"
  	"strings"
-@@ -196,7 +197,9 @@ type scrapeWork struct {
+@@ -196,7 +197,22 @@ type scrapeWork struct {
  	Config *ScrapeWork
  
  	// ReadData is called for reading the scrape response data into dst.
@@ -1424,10 +1619,23 @@ index 083b59f70..0faf23f80 100644
 +	//
 +	// It returns the Content-Encoding of the read data: "gzip", "zstd" or "" for uncompressed data.
 +	ReadData func(dst *chunkedbuffer.Buffer) (string, error)
++
++	// ReadDeltaData, when set, is used instead of ReadData. It also sends ack as
++	// the acknowledgement of the last round of the target processed, and returns
++	// the round the response carries, "" when it carries none. See deltaAck.
++	ReadDeltaData func(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error)
++
++	// deltaAck is what the next scrape acknowledges to a target exposing
++	// increments through client_golang's promhttp/delta: nil before it has
++	// answered with a round, then the last round processed in full, or
++	// "<session>:0" when none of its session was. Such a target holds each round
++	// until the next request names it, and reports it again otherwise; see
++	// -promscrape.deltaAck.
++	deltaAck atomic.Pointer[string]
  
  	// PushData is called for pushing collected data.
  	//
-@@ -355,7 +358,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
+@@ -355,7 +371,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
  			}
  			return
  		case tt := <-ticker.C:
@@ -1436,7 +1644,7 @@ index 083b59f70..0faf23f80 100644
  			if d := math.Abs(float64(t - timestamp)); d > 0 && d/float64(scrapeInterval.Milliseconds()) > 0.1 {
  				// Too big jitter. Adjust timestamp
  				timestamp = t
-@@ -365,6 +368,18 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
+@@ -365,6 +381,18 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{})
  	}
  }
  
@@ -1455,7 +1663,7 @@ index 083b59f70..0faf23f80 100644
  func (sw *scrapeWork) logError(s string) {
  	if !*suppressScrapeErrors {
  		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s; "+
-@@ -406,7 +421,17 @@ var (
+@@ -406,7 +434,17 @@ var (
  	scrapesSkippedBySampleLimit = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_sample_limit_total")
  	scrapesSkippedByLabelLimit  = metrics.NewCounter("vm_promscrape_scrapes_skipped_by_label_limit_total")
  	scrapesFailed               = metrics.NewCounter("vm_promscrape_scrapes_failed_total")
@@ -1474,12 +1682,14 @@ index 083b59f70..0faf23f80 100644
  )
  
  func (sw *scrapeWork) needStreamParseMode(responseSize int) bool {
-@@ -424,13 +449,13 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
+@@ -424,24 +462,62 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
  	cb := chunkedbuffer.Get()
  	defer chunkedbuffer.Put(cb)
  
 -	isGzipped, err := sw.ReadData(cb)
-+	contentEncoding, err := sw.ReadData(cb)
++	// The response is only looked at: a target exposing increments must not
++	// count it as processed, nor settle the round the scrape loop is processing.
++	contentEncoding, _, err := sw.readData(cb, deltaAckPeek)
  	if err != nil {
  		return nil, err
  	}
@@ -1490,16 +1700,56 @@ index 083b59f70..0faf23f80 100644
  	return bb.B, err
  }
  
-@@ -441,7 +466,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+-func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error {
++// readData reads the scrape response into dst, acknowledging ack, or the last
++// round processed when ack is empty, to a target that exposes rounds.
++func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error) {
++	if sw.ReadDeltaData == nil {
++		contentEncoding, err = sw.ReadData(dst)
++		return contentEncoding, "", err
++	}
++	if ack == "" {
++		ack = deltaAckNew
++		if p := sw.deltaAck.Load(); p != nil {
++			ack = *p
++		}
++	}
++	return sw.ReadDeltaData(dst, ack)
++}
++
++// processedDeltaRound records what the next scrape acknowledges after one that
++// got round, "" when the response carried none, processed in full or not.
++func (sw *scrapeWork) processedDeltaRound(round string, processed bool) {
++	if round == "" {
++		return
++	}
++	if processed {
++		sw.deltaAck.Store(&round)
++		return
++	}
++	// A round of a session none of whose rounds was processed yet, as after
++	// the target restarted, acknowledges nothing of it.
++	session, _, _ := strings.Cut(round, ":")
++	if p := sw.deltaAck.Load(); p == nil || !strings.HasPrefix(*p, session+":") {
++		none := session + ":0"
++		sw.deltaAck.Store(&none)
++	}
++}
++
++func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) (err error) {
+ 	// Read the whole scrape response into cb.
+ 	// It is OK to do this for stream parsing mode, since the most of RAM
+ 	// is occupied during parsing of the read response body below.
  	// This also allows measuring the real scrape duration, which doesn't include
  	// the time needed for processing of the read response.
  	cb := chunkedbuffer.Get()
 -	isGzipped, err := sw.ReadData(cb)
-+	contentEncoding, err := sw.ReadData(cb)
++	contentEncoding, round, err := sw.readData(cb, "")
++	defer func() { sw.processedDeltaRound(round, err == nil) }()
  
  	// Measure scrape duration.
  	endTimestamp := time.Now().UnixMilli()
-@@ -454,11 +479,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -454,11 +530,20 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  	// without sacrificing the performance.
  	processScrapedDataConcurrencyLimitCh <- struct{}{}
  
@@ -1521,7 +1771,7 @@ index 083b59f70..0faf23f80 100644
  	}
  	chunkedbuffer.Put(cb)
  
-@@ -470,11 +504,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -470,11 +555,13 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  		// Process response body from scrape target in streaming manner.
  		// This case is optimized for targets exposing more than ten thousand of metrics per target,
  		// such as kube-state-metrics.
@@ -1535,7 +1785,7 @@ index 083b59f70..0faf23f80 100644
  		err = sw.processDataOneShot(scrapeTimestamp, realTimestamp, body.B, scrapeDurationSeconds, err)
  	}
  
-@@ -487,20 +523,80 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
+@@ -487,20 +574,80 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
  
  var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
  
@@ -1620,7 +1870,7 @@ index 083b59f70..0faf23f80 100644
  	}
  	return nil
  }
-@@ -601,6 +697,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
+@@ -601,6 +748,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
  }
  
  func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64) error {
@@ -1636,7 +1886,7 @@ index 083b59f70..0faf23f80 100644
  	var samplesScraped atomic.Int64
  	var samplesPostRelabeling atomic.Int64
  	var samplesDroppedTotal atomic.Int64
-@@ -612,11 +717,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+@@ -612,11 +768,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
  	bbLastScrape.B = sw.loadLastScrape(bbLastScrape.B)
  	lastScrapeStr := bytesutil.ToUnsafeString(bbLastScrape.B)
  
@@ -1648,7 +1898,7 @@ index 083b59f70..0faf23f80 100644
  	err := stream.Parse(r, scrapeTimestamp, "", false, prommetadata.IsEnabled(), func(rows []parser.Row, mms []parser.Metadata) error {
  		labelsLen := maxLabelsLen.Load()
  		wc := writeRequestCtxPool.Get(int(labelsLen))
-@@ -677,12 +780,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+@@ -677,12 +831,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
  		// This is a trade-off between performance and accuracy.
  		seriesAdded = getSeriesAdded(lastScrapeStr, bodyString)
  	}
@@ -1666,7 +1916,7 @@ index 083b59f70..0faf23f80 100644
  		samplesScraped:            int(samplesScraped.Load()),
  		samplesPostRelabeling:     int(samplesPostRelabeling.Load()),
  		seriesAdded:               seriesAdded,
-@@ -699,7 +805,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
+@@ -699,7 +856,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
  	}
  	leveledbytebufferpool.Put(bbLastScrape)
  
@@ -3779,7 +4029,7 @@ index 000000000..df96d560f
 +	}
 +}
 diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
-index 3fcb9f6a3..520f4ff4f 100644
+index 3fcb9f6a3..3094a7991 100644
 --- a/lib/streamaggr/output.go
 +++ b/lib/streamaggr/output.go
 @@ -3,18 +3,66 @@ package streamaggr
@@ -3908,7 +4158,7 @@ index 3fcb9f6a3..520f4ff4f 100644
  			for idx, o := range outputs {
  				o.pushSample(ao.configs[idx], sample, inputKey, deleteDeadline)
  			}
-@@ -88,49 +127,187 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+@@ -88,49 +127,196 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
  	}
  }
  
@@ -3969,6 +4219,15 @@ index 3fcb9f6a3..520f4ff4f 100644
  		deleted := ctx.flushTimestamp > av.deleteDeadline
  		if deleted {
 -			// Mark the current entry as deleted
++			// Under sample_timestamps an entry may still hold sums of intervals
++			// after the flush's boundary, which no flush has written yet: keep it
++			// until they are. Pushes stopped long ago, so this costs a lookup of
++			// the entries about to be dropped, and only of those.
++			if _, ok := av.firstPending(len(ao.configs), ctx.isGreen); ok {
++				deleted = false
++			}
++		}
++		if deleted {
 +			if ao.resetMarkerOnStale {
 +				ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp)
 +			}
@@ -4007,7 +4266,9 @@ index 3fcb9f6a3..520f4ff4f 100644
  		if ctx.isLast {
 -			m.Delete(k)
 +			sh.removeEntry(outputKey, av)
-+		}
+ 		}
+-		return true
+-	})
 +	}
 +}
 +
@@ -4022,9 +4283,7 @@ index 3fcb9f6a3..520f4ff4f 100644
 +	for i := range outputs {
 +		if suffix, ok := cumulativeSuffix(ao.configs[i]); ok {
 +			ctx.appendSeriesAt(outputKey, suffix, timestamp, 0)
- 		}
--		return true
--	})
++		}
 +	}
  }
  
@@ -4812,13 +5071,15 @@ index 000000000..db2faecaf
 +}
 diff --git a/lib/streamaggr/sample_timestamps_test.go b/lib/streamaggr/sample_timestamps_test.go
 new file mode 100644
-index 000000000..49a20b7f2
+index 000000000..847708a63
 --- /dev/null
 +++ b/lib/streamaggr/sample_timestamps_test.go
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,607 @@
 +package streamaggr
 +
 +import (
++	"fmt"
++	"math/rand"
 +	"sort"
 +	"strings"
 +	"sync"
@@ -5044,6 +5305,477 @@ index 000000000..49a20b7f2
 +		}
 +	}
 +}
++
++// Targets are scraped at offsets of their own, so the rounds of one minute reach
++// an output with as many timestamps as there are targets. They are summed per
++// minute and written once, at the end of the minute, not once per target; a
++// sample right on a boundary belongs to the minute it ends.
++func TestSampleTimestampsOneSamplePerIntervalAcrossTargets(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
++	var pushes []latePush
++	// Three targets at 5s, 23s and 41s into minutes 1 to 3, all processed at
++	// 4m30s, as while the aggregator is behind.
++	for m := 1; m <= 3; m++ {
++		for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
++			pushes = append(pushes, latePush{at: 4*time.Minute + 30*time.Second, sampleAt: time.Duration(m)*time.Minute + off, metrics: `foo 1`})
++		}
++	}
++	// A round scraped exactly at 5m belongs to (4m, 5m].
++	pushes = append(pushes, latePush{at: 5*time.Minute + 10*time.Second, sampleAt: 5 * time.Minute, metrics: `foo 7`})
++	got := runLateScenario(t, cfg, pushes, 7*time.Minute)["foo"]
++	for m, want := range map[int]float64{1: 0, 2: 3, 3: 3, 4: 3, 5: 7, 6: 0} {
++		to := time.Duration(m) * time.Minute
++		if sum := sumIn(got, to-time.Minute, to); sum != want {
++			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
++		}
++	}
++	if len(got) != 4 {
++		t.Errorf("want one sample per minute with input, 4 in all; got %d: %v", len(got), got)
++	}
++}
++
++// The totals of rounds from several targets are written once per minute, at the
++// end of the minute, and the increase over every minute is the rounds in it.
++func TestSampleTimestampsTotalOneSamplePerIntervalAcrossTargets(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  sample_timestamps: true\n"
++	var pushes []latePush
++	for m := 0; m < 3; m++ {
++		for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
++			pushes = append(pushes, latePush{at: 3*time.Minute + 30*time.Second, sampleAt: time.Duration(m)*time.Minute + off, metrics: `foo 1`})
++		}
++	}
++	got := runLateScenario(t, cfg, pushes, 5*time.Minute)["foo"]
++	for m := 1; m <= 3; m++ {
++		to := time.Duration(m) * time.Minute
++		if inc := increaseIn(got, to-time.Minute, to); inc != 3 {
++			t.Errorf("increase over minute %d is %v, want 3; samples %v", m, inc, got)
++		}
++	}
++	for _, s := range got {
++		if s.at%time.Minute != 0 {
++			t.Errorf("sample %v is not at the end of a minute; samples %v", s, got)
++		}
++	}
++}
++
++// The intervals samples are put into are the rule's own, on the grid its
++// flushes are aligned to. time.Truncate counts from year 1, not from the Unix
++// epoch, and for an interval that does not divide a day, such as 7m, the two
++// grids differ: on the epoch's the sums would end between two flushes.
++func TestSampleTimestampsIntervalsFollowTheFlushGrid(t *testing.T) {
++	for _, iv := range []time.Duration{5 * time.Minute, 7 * time.Minute} {
++		cfg := fmt.Sprintf("- match: foo\n  interval: %s\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n"+
++			"  staleness_interval: 2h\n  sample_timestamps: true\n", iv)
++		var start time.Time
++		synctest.Test(t, func(t *testing.T) { start = time.Now() })
++		// The first interval on the flush grid that starts after the scenario does.
++		first := start.Truncate(iv).Add(iv).Sub(start)
++		var pushes []latePush
++		// Samples at its start, inside it, at its very end and just after, all
++		// processed one interval and a half late.
++		for _, at := range []time.Duration{first + time.Millisecond, first + iv/2, first + iv, first + iv + time.Millisecond} {
++			pushes = append(pushes, latePush{at: first + 3*iv, sampleAt: at, metrics: `foo 1`})
++		}
++		got := runLateScenario(t, cfg, pushes, first+5*iv)["foo"]
++		for _, s := range got {
++			if at := start.Add(s.at); !at.Equal(at.Truncate(iv)) {
++				t.Errorf("interval %s: sample %v at %s is off the flush grid; samples %v", iv, s, at.Format("15:04:05.000"), got)
++			}
++		}
++		if inc := increaseIn(got, first, first+iv); inc != 3 {
++			t.Errorf("interval %s: increase over the first interval is %v, want 3; samples %v", iv, inc, got)
++		}
++		if inc := increaseIn(got, first+iv, first+2*iv); inc != 1 {
++			t.Errorf("interval %s: increase over the second interval is %v, want 1; samples %v", iv, inc, got)
++		}
++	}
++}
++
++// A flush that runs a little after its boundary finds samples scraped after the
++// boundary, of the interval still open. They must not be written into the
++// interval that just closed, whatever the flush's back-off, and not twice.
++func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
++	for _, output := range []string{"sum_samples", "sum_samples_total"} {
++		cfg := "- match: foo\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
++			"  staleness_interval: 40m\n  sample_timestamps: true\n"
++		var got []outSample
++		synctest.Test(t, func(t *testing.T) {
++			start := time.Now()
++			var mu sync.Mutex
++			pushFunc := func(tss []prompb.TimeSeries) {
++				mu.Lock()
++				defer mu.Unlock()
++				for _, ts := range tss {
++					for _, s := range ts.Samples {
++						got = append(got, outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++					}
++				}
++			}
++			a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			aggr := a.as[0]
++			// Many flushes in, so the back-off is several hundred milliseconds.
++			aggr.flushSeq.Store(600)
++			T := start.Add(time.Minute)
++			time.Sleep(T.Add(-10 * time.Second).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(`foo 1`, T.Add(-10*time.Second).UnixMilli()), nil)
++			// The flush for T runs 20ms late, and a round scraped 5ms after T is
++			// already in.
++			time.Sleep(T.Add(5 * time.Millisecond).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(`foo 10`, T.Add(5*time.Millisecond).UnixMilli()), nil)
++			time.Sleep(T.Add(20 * time.Millisecond).Sub(time.Now()))
++			aggr.flush(pushFunc, T, aggr.cs.Load(), false)
++			time.Sleep(start.Add(3 * time.Minute).Sub(time.Now()))
++			a.MustStop()
++		})
++		sort.SliceStable(got, func(i, j int) bool { return got[i].at < got[j].at })
++		first, second := sumIn(got, 0, time.Minute), sumIn(got, time.Minute, 2*time.Minute)
++		if output == "sum_samples_total" {
++			first, second = increaseIn(got, -time.Minute, time.Minute), increaseIn(got, time.Minute, 2*time.Minute)
++		}
++		if first != 1 || second != 10 {
++			t.Errorf("%s: minute 1 got %v, want 1; minute 2 got %v, want 10; samples %v", output, first, second, got)
++		}
++		// Left for the next flush, the open interval is written at its end.
++		for _, s := range got {
++			if s.at > time.Minute && s.at < 2*time.Minute-time.Second {
++				t.Errorf("%s: sample %v of minute 2 was written before minute 2 ended; samples %v", output, s, got)
++			}
++		}
++	}
++}
++
++// The flush on shutdown writes the interval still open, before it ends. Right
++// after a boundary, backing off must not put it into the interval just closed.
++func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
++	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
++		"  flush_on_shutdown: true\n  sample_timestamps: true\n"
++	var got []outSample
++	synctest.Test(t, func(t *testing.T) {
++		start := time.Now()
++		var mu sync.Mutex
++		a, err := LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
++			mu.Lock()
++			defer mu.Unlock()
++			for _, ts := range tss {
++				for _, s := range ts.Samples {
++					got = append(got, outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++				}
++			}
++		}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		a.as[0].flushSeq.Store(600)
++		T := start.Add(time.Minute)
++		time.Sleep(T.Add(2 * time.Millisecond).Sub(time.Now()))
++		a.Push(prometheus.MustParsePromMetrics(`foo 10`, T.Add(time.Millisecond).UnixMilli()), nil)
++		time.Sleep(T.Add(5 * time.Millisecond).Sub(time.Now()))
++		a.MustStop()
++	})
++	if sum := sumIn(got, time.Minute, 2*time.Minute); sum != 10 || len(got) != 1 {
++		t.Fatalf("want 10 written once within minute 2; samples %v", got)
++	}
++}
++
++// Every sample is counted exactly once, in the interval its timestamp falls in,
++// however late the aggregator processes it and however long its flushes take:
++// targets scraped at offsets of their own, rounds processed up to two and a
++// half minutes late, flushes running over their interval, and a flush on
++// shutdown. sum_samples has to match every interval exactly. sum_samples_total
++// has to end at the sum of everything and never go back; an interval arriving
++// after a later one was written goes to that later one by design.
++func TestSampleTimestampsCountsEverySampleOnceInItsInterval(t *testing.T) {
++	for seed := int64(1); seed <= 20; seed++ {
++		for _, output := range []string{"sum_samples", "sum_samples_total"} {
++			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
++				checkCountsEverySampleOnce(t, seed, output, iv)
++			}
++		}
++	}
++}
++
++func checkCountsEverySampleOnce(t *testing.T, seed int64, output string, iv time.Duration) {
++	t.Helper()
++	cfg := fmt.Sprintf("- match: foo\n  interval: %s\n  outputs: [%s]\n  keep_metric_names: true\n"+
++		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", iv, output)
++	rnd := rand.New(rand.NewSource(seed))
++	type push struct {
++		at, sampleAt time.Duration
++		value        float64
++	}
++	const minutes = 40
++	var pushes []push
++	offsets := []time.Duration{0, 1 * time.Millisecond, 13 * time.Second, 37 * time.Second, 59*time.Second + 999*time.Millisecond}
++	for m := 1; m < minutes; m++ {
++		for _, off := range offsets {
++			sampleAt := time.Duration(m)*time.Minute + off
++			delay := time.Duration(rnd.Intn(2000)) * time.Millisecond
++			if rnd.Intn(5) == 0 {
++				delay = time.Duration(rnd.Intn(150)) * time.Second
++			}
++			pushes = append(pushes, push{at: sampleAt + delay, sampleAt: sampleAt, value: float64(1 + rnd.Intn(9))})
++		}
++	}
++	sort.SliceStable(pushes, func(i, j int) bool { return pushes[i].at < pushes[j].at })
++	flushDelays := make([]time.Duration, 100)
++	for i := range flushDelays {
++		if rnd.Intn(4) == 0 {
++			flushDelays[i] = time.Duration(1+rnd.Intn(100)) * time.Second
++		}
++	}
++
++	var got []outSample
++	var start time.Time
++	synctest.Test(t, func(t *testing.T) {
++		start = time.Now()
++		var mu sync.Mutex
++		flushes := 0
++		pushFunc := func(tss []prompb.TimeSeries) {
++			mu.Lock()
++			for _, ts := range tss {
++				for _, s := range ts.Samples {
++					got = append(got, outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++				}
++			}
++			d := flushDelays[flushes%len(flushDelays)]
++			flushes++
++			mu.Unlock()
++			time.Sleep(d)
++		}
++		a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		for _, p := range pushes {
++			time.Sleep(start.Add(p.at).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(fmt.Sprintf("foo %v", p.value), start.Add(p.sampleAt).UnixMilli()), nil)
++		}
++		time.Sleep(start.Add(minutes*time.Minute + 5*time.Minute).Sub(time.Now()))
++		a.MustStop()
++	})
++	sort.SliceStable(got, func(i, j int) bool { return got[i].at < got[j].at })
++
++	// The true sums per interval, on the flushes' grid.
++	end := func(at time.Duration) time.Duration {
++		abs := start.Add(at)
++		e := abs.Truncate(iv)
++		if !e.Equal(abs) {
++			e = e.Add(iv)
++		}
++		return e.Sub(start)
++	}
++	want := map[time.Duration]float64{}
++	var all float64
++	for _, p := range pushes {
++		want[end(p.sampleAt)] += p.value
++		all += p.value
++	}
++	name := fmt.Sprintf("seed=%d output=%s interval=%s", seed, output, iv)
++	for _, s := range got {
++		if s.at > minutes*time.Minute+5*time.Minute {
++			t.Fatalf("%s: sample %v is after the end of the run", name, s)
++		}
++	}
++	if output == "sum_samples" {
++		for e, w := range want {
++			if g := sumIn(got, e-iv, e); g != w {
++				t.Errorf("%s: interval ending %s sums to %v, want %v", name, e, g, w)
++			}
++		}
++		if g := sumIn(got, -time.Hour, 2*time.Hour); g != all {
++			t.Errorf("%s: everything sums to %v, want %v", name, g, all)
++		}
++		return
++	}
++	for i := 1; i < len(got); i++ {
++		if got[i].value < got[i-1].value {
++			t.Fatalf("%s: the counter goes back from %v to %v", name, got[i-1], got[i])
++		}
++	}
++	if inc := increaseIn(got, -time.Hour, 2*time.Hour); inc != all {
++		t.Errorf("%s: the counter ends at %v, want %v", name, inc, all)
++	}
++}
++
++// A flush that takes longer than its interval reaches some entries only after
++// the next interval has started, or ended: such an entry holds samples of the
++// interval right after the boundary and of the one after that. Neither may be
++// written ahead of the other, or sum_samples_total, which never writes a
++// timestamp before one it has written, would move the first into the second.
++func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
++	for _, output := range []string{"sum_samples", "sum_samples_total"} {
++		cfg := "- match: '{__name__=~\"foo|bar\"}'\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
++			"  staleness_interval: 40m\n  sample_timestamps: true\n"
++		var got []outSample
++		synctest.Test(t, func(t *testing.T) {
++			start := time.Now()
++			F := start.Add(time.Minute)
++			var mu sync.Mutex
++			pushFunc := func(tss []prompb.TimeSeries) {
++				stuck := false
++				mu.Lock()
++				for _, ts := range tss {
++					if ts.Labels[0].Value == "bar" || (len(ts.Labels) > 1 && ts.Labels[1].Value == "bar") {
++						stuck = true
++						continue
++					}
++					for _, s := range ts.Samples {
++						got = append(got, outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++					}
++				}
++				mu.Unlock()
++				if stuck && time.Now().Before(F.Add(time.Second)) {
++					// The background flush at F is stuck for 200 seconds, as
++					// a flush walking a million entries would be.
++					time.Sleep(200 * time.Second)
++				}
++			}
++			a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			aggr := a.as[0]
++			time.Sleep(F.Add(-30 * time.Second).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(`bar 1`, F.Add(-30*time.Second).UnixMilli()), nil)
++			at := func(d time.Duration) { time.Sleep(F.Add(d).Sub(time.Now())) }
++			at(30 * time.Second)
++			a.Push(prometheus.MustParsePromMetrics(`foo 1`, F.Add(30*time.Second).UnixMilli()), nil)
++			at(70 * time.Second)
++			a.Push(prometheus.MustParsePromMetrics(`foo 10`, F.Add(70*time.Second).UnixMilli()), nil)
++			// The stuck flush for F reaches foo's entry 90 seconds late.
++			at(90 * time.Second)
++			aggr.flush(pushFunc, F, aggr.cs.Load(), false)
++			// The next flush to run is for F+2m.
++			at(120 * time.Second)
++			aggr.flush(pushFunc, F.Add(2*time.Minute), aggr.cs.Load(), false)
++			at(10 * time.Minute)
++			a.MustStop()
++		})
++		sort.SliceStable(got, func(i, j int) bool { return got[i].at < got[j].at })
++		var m2, m3 float64
++		if output == "sum_samples" {
++			m2, m3 = sumIn(got, time.Minute, 2*time.Minute), sumIn(got, 2*time.Minute, 3*time.Minute)
++		} else {
++			m2, m3 = increaseIn(got, time.Minute, 2*time.Minute), increaseIn(got, 2*time.Minute, 3*time.Minute)
++		}
++		if m2 != 1 || m3 != 10 {
++			t.Errorf("%s: minute 2 got %v, want 1; minute 3 got %v, want 10; samples %v", output, m2, m3, got)
++		}
++	}
++}
++
++// An entry that receives nothing for staleness_interval is dropped, but not
++// while it holds sums of intervals no flush has written yet: a sample
++// timestamped ahead of the clock waits for its interval to end, and the entry
++// with it, on shutdown too.
++func TestSampleTimestampsStaleEntryKeepsPendingSums(t *testing.T) {
++	for _, stopAt := range []time.Duration{10 * time.Minute, 2*time.Minute + 30*time.Second} {
++		cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
++			"  staleness_interval: 1m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
++		got := runLateScenario(t, cfg, []latePush{{at: 10 * time.Second, sampleAt: 2*time.Minute + 30*time.Second, metrics: `foo 5`}}, stopAt)["foo"]
++		if sum := sumIn(got, 2*time.Minute, 3*time.Minute); sum != 5 || len(got) != 1 {
++			t.Errorf("stopped at %s: want 5 written once within minute 3; samples %v", stopAt, got)
++		}
++	}
++}
+diff --git a/lib/streamaggr/sample_timestamps_timing_test.go b/lib/streamaggr/sample_timestamps_timing_test.go
+new file mode 100644
+index 000000000..a29cc8215
+--- /dev/null
++++ b/lib/streamaggr/sample_timestamps_timing_test.go
+@@ -0,0 +1,88 @@
++package streamaggr
++
++import (
++	"fmt"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++)
++
++// The ACG shape under sample_timestamps: every output is fed by many targets,
++// and vmagent scrapes each target at an offset of its own, so the rounds of one
++// minute reach an output with as many distinct timestamps as there are targets.
++// lag is how many minutes of rounds pile up between two flushes, as while
++// vmagent is behind.
++func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
++	const (
++		targets = 20
++		keys    = 2000
++	)
++	for _, lag := range []int{1, 4} {
++		for _, mode := range []string{"off", "on"} {
++			b.Run(fmt.Sprintf("lag=%dm/sample_timestamps=%s", lag, mode), func(b *testing.B) {
++				config := `
++- match: acg_cost_total
++  interval: 1m
++  by: [apikey_id]
++  outputs: [sum_samples]
++`
++				if mode == "on" {
++					config += "  sample_timestamps: true\n"
++				}
++				var outSamples atomic.Int64
++				pushFunc := func(tss []prompb.TimeSeries) {
++					n := 0
++					for _, ts := range tss {
++						n += len(ts.Samples)
++					}
++					outSamples.Add(int64(n))
++				}
++				a, err := LoadFromData([]byte(config), pushFunc, nil, "bench")
++				if err != nil {
++					b.Fatalf("cannot load config: %s", err)
++				}
++				defer a.MustStop()
++				aggr := a.as[0]
++
++				rounds := make([][]prompb.TimeSeries, targets)
++				for t := range rounds {
++					tss := make([]prompb.TimeSeries, keys)
++					for k := range tss {
++						tss[k] = prompb.TimeSeries{
++							Labels: []prompb.Label{
++								{Name: "__name__", Value: "acg_cost_total"},
++								{Name: "apikey_id", Value: fmt.Sprintf("k%d", k)},
++								{Name: "instance", Value: fmt.Sprintf("pod-%d", t)},
++							},
++							Samples: []prompb.Sample{{Value: 1}},
++						}
++					}
++					rounds[t] = tss
++				}
++
++				minute := time.Now().Truncate(time.Minute).Add(-time.Hour).UnixMilli()
++				var matchIdxs []byte
++				b.ReportAllocs()
++				b.ResetTimer()
++				for i := 0; i < b.N; i++ {
++					for m := 0; m < lag; m++ {
++						for t, tss := range rounds {
++							// each target's own offset into the minute
++							ts := minute + int64(t)*2_917
++							for k := range tss {
++								tss[k].Samples[0].Timestamp = ts
++							}
++							matchIdxs = a.Push(tss, matchIdxs)
++						}
++						minute += 60_000
++					}
++					aggr.flush(pushFunc, time.UnixMilli(minute), aggr.cs.Load(), false)
++				}
++				b.StopTimer()
++				b.ReportMetric(float64(outSamples.Load())/float64(b.N*keys), "out-samples/series/flush")
++			})
++		}
++	}
++}
 diff --git a/lib/streamaggr/std.go b/lib/streamaggr/std.go
 index af259b8c0..2128494f6 100644
 --- a/lib/streamaggr/std.go
@@ -5058,7 +5790,7 @@ index af259b8c0..2128494f6 100644
 +// costs a hash and two string compares per label per sample, for nothing.
 +func (*stdAggrConfig) needsInputKey() bool { return false }
 diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
-index 2c9ccc38d..8ca380afe 100644
+index 2c9ccc38d..6648a3e51 100644
 --- a/lib/streamaggr/streamaggr.go
 +++ b/lib/streamaggr/streamaggr.go
 @@ -47,6 +47,7 @@ var supportedOutputs = []string{
@@ -5074,9 +5806,9 @@ index 2c9ccc38d..8ca380afe 100644
  	// EnableWindows enables aggregation in windows
  	EnableWindows bool
 +
-+	// SampleTimestamps writes sum_samples and sum_samples_total at the timestamps
-+	// of the input samples instead of at the flush, so an input processed late
-+	// still counts towards the interval it was scraped in.
++	// SampleTimestamps writes sum_samples and sum_samples_total at the end of the
++	// interval the input samples' timestamps fall in instead of at the flush, so
++	// an input processed late still counts towards the interval it was scraped in.
 +	//
 +	// This option can be overridden individually per each aggregation via sample_timestamps option.
 +	SampleTimestamps bool
@@ -5384,7 +6116,21 @@ index 2c9ccc38d..8ca380afe 100644
  
  	by                  []string
  	without             []string
-@@ -446,6 +694,7 @@ type aggregator struct {
+@@ -413,6 +661,13 @@ type aggregator struct {
+ 	// interval is the interval between flushes
+ 	interval time.Duration
+ 
++	// intervalPhaseMsec is a Unix timestamp on the grid the flushes are aligned
++	// to. time.Truncate counts intervals from the zero time, January 1 of year 1,
++	// not from the Unix epoch, and the two grids differ for an interval that does
++	// not divide a day, such as 7m. sample_timestamps puts samples into intervals
++	// on the flushes' grid.
++	intervalPhaseMsec int64
++
+ 	// dedupInterval is optional deduplication interval for incoming samples
+ 	dedupInterval time.Duration
+ 
+@@ -446,6 +701,7 @@ type aggregator struct {
  	samplesLag    *metrics.Histogram
  
  	flushTimeouts     *metrics.Counter
@@ -5392,7 +6138,7 @@ index 2c9ccc38d..8ca380afe 100644
  	ignoredOldSamples *metrics.Counter
  	ignoredNaNSamples *metrics.Counter
  	matchedSamples    *metrics.Counter
-@@ -494,6 +743,22 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -494,6 +750,22 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  		return nil, fmt.Errorf("interval=%s must be a multiple of dedup_interval=%s", interval, dedupInterval)
  	}
  
@@ -5415,7 +6161,7 @@ index 2c9ccc38d..8ca380afe 100644
  	// check cfg.StalenessInterval
  	stalenessInterval := interval * 2
  	if cfg.StalenessInterval != "" {
-@@ -581,6 +846,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -581,6 +853,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  		enableWindows = *v
  	}
  
@@ -5434,7 +6180,7 @@ index 2c9ccc38d..8ca380afe 100644
  	// Initialize common metric labels
  	name := cfg.Name
  	if name == "" {
-@@ -595,18 +872,43 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -595,18 +879,43 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  	useInputKey := dedupInterval <= 0
  	useSharedState := enableWindows && useInputKey
  	aggrOutputs := &aggrOutputs{
@@ -5482,7 +6228,7 @@ index 2c9ccc38d..8ca380afe 100644
  	outputsLabels := make([]string, 0, len(outputsSeen))
  	for o := range outputsSeen {
  		outputsLabels = append(outputsLabels, o)
-@@ -635,8 +937,11 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -635,14 +944,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  		keepMetricNames:   keepMetricNames,
  		ignoreOldSamples:  ignoreOldSamples,
  		enableWindows:     enableWindows,
@@ -5494,7 +6240,16 @@ index 2c9ccc38d..8ca380afe 100644
  		by:                  by,
  		without:             without,
  		aggregateOnlyByTime: aggregateOnlyByTime,
-@@ -655,6 +960,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+-		interval:      interval,
+-		dedupInterval: dedupInterval,
++		interval:          interval,
++		intervalPhaseMsec: time.UnixMilli(0).Truncate(interval).UnixMilli(),
++		dedupInterval:     dedupInterval,
+ 
+ 		aggrOutputs: aggrOutputs,
+ 
+@@ -655,6 +968,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  
  		matchedSamples:    ms.NewCounter(fmt.Sprintf(`vm_streamaggr_matched_samples_total{%s}`, metricLabels)),
  		flushTimeouts:     ms.NewCounter(fmt.Sprintf(`vm_streamaggr_flush_timeouts_total{%s}`, metricLabels)),
@@ -5502,7 +6257,7 @@ index 2c9ccc38d..8ca380afe 100644
  		ignoredNaNSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="nan",%s}`, metricLabels)),
  		ignoredOldSamples: ms.NewCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="too_old",%s}`, metricLabels)),
  	}
-@@ -713,7 +1019,21 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+@@ -713,7 +1027,21 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
  	return a, nil
  }
  
@@ -5525,7 +6280,7 @@ index 2c9ccc38d..8ca380afe 100644
  	// check for duplicated output
  	if _, ok := outputsSeen[output]; ok {
  		return nil, fmt.Errorf("`outputs` list contains duplicate aggregation function: %s", output)
-@@ -777,7 +1097,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+@@ -777,7 +1105,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
  	case "stdvar":
  		return newStdvarAggrConfig(), nil
  	case "sum_samples":
@@ -5536,7 +6291,7 @@ index 2c9ccc38d..8ca380afe 100644
  	case "total":
  		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
  	case "total_prometheus":
-@@ -848,6 +1170,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+@@ -848,6 +1178,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
  			} else {
  				a.flush(pf, flushTime, cs, false)
  			}
@@ -5546,7 +6301,7 @@ index 2c9ccc38d..8ca380afe 100644
  			for time.Now().After(flushTime) {
  				flushTime = flushTime.Add(a.interval)
  			}
-@@ -885,6 +1210,14 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+@@ -885,6 +1218,14 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
  	if skipIncompleteFlush || ignoreFirstIntervals > 0 {
  		pf = nil
  	}
@@ -5561,7 +6316,7 @@ index 2c9ccc38d..8ca380afe 100644
  	a.flush(pf, flushTime, cs, true)
  }
  
-@@ -965,12 +1298,13 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+@@ -965,12 +1306,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  	deleteDeadlineMsec := deleteDeadline.UnixMilli()
  
  	minDeadline := a.minDeadline.Load()
@@ -5572,11 +6327,18 @@ index 2c9ccc38d..8ca380afe 100644
  	cs := a.cs.Load()
  
 -	var maxLagMsec int64
++	// Under sample_timestamps a sample is kept under the end of the interval it
++	// falls in, not under its own timestamp. Every target is scraped at an
++	// offset of its own, so the exact timestamps would give an output fed by N
++	// targets N sums to keep and N samples to write per interval -- N times the
++	// output, and more state still for every interval the aggregator is behind.
++	sampleTimestamps := a.sampleTimestamps
++
 +	var maxLagMsec, maxTimestamp int64
  	for idx, ts := range tss {
  		if !a.match.Match(ts.Labels) {
  			continue
-@@ -998,7 +1332,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+@@ -998,7 +1347,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  		}
  
  		bufLen := len(buf)
@@ -5585,15 +6347,32 @@ index 2c9ccc38d..8ca380afe 100644
  		// key remains valid only by the end of this function and can't be reused after
  		// do not intern key because number of unique keys could be too high
  		key := bytesutil.ToUnsafeString(buf[bufLen:])
-@@ -1017,6 +1351,7 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+@@ -1017,17 +1366,22 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  			if lagMsec > maxLagMsec {
  				maxLagMsec = lagMsec
  			}
 +			maxTimestamp = max(maxTimestamp, s.Timestamp)
++			timestamp := s.Timestamp
++			if sampleTimestamps {
++				timestamp = a.intervalEnd(timestamp)
++			}
  			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
  				ctx.green = append(ctx.green, pushSample{
  					key:       key,
-@@ -1038,6 +1373,12 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 					value:     s.Value,
+-					timestamp: s.Timestamp,
++					timestamp: timestamp,
+ 				})
+ 			} else {
+ 				ctx.blue = append(ctx.blue, pushSample{
+ 					key:       key,
+ 					value:     s.Value,
+-					timestamp: s.Timestamp,
++					timestamp: timestamp,
+ 				})
+ 			}
+ 		}
+@@ -1038,6 +1392,12 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  		a.muFlushAfter.Unlock()
  	}
  	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
@@ -5606,11 +6385,21 @@ index 2c9ccc38d..8ca380afe 100644
  
  	ctx.buf = buf
  
-@@ -1057,13 +1398,20 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+@@ -1057,13 +1417,30 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
  	}
  }
  
 -func compressLabels(dst []byte, inputLabels, outputLabels []prompb.Label) []byte {
++// intervalEnd returns the end of the interval ts falls in, on the grid the
++// flushes are aligned to: intervals are (end - interval, end].
++func (a *aggregator) intervalEnd(ts int64) int64 {
++	phase, iv := a.intervalPhaseMsec, a.interval.Milliseconds()
++	if ts <= phase {
++		return ts
++	}
++	return phase + ((ts-phase-1)/iv+1)*iv
++}
++
 +// compressLabels builds a sample's key: the length of the output part, the
 +// output part, and -- only when some configured output keeps state per input
 +// series -- the input part. Compressing the input part costs a hash and two
@@ -5630,7 +6419,7 @@ index 2c9ccc38d..8ca380afe 100644
  	return dst
  }
  
-@@ -1078,6 +1426,7 @@ type pushCtx struct {
+@@ -1078,6 +1455,7 @@ type pushCtx struct {
  	inputLabels  promutil.Labels
  	outputLabels promutil.Labels
  	buf          []byte
@@ -5638,7 +6427,7 @@ index 2c9ccc38d..8ca380afe 100644
  }
  
  func (ctx *pushCtx) reset() {
-@@ -1144,6 +1493,9 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
+@@ -1144,6 +1522,9 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
  	ctx.pushFunc = pushFunc
  	ctx.flushTimestamp = flushTimestamp
  	ctx.isLast = isLast
@@ -5648,7 +6437,7 @@ index 2c9ccc38d..8ca380afe 100644
  	return ctx
  }
  
-@@ -1162,6 +1514,12 @@ type flushCtx struct {
+@@ -1162,6 +1543,12 @@ type flushCtx struct {
  	isGreen        bool
  	isLast         bool
  
@@ -5661,7 +6450,7 @@ index 2c9ccc38d..8ca380afe 100644
  	tss     []prompb.TimeSeries
  	labels  []prompb.Label
  	samples []prompb.Sample
-@@ -1174,6 +1532,7 @@ func (ctx *flushCtx) reset() {
+@@ -1174,6 +1561,7 @@ func (ctx *flushCtx) reset() {
  	ctx.isGreen = false
  	ctx.isLast = false
  	ctx.flushTimestamp = 0
@@ -5669,7 +6458,24 @@ index 2c9ccc38d..8ca380afe 100644
  	ctx.resetSeries()
  }
  
-@@ -1230,6 +1589,10 @@ func (ctx *flushCtx) flushSeries() {
+@@ -1201,7 +1589,7 @@ func (ctx *flushCtx) flushSeries() {
+ 		// Fast path - push the output metrics.
+ 		if ctx.pushFunc != nil {
+ 			ctx.pushFunc(tss)
+-			ctx.ao.outputSamples.Add(len(tss))
++			ctx.ao.outputSamples.Add(samplesCount(tss))
+ 		}
+ 		return
+ 	}
+@@ -1223,13 +1611,17 @@ func (ctx *flushCtx) flushSeries() {
+ 	}
+ 	if ctx.pushFunc != nil {
+ 		ctx.pushFunc(dst)
+-		ctx.ao.outputSamples.Add(len(dst))
++		ctx.ao.outputSamples.Add(samplesCount(dst))
+ 	}
+ 	auxLabels.Labels = dstLabels
+ 	promutil.PutLabels(auxLabels)
  }
  
  func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
@@ -5680,7 +6486,7 @@ index 2c9ccc38d..8ca380afe 100644
  	labelsLen := len(ctx.labels)
  	samplesLen := len(ctx.samples)
  	ctx.labels = decompressLabels(ctx.labels, key)
-@@ -1237,7 +1600,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+@@ -1237,7 +1629,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
  		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
  	}
  	ctx.samples = append(ctx.samples, prompb.Sample{
@@ -5689,6 +6495,61 @@ index 2c9ccc38d..8ca380afe 100644
  		Value:     value,
  	})
  	ctx.tss = append(ctx.tss, prompb.TimeSeries{
+@@ -1251,6 +1643,54 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+ 	}
+ }
+ 
++// samplesCount counts the samples in tss: a series carries several under
++// sample_timestamps, one per pending interval, see beginSeries.
++func samplesCount(tss []prompb.TimeSeries) int {
++	n := 0
++	for i := range tss {
++		n += len(tss[i].Samples)
++	}
++	return n
++}
++
++// beginSeries starts an output series that takes several samples, added with
++// appendSample and closed with endSeries, so that an output writing more than
++// one sample per flush -- one per pending interval under sample_timestamps --
++// decompresses its labels and goes to pushFunc once rather than per sample.
++func (ctx *flushCtx) beginSeries(key, suffix string) (labelsLen, samplesLen int) {
++	labelsLen = len(ctx.labels)
++	samplesLen = len(ctx.samples)
++	ctx.labels = decompressLabels(ctx.labels, key)
++	if !ctx.a.keepMetricNames {
++		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
++	}
++	return labelsLen, samplesLen
++}
++
++// appendSample adds a sample to the series beginSeries started. Samples have to
++// come in timestamp order.
++func (ctx *flushCtx) appendSample(timestamp int64, value float64) {
++	ctx.samples = append(ctx.samples, prompb.Sample{
++		Timestamp: timestamp,
++		Value:     value,
++	})
++}
++
++// endSeries closes the series beginSeries started; one without samples is dropped.
++func (ctx *flushCtx) endSeries(labelsLen, samplesLen int) {
++	if len(ctx.samples) == samplesLen {
++		ctx.labels = ctx.labels[:labelsLen]
++		return
++	}
++	ctx.tss = append(ctx.tss, prompb.TimeSeries{
++		Labels:  ctx.labels[labelsLen:],
++		Samples: ctx.samples[samplesLen:],
++	})
++	if len(ctx.tss) >= 10_000 {
++		ctx.flushSeries()
++	}
++}
++
+ func (ctx *flushCtx) appendSeriesWithExtraLabel(key, suffix string, value float64, extraName, extraValue string) {
+ 	labelsLen := len(ctx.labels)
+ 	samplesLen := len(ctx.samples)
 diff --git a/lib/streamaggr/streamaggr_timing_test.go b/lib/streamaggr/streamaggr_timing_test.go
 index 01a4f5423..0fe01bcf7 100644
 --- a/lib/streamaggr/streamaggr_timing_test.go
@@ -5702,22 +6563,23 @@ index 01a4f5423..0fe01bcf7 100644
  	"total_prometheus",
  	"unique_samples",
 diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
-index 8ec63e679..58dc1455a 100644
+index 8ec63e679..e1513e487 100644
 --- a/lib/streamaggr/sum_samples.go
 +++ b/lib/streamaggr/sum_samples.go
-@@ -1,5 +1,11 @@
+@@ -1,5 +1,12 @@
  package streamaggr
  
 +import (
 +	"cmp"
 +	"math"
 +	"slices"
++	"sync"
 +)
 +
  type sumSamplesAggrValue struct {
  	sum float64
  }
-@@ -17,12 +23,286 @@ func (*sumSamplesAggrValue) state() any {
+@@ -17,12 +24,357 @@ func (*sumSamplesAggrValue) state() any {
  	return nil
  }
  
@@ -5741,7 +6603,7 @@ index 8ec63e679..58dc1455a 100644
  }
 +
 +// sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
-+// the interval its samples were scraped in, ending at their timestamp, rather
++// the interval its samples were scraped in, written at the end of it, rather
 +// than to the one the aggregator happened to process them in.
 +type sumSamplesAtValue struct {
 +	pending bySampleTime
@@ -5755,12 +6617,17 @@ index 8ec63e679..58dc1455a 100644
 +// as one more sample a few milliseconds earlier -- each flush backs off by its
 +// own sequence number -- so the two don't share a timestamp, which
 +// deduplication would keep only one of, and sum_over_time() adds them up.
-+// Backing off keeps the sample within the interval, (ts - interval, ts].
++// The sample stays within its interval, (ts - interval, ts], see stampWithin.
 +func (av *sumSamplesAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
++	if av.pending.empty() {
++		return
++	}
 +	back := ctx.seq % 1000
-+	av.pending.drain(func(ts int64, sum float64) {
-+		ctx.appendSeriesAt(key, "sum_samples", min(ts, ctx.now)-back, sum)
++	labelsLen, samplesLen := ctx.beginSeries(key, "sum_samples")
++	av.pending.drain(closedUpTo(ctx), func(ts int64, sum float64) {
++		ctx.appendSample(stampWithin(ctx, ts, back), sum)
 +	})
++	ctx.endSeries(labelsLen, samplesLen)
 +}
 +
 +func (*sumSamplesAtValue) state() any { return nil }
@@ -5768,10 +6635,10 @@ index 8ec63e679..58dc1455a 100644
 +func (av *sumSamplesAtValue) firstPending() (int64, bool) { return av.pending.first() }
 +
 +// bySampleTime holds the input sums of one output between two flushes, one per
-+// distinct sample timestamp, for sample_timestamps. Scrapes aligned to the
-+// interval give every sample of a round the same timestamp, so there is one sum
-+// almost always, and more only while the aggregator catches up with rounds it
-+// fell behind on.
++// interval, for sample_timestamps: Push keeps every sample under the end of the
++// interval it falls in. There is one sum almost always, two when a round right
++// after a boundary is processed before the flush, and more only while the
++// aggregator catches up with intervals it fell behind on.
 +type bySampleTime struct {
 +	ts   int64 // 0: nothing pending
 +	sum  float64
@@ -5783,6 +6650,13 @@ index 8ec63e679..58dc1455a 100644
 +	sum float64
 +}
 +
++// tsSumsPool keeps the slices of the outputs that held more than one interval
++// at a flush: two is common, a round right after a boundary being processed
++// before the flush, and so is every output while the aggregator is behind.
++var tsSumsPool = sync.Pool{New: func() any { return &[]tsSum{} }}
++
++func (p *bySampleTime) empty() bool { return p.ts == 0 }
++
 +func (p *bySampleTime) add(ts int64, v float64) {
 +	switch {
 +	case p.ts == 0:
@@ -5791,7 +6665,7 @@ index 8ec63e679..58dc1455a 100644
 +		p.sum += v
 +	default:
 +		if p.more == nil {
-+			p.more = &[]tsSum{}
++			p.more = tsSumsPool.Get().(*[]tsSum)
 +		}
 +		for i := range *p.more {
 +			if (*p.more)[i].ts == ts {
@@ -5817,22 +6691,65 @@ index 8ec63e679..58dc1455a 100644
 +	return first, true
 +}
 +
-+// drain calls f for every pending sum in timestamp order and empties p.
-+func (p *bySampleTime) drain(f func(ts int64, sum float64)) {
++// drain calls f, in timestamp order, for every pending sum at or before limit,
++// and keeps the later ones pending.
++func (p *bySampleTime) drain(limit int64, f func(ts int64, sum float64)) {
 +	if p.ts == 0 {
 +		return
 +	}
 +	if p.more == nil {
-+		f(p.ts, p.sum)
-+		p.ts, p.sum = 0, 0
++		if p.ts <= limit {
++			f(p.ts, p.sum)
++			p.ts, p.sum = 0, 0
++		}
 +		return
 +	}
 +	all := append(*p.more, tsSum{p.ts, p.sum})
 +	slices.SortFunc(all, func(a, b tsSum) int { return cmp.Compare(a.ts, b.ts) })
-+	for _, x := range all {
-+		f(x.ts, x.sum)
++	n := 0
++	for n < len(all) && all[n].ts <= limit {
++		f(all[n].ts, all[n].sum)
++		n++
 +	}
-+	p.ts, p.sum, p.more = 0, 0, nil
++	p.ts, p.sum = 0, 0
++	kept := all[n:]
++	if len(kept) > 0 {
++		p.ts, p.sum = kept[0].ts, kept[0].sum
++		kept = kept[1:]
++	}
++	if len(kept) > 0 {
++		*p.more = append(all[:0], kept...)
++		return
++	}
++	*p.more = all[:0]
++	tsSumsPool.Put(p.more)
++	p.more = nil
++}
++
++// closedUpTo is the latest interval end a flush writes: the intervals that have
++// ended by the flush's boundary. The ones after it wait for the flush at their
++// end, so that every interval is written at its end and in order. The samples
++// of those come from rounds scraped after the boundary but processed before
++// the flush reached them, which a flush taking longer than its interval does
++// for more than one interval; written now, they would go out before the
++// intervals end, and sum_samples_total, which never writes a timestamp before
++// one it has written, would move the earlier interval into the later one.
++//
++// An entry is not dropped as stale while it holds such sums, see
++// aggrValues.firstPending in flushEntry. The last flush, on shutdown, writes
++// everything.
++func closedUpTo(ctx *flushCtx) int64 {
++	if ctx.isLast {
++		return math.MaxInt64
++	}
++	return ctx.flushTimestamp
++}
++
++// stampWithin is where a sum of the interval ending at end is written: at end,
++// or at the wall clock if that is earlier, backed off by back, and never before
++// the interval starts nor after the wall clock.
++func stampWithin(ctx *flushCtx, end, back int64) int64 {
++	return min(max(min(end, ctx.now)-back, end-ctx.a.interval.Milliseconds()+1), ctx.now)
 +}
 +
 +// sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
@@ -5940,13 +6857,13 @@ index 8ec63e679..58dc1455a 100644
 +}
 +
 +// sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
-+// writes the total as of each scrape round it has samples of, in timestamp
-+// order, so an increment lands in the interval it was scraped in even when the
++// writes the total as of the end of each interval it has samples of, in order,
++// so an increment lands in the interval it was scraped in even when the
 +// aggregator processes it minutes later. The written timestamps never go back
-+// -- a counter that did would look reset -- so a round whose samples arrive
-+// after a later round was written goes to that later one: the error is bounded
-+// by how far the targets' rounds are apart in processing, not by how far the
-+// aggregator is behind.
++// -- a counter that did would look reset -- so an interval whose samples arrive
++// after a later interval was written goes to that later one: the error is
++// bounded by how far the targets' rounds are apart in processing, not by how far
++// the aggregator is behind.
 +//
 +// An unchanged total is written again only as the heartbeat, and then at the
 +// latest sample timestamp the aggregator has seen rather than at the wall
@@ -5968,26 +6885,42 @@ index 8ec63e679..58dc1455a 100644
 +
 +func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
 +	sh := av.shared
++	labelsLen, samplesLen, started := 0, 0, false
++	write := func(at int64, v float64) {
++		if !started {
++			labelsLen, samplesLen = ctx.beginSeries(key, "sum_samples_total")
++			started = true
++		}
++		ctx.appendSample(at, v)
++	}
 +	wrote := false
-+	av.pending.drain(func(ts int64, sum float64) {
++	av.pending.drain(closedUpTo(ctx), func(ts int64, sum float64) {
 +		sh.total += sum
 +		if sh.written && sh.total == sh.lastWritten {
 +			return
 +		}
-+		at := max(min(ts, ctx.now), sh.lastWrittenAt)
-+		ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
++		at := max(stampWithin(ctx, ts, 0), sh.lastWrittenAt)
++		write(at, sh.total)
 +		sh.lastWritten, sh.lastWrittenAt, sh.written = sh.total, at, true
 +		wrote = true
 +	})
 +	if !wrote && sh.written {
 +		at := min(ctx.watermark, ctx.now)
++		if !ctx.isLast {
++			// Not past the flush's boundary: the total does not include the
++			// intervals after it, whose samples are written at their ends.
++			at = min(at, ctx.flushTimestamp)
++		}
 +		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
 +		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
-+			ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
++			write(at, sh.total)
 +			sh.lastWrittenAt = at
 +		} else {
 +			ctx.a.skippedOutputs.Inc()
 +		}
++	}
++	if started {
++		ctx.endSeries(labelsLen, samplesLen)
 +	}
 +	if math.Abs(sh.total) >= (1 << 53) {
 +		// It is time to reset the entry, since it starts losing float64 precision

@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-二十八个补丁,**按编号顺序打**。004~027、030、031 是 vmagent 的,028 是 vmselect 的,029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+三十一个补丁,**按编号顺序打**。004~027、030~033 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -34,15 +34,18 @@
 | `027-acg_streamaggr-inline-single-output` | 单个输出直接放在条目里,`sum_samples_total` 的值与状态一次分配。每条输出序列 360 → 313 字节(两条合计 −28%) | 建议,纯内存;依赖 026 |
 | `028-acg_httpserver-zstd-response` | 客户端在 `Accept-Encoding` 里给 zstd 的权重高于 gzip(或相同且排在前面)时,响应改用 zstd 压缩(第八部分);其余客户端照旧拿 gzip | 可选,ruler 读导出时省 vmselect 的 CPU;没有它 ruler 退回 gzip |
 | `029-acg_storage-tsdb-status-from-names` | 带 `match[]` 的 `/api/v1/status/tsdb` 在匹配数不超过新参数时从匹配序列的指标名统计,不再扫当天全部倒排索引(第九部分)。实验集群 2.4 亿序列的一天:29–41 秒 → 0.06–0.38 秒,结果逐项相同 | **建议**(ruler 切分片要问它),需在 vmstorage 上加参数才生效 |
-| `030-acg_streamaggr-sample-timestamps` | 新增 `sample_timestamps`:`sum_samples`、`sum_samples_total` 按样本的抓取时刻打时间戳,vmagent 处理落后时用量仍记在抓取的那一分钟;抓取 tick 晚于间隔十分之一时改用实际开始时刻(第十部分) | 补丁要打(不开参数时行为不变),**参数暂不打开**:跟不上时打开反而更慢,见第十部分 |
+| `030-acg_streamaggr-sample-timestamps` | 新增 `sample_timestamps`:`sum_samples`、`sum_samples_total` 按样本的抓取时刻打时间戳,vmagent 处理落后时用量仍记在抓取的那一分钟;抓取 tick 晚于间隔十分之一时改用实际开始时刻(第十部分) | 补丁要打(不开参数时行为不变),**参数暂不打开**,见第十、十二部分 |
 | `031-acg_streamaggr-name-index` | 流式聚合按 `match` 里写死的指标名索引规则,每条样本只交给可能命中它的规则,输出逐条不变(第十一部分)。ACG 的 102 条规则全规模本机复现:vmagent CPU 1.30 → 0.82 核 | **建议**,纯性能,不用改配置 |
+| `032-acg_streamaggr-sample-timestamps-per-interval` | `sample_timestamps` 按规则的间隔累加,不再按每个抓取时刻:20 个目标时每条输出每分钟写 20 个样本 → 1 个,落后时内存不再随目标数涨;并修掉 030 打开参数时的两处数据错误(晚到部分撞同一毫秒被去重丢掉、刚过边界的样本退回上一分钟)(第十二部分) | 打开 `sample_timestamps` **之前必须打**;不开参数时输出不变。参数仍待全规模回放后再开 |
+| `033-acg_promscrape-delta-ack` | 对用 client_golang `promhttp/delta` 报增量的目标做确认投递:每次抓取在请求头里带上上一轮完整处理过的轮次,边车只提交被确认的轮次,写出了却没处理(抓取超时)的那轮下次重报而不是丢掉;目标状态页看一眼不再吃掉一轮(第十三部分) | **必须**,配合含确认协议的边车;对其它目标无影响 |
+| `034-acg_httpserver-zstd-unwrap` | 028 的 zstd 响应包装补上 `Unwrap()`,`http.NewResponseController` 能像穿过 gzip 包装一样穿过它(第十四部分) | 建议,目前没有调用方依赖 |
 
-只动源码的是 28 个文件:028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
+只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(11 个补丁碰它)和 `output.go`(8 个)。
+冲突热点是 `streamaggr.go`(12 个补丁碰它)和 `output.go`(8 个)。
 
 ## 基线:为什么是集群版
 
@@ -95,6 +98,15 @@ vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}              # 应停
 - **进程启动后第一次抓取必然走较贵的那条**(表里那个 `stream` 1)。判定用
   `prevBodyLen` 估未压缩大小,首次为 0 估不出来,第二次起才进最省的路。
   所以 `stream` 停在 1 是正常的,`one_shot` 不为 0 才要回头查上面三个条件。
+
+## 部署检查:用量规则要配 `flush_on_shutdown`
+
+`_1m_by_*` 和两条合并规则若不配 `flush_on_shutdown: true`,vmagent 停机或热加载配置时,当前区间还没刷出的用量直接丢掉
+(第七部分实测重启窗口少算 1.7%)。用量规则都要配上;第七部分(`010`)保证停机刷出的时间戳不会造成重复计数。
+`033` 的确认投递只管「边车 → vmagent」这一段:vmagent 收下并处理完一轮就确认,之后在内存里丢掉的,边车不会重报。
+
+另:`021`/`024` 的 `-zstd.encoderConcurrency` 默认 1,只在纯 Go(`CGO_ENABLED=0`)构建里生效,意味着所有压缩排队用一个编码器。
+发布版是 cgo 构建、走 gozstd,不受影响;若改用纯 Go 构建且远程写吞吐大,把它调到远程写的并发数(`-remoteWrite.queues`)。
 
 ## 多个 vmagent 实例:现在是单实例,扩成多个之前先看这里
 
@@ -186,7 +198,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~十四节是 `030`~`034`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -514,7 +526,7 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
 
 ### 用法与约束
 
-- **暂不打开**(2026-10-02 实验集群实测):vmagent 跟不上时,打开它反而更慢、内存更高。全规模回放下,
+- **暂不打开**(2026-10-02 实验集群实测;原因已由 `032` 修掉,待全规模回放重新验证,见第十二部分):vmagent 跟不上时,打开它反而更慢、内存更高。全规模回放下,
   不开时每分钟聚合 1787 万条(跟上 89%)、没有重启;打开后只有 1053 万条,比 1027 的 1227 万还少,刷出超时 2.6 次/分钟,
   两次因内存到 5 GiB 被 OOM。原因是落后时每条输出要按每个待写的抓取轮次分开累加、分开刷出。优化这部分并重新验证之前不开;
   不开时 030 不改变任何输出(回放逐字节一致)。
@@ -560,4 +572,98 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
 
 不用改配置,不加参数。设计与全部实测见 ACGCluster `docs/apikey-usage/vmagent-rule-index.md`,
 回放与比对工具在 `vm/vmagent/verify/`。
+
+## 十二、`sample_timestamps` 按间隔累加,并修掉两处数据错误(032)
+
+### 解决什么
+
+- **性能**:030 按每个不同的样本时间戳各存一份和。vmagent 给每个目标一个自己的抓取偏移,
+  所以一条由 N 个边车 pod 供数的输出,每分钟要存 N 份、写 N 个样本;落后几分钟还要再乘几倍。
+  实验集群上打开参数后反而更跟不上、两次 OOM(第十部分),原因就在这里。
+- **数据(030 打开参数时才有)**:
+  - 晚到部分写在「时间戳减去刷出序号毫秒」上。两个目标的时间戳差几毫秒、又恰好隔几次刷出写出,
+    就落在同一毫秒,去重只留一个。随机测试里 030 每个种子都丢数,例如 40 分钟合计 961,应为 978。
+  - 刷出比边界晚几毫秒时,已经收到的、边界之后抓的样本也被写出,减去提前的毫秒数后落回**上一分钟**。
+
+### 改了什么
+
+- 样本按所在区间的终点归组:区间是规则自己的 `interval`,`(终点 − interval, 终点]`,网格与刷出对齐。
+  注意 `time.Truncate` 从公元 1 年起算,不是 Unix 纪元;不能整除一天的间隔(如 7m)两种网格不同,这里用刷出的那种。
+- 一次刷出只写在它的边界之前**已经结束**的区间,之后的区间都留给结束时的那次刷出,写在各自的终点、按先后写。
+  一次刷出走得比间隔还长时(全规模下实测过 91 秒),走到后面的条目会同时攒着边界之后的两个区间;
+  若先写后一个,`sum_samples_total` 写出的时间戳不能回退,前一个就被挪进后一个,又成了相邻分钟的 ±。
+- 条目超过 `staleness_interval` 没收到样本本应删掉、且删时不刷出;它还攒着没写的区间时推迟删除,写完再删,停机时也一样。
+  停机那次刷出全部写出。没开 `flush_on_shutdown` 时停机或热加载照旧丢掉还没写的部分,和不开参数时丢掉当前区间是一回事。
+- 每个写出的时间戳都落在自己的区间内,且不晚于墙钟。区间终点相隔至少 1 秒,提前的毫秒数小于 1 秒,不同区间不会撞。
+- 一条输出待写的几个区间合成一条序列、多个样本写出;多于一个区间时用的切片从池里取。
+- `sum_samples_total` 的心跳不越过本次刷出的边界;`vm_streamaggr_output_samples_total` 改为数样本而不是序列。
+- 写出的时间戳从抓取时刻变成区间终点(如 12:01:00)。按分钟、按小时的合计不变。
+
+### 已做的验证
+
+- 基准(20 个目标、2000 条输出、`interval: 1m`,每次刷出):每条输出写的样本 20 → 2,耗时 11.8 → 7.8 ms
+  (不开参数 7.5 ms),分配次数 14264 → 547;落后 4 分钟时样本 60 → 3.75,耗时 45.0 → 30.5 ms(不开 29.5 ms)。
+  每条输出在刷出前占的状态 655 → 119 字节,落后 4 分钟时 2190 → 207 字节(不开参数约 103)。
+- 随机测试:20 个种子 × 两种输出 × 1m、7m 两种间隔;目标各有偏移(含边界后 1 毫秒),
+  处理最多晚 150 秒,刷出最多超时 100 秒,外加停机刷出。`sum_samples` 每个区间都与按样本时间戳算出的真值相等,
+  `sum_samples_total` 终值正确、从不回退。它在 030 上每个种子都失败;去掉提前毫秒、用错网格也都会失败。
+- 推迟写出、区间内钳制、推迟删除各有专门的测试,单独去掉任何一个都会失败;
+  刷出比间隔还长的场景另有一个测试(只留一个区间的做法在它上面失败)。`-race` 通过。
+- 已知前提:正确性建立在 `-dedup.minScrapeInterval=1ms`(同一毫秒才去重)和**每条序列只有一个 vmagent 在写**之上,
+  ACG 现在正是如此。若改成 `1m` 去重,同一分钟的晚到部分会被丢掉;多实例见上文「多个 vmagent 实例」。
+
+### 用法与约束
+
+- 打开前必须打 032。不开参数时输出不变。
+- 参数仍**暂不打开**:要在实验集群上重跑全规模回放,对比每分钟聚合条数、刷出超时和内存,确认后再开。
+
+## 十三、对报增量的目标做确认投递(033)
+
+### 解决什么
+
+边车(client_golang `promhttp/delta`)报的是「上次交付以来的增量」,原来在**整份响应写出去**时就算交付、提交。
+写出去不等于 vmagent 收到并处理了:响应还在 socket 发送缓冲里时 vmagent 的抓取超时、断开,
+边车已经提交,vmagent 却把这轮整个丢掉,这个 pod 这一分钟的用量就没了。
+另外 vmagent 的目标状态页(`/target_response`)会真去抓一次目标:对边车来说这是第二个抓取方,
+看一眼就提交掉一轮、却不进聚合,同样丢一分钟。
+
+### 改了什么
+
+- 边车每个响应带 `X-Prometheus-Delta-Round: <session>:<round>`。vmagent 每次抓取带 `X-Prometheus-Delta-Ack`:
+  - `new`:还没从这个目标拿到过轮次(vmagent 刚启动),边车按原来的方式提交挂着的那轮,本轮挂起等确认;
+  - `<session>:<round>`:上一轮完整处理过的轮次,与挂着的一致就提交,不一致(没处理成)就回滚、下一轮重报;
+    拿到过该 session 的轮次但一轮都没处理成时发 `<session>:0`;
+  - `peek`:目标状态页,只看不处理:挂着的那轮不动,本轮写完立即回滚。
+- 不带这个头的请求(旧 vmagent、curl)照旧「交付即提交」,与原来完全一样;
+  vmagent 对不报轮次的目标也带这个头(值为 `new`),对方忽略。
+- 抓取成功(`up=1`)才算处理完;解析出错被跳过的行照旧算在内(这一轮仍是成功的抓取)。
+- 参数 `-promscrape.deltaAck`(默认 true)可关掉,关掉时与 032 及以前完全一样。
+
+### 已做的验证
+
+- 单测:请求头与返回的轮次;成功推进确认、失败保留上一轮或 `<session>:0`、目标重启换 session;状态页发 `peek` 且不改状态;
+  关掉参数时走原来的 `ReadData`、不带头。
+- 边车侧(client_golang)单测与随机测试见其提交说明:随机交错写入、成功抓取、失败抓取、状态页查看,
+  并开着空闲清理,40 个种子每个 key 都恰好处理一次;把回滚改成提交或换回旧的空闲删除都会大量失败。
+- 端到端(本 fork 的 client_golang 边车 + 本分支构建的 vmagent,远程写到一个只做求和的接收端):30 个 key 随机写 40 秒,
+  vmagent 每 2 秒抓、超时 1 秒,边车每第三次抓取写完整份响应后卡 3 秒(写出了、vmagent 却超时丢掉),
+  期间打开 5 次目标状态页。
+
+  | | 写入 | vmagent 收到 | 对不上的 key |
+  |---|---|---|---|
+  | `-promscrape.deltaAck=true` | 3892 | **3892** | **0/30**(9 次卡住、8 次回滚重报,最后一次卡住时已无新写入) |
+  | `-promscrape.deltaAck=false` | 3892 | 1266(**−67.5%**) | 30/30(卡住的轮次和状态页各吃掉一轮) |
+
+### 用法与约束
+
+- 需要边车用含确认协议的 client_golang(2026-10-23 之后的版本);旧边车不带轮次头,033 对它没有任何影响。
+- 剩下的两种情况协议表达不了:vmagent 在一轮和下一次请求之间重启(发 `new`,按原来的方式提交,可能丢一轮);
+  vmagent 处理一半失败(只有解压中途出错会这样,轮次被回滚、已处理的部分再算一次)。
+- 只确认「边车 → vmagent」这一段;vmagent 之后在内存里丢的(没配 `flush_on_shutdown` 时停机)不会重报,见「部署检查」。
+
+## 十四、zstd 响应包装补上 `Unwrap`(034)
+
+028 的 zstd 包装没有 `Unwrap()`,gzip 包装(gzhttp)有。处理函数用 `http.NewResponseController(w)` 设写超时之类,
+对选 zstd 的客户端会报 `feature not supported`,对 gzip 客户端却正常。VM 目前没有这样的调用方,补上以免以后踩到。
+测试:经包装设写超时,zstd 与 gzip 两种客户端都成功;去掉 `Unwrap` 后 zstd 那一路失败。
 
