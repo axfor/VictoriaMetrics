@@ -358,3 +358,28 @@ func TestTheWindowIsSmall(t *testing.T) {
 		t.Fatalf("window %d bytes (%v), want at most 1 MiB", h.WindowSize, err)
 	}
 }
+
+// http.NewResponseController reaches the server's writer through the zstd
+// wrapper, as it does through the gzip one: a handler setting a write deadline
+// must not fail only for clients preferring zstd.
+func TestZstdResponseWriterUnwrap(t *testing.T) {
+	var deadlineErr error
+	h := compressHandlerWrapper(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		deadlineErr = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Minute))
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	for _, enc := range []string{"zstd", "gzip"} {
+		req, _ := http.NewRequest("GET", srv.URL, nil)
+		req.Header.Set("Accept-Encoding", enc)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %s", enc, err)
+		}
+		_ = resp.Body.Close()
+		if deadlineErr != nil {
+			t.Fatalf("%s: cannot set a write deadline through the wrapper: %s", enc, deadlineErr)
+		}
+	}
+}

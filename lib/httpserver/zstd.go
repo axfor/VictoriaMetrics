@@ -205,6 +205,13 @@ func (zw *zstdResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return hj.Hijack()
 }
 
+// Unwrap returns the wrapped ResponseWriter, so that http.NewResponseController
+// reaches what it does not implement itself, such as write deadlines, as it does
+// through the gzip wrapper.
+func (zw *zstdResponseWriter) Unwrap() http.ResponseWriter {
+	return zw.ResponseWriter
+}
+
 func (zw *zstdResponseWriter) close() {
 	if !zw.hijacked {
 		if !zw.decided {
