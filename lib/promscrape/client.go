@@ -26,6 +26,10 @@ var (
 	zstdCompression = flag.Bool("promscrape.zstdCompression", false, "Whether to send 'Accept-Encoding: zstd, gzip' instead of 'Accept-Encoding: gzip' to all the scrape targets. "+
 		"zstd usually needs less CPU on scrape targets than gzip for the same or better compression ratio. "+
 		"Targets without zstd support may keep responding with gzip. This flag has no effect for targets with disabled compression")
+	deltaAck = flag.Bool("promscrape.deltaAck", true, "Whether to acknowledge the rounds of targets exposing increments with client_golang's promhttp/delta, "+
+		"which answer with the X-Prometheus-Delta-Round header: each scrape names the last round processed in full, so a round whose response was written "+
+		"but not processed, as when the scrape times out, is reported again instead of lost, and the target status page no longer takes a round with it. "+
+		"Other targets ignore the header")
 	disableKeepAlive = flag.Bool("promscrape.disableKeepAlive", false, "Whether to disable HTTP keep-alive connections when scraping all the targets. "+
 		"This may be useful when targets has no support for HTTP keep-alive connection. "+
 		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control. "+
@@ -119,13 +123,33 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
 }
 
 func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+	contentEncoding, _, err := c.ReadDeltaData(dst, "")
+	return contentEncoding, err
+}
+
+// The headers of acknowledged delivery with targets exposing increments through
+// client_golang's promhttp/delta; see its ack.go.
+const (
+	deltaRoundHeader = "X-Prometheus-Delta-Round"
+	deltaAckHeader   = "X-Prometheus-Delta-Ack"
+	deltaAckNew      = "new"  // no round of this target was had yet
+	deltaAckPeek     = "peek" // the response is looked at, not processed
+)
+
+// ReadDeltaData is ReadData that also sends ack, when not empty, as the
+// acknowledgement of the last round processed, and returns the round the
+// response carries, "" when it carries none.
+func (c *client) ReadDeltaData(dst *chunkedbuffer.Buffer, ack string) (string, string, error) {
 	deadline := time.Now().Add(c.c.Timeout)
 	ctx, cancel := context.WithDeadline(c.ctx, deadline)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
+		return "", "", fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
+	}
+	if ack != "" {
+		req.Header.Set(deltaAckHeader, ack)
 	}
 	// The following `Accept` header has been copied from Prometheus sources.
 	// See https://github.com/prometheus/prometheus/blob/f9d21f10ecd2a343a381044f131ea4e46381ce09/scrape/scrape.go#L532 .
@@ -138,10 +162,10 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
 	req.Header.Set("User-Agent", "vm_promscrape")
 	if err := c.setHeaders(req); err != nil {
-		return "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+		return "", "", fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
 	}
 	if err := c.setProxyHeaders(req); err != nil {
-		return "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+		return "", "", fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
 	}
 	if !c.disableCompression {
 		if *zstdCompression {
@@ -157,7 +181,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
 			scrapesTimedout.Inc()
 		}
-		return "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
+		return "", "", fmt.Errorf("cannot perform request to %q: %w", c.scrapeURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -167,7 +191,7 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
 		if err != nil {
 			respBody = []byte(err.Error())
 		}
-		return "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
+		return "", "", fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
 			c.scrapeURL, resp.StatusCode, http.StatusOK, respBody)
 	}
 	scrapesOK.Inc()
@@ -179,22 +203,23 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
 		if ue, ok := err.(*url.Error); ok && ue.Timeout() {
 			scrapesTimedout.Inc()
 		}
-		return "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
+		return "", "", fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
 	}
 	if int64(dst.Len()) >= c.maxScrapeSize {
 		maxScrapeSizeExceeded.Inc()
-		return "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
+		return "", "", fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
 			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
 			"increase max_scrape_size value in scrape config for the given target", c.scrapeURL, c.maxScrapeSize)
 	}
 
 	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
 	// Any other Content-Encoding is treated as uncompressed data, like before.
+	round := resp.Header.Get(deltaRoundHeader)
 	switch ce := resp.Header.Get("Content-Encoding"); ce {
 	case "gzip", "zstd":
-		return ce, nil
+		return ce, round, nil
 	default:
-		return "", nil
+		return "", round, nil
 	}
 }
 

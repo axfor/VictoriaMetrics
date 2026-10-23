@@ -464,6 +464,9 @@ func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *
 	sc.sw.Config = sw
 	sc.sw.ScrapeGroup = group
 	sc.sw.ReadData = c.ReadData
+	if *deltaAck {
+		sc.sw.ReadDeltaData = c.ReadDeltaData
+	}
 	sc.sw.PushData = pushData
 	return sc, nil
 }

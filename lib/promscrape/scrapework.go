@@ -201,6 +201,19 @@ type scrapeWork struct {
 	// It returns the Content-Encoding of the read data: "gzip", "zstd" or "" for uncompressed data.
 	ReadData func(dst *chunkedbuffer.Buffer) (string, error)
 
+	// ReadDeltaData, when set, is used instead of ReadData. It also sends ack as
+	// the acknowledgement of the last round of the target processed, and returns
+	// the round the response carries, "" when it carries none. See deltaAck.
+	ReadDeltaData func(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error)
+
+	// deltaAck is what the next scrape acknowledges to a target exposing
+	// increments through client_golang's promhttp/delta: nil before it has
+	// answered with a round, then the last round processed in full, or
+	// "<session>:0" when none of its session was. Such a target holds each round
+	// until the next request names it, and reports it again otherwise; see
+	// -promscrape.deltaAck.
+	deltaAck atomic.Pointer[string]
+
 	// PushData is called for pushing collected data.
 	//
 	// The PushData must be safe for calling from multiple concurrent goroutines.
@@ -449,7 +462,9 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
 	cb := chunkedbuffer.Get()
 	defer chunkedbuffer.Put(cb)
 
-	contentEncoding, err := sw.ReadData(cb)
+	// The response is only looked at: a target exposing increments must not
+	// count it as processed, nor settle the round the scrape loop is processing.
+	contentEncoding, _, err := sw.readData(cb, deltaAckPeek)
 	if err != nil {
 		return nil, err
 	}
@@ -459,14 +474,50 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
 	return bb.B, err
 }
 
-func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error {
+// readData reads the scrape response into dst, acknowledging ack, or the last
+// round processed when ack is empty, to a target that exposes rounds.
+func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error) {
+	if sw.ReadDeltaData == nil {
+		contentEncoding, err = sw.ReadData(dst)
+		return contentEncoding, "", err
+	}
+	if ack == "" {
+		ack = deltaAckNew
+		if p := sw.deltaAck.Load(); p != nil {
+			ack = *p
+		}
+	}
+	return sw.ReadDeltaData(dst, ack)
+}
+
+// processedDeltaRound records what the next scrape acknowledges after one that
+// got round, "" when the response carried none, processed in full or not.
+func (sw *scrapeWork) processedDeltaRound(round string, processed bool) {
+	if round == "" {
+		return
+	}
+	if processed {
+		sw.deltaAck.Store(&round)
+		return
+	}
+	// A round of a session none of whose rounds was processed yet, as after
+	// the target restarted, acknowledges nothing of it.
+	session, _, _ := strings.Cut(round, ":")
+	if p := sw.deltaAck.Load(); p == nil || !strings.HasPrefix(*p, session+":") {
+		none := session + ":0"
+		sw.deltaAck.Store(&none)
+	}
+}
+
+func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) (err error) {
 	// Read the whole scrape response into cb.
 	// It is OK to do this for stream parsing mode, since the most of RAM
 	// is occupied during parsing of the read response body below.
 	// This also allows measuring the real scrape duration, which doesn't include
 	// the time needed for processing of the read response.
 	cb := chunkedbuffer.Get()
-	contentEncoding, err := sw.ReadData(cb)
+	contentEncoding, round, err := sw.readData(cb, "")
+	defer func() { sw.processedDeltaRound(round, err == nil) }()
 
 	// Measure scrape duration.
 	endTimestamp := time.Now().UnixMilli()
