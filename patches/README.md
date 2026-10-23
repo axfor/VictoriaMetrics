@@ -96,6 +96,45 @@ vm_promscrape_scrapes_by_parse_mode_total{mode="one_shot"}              # 应停
   `prevBodyLen` 估未压缩大小,首次为 0 估不出来,第二次起才进最省的路。
   所以 `stream` 停在 1 是正常的,`one_shot` 不为 0 才要回头查上面三个条件。
 
+## 多个 vmagent 实例:现在是单实例,扩成多个之前先看这里
+
+ACG 现在只有一个 vmagent,下面的问题都不存在。将来要扩成多个实例分担抓取,**先改完下面几点再扩**,
+否则用量会静默少算:抓取照常成功,数字只是变小,没有报错。
+
+**不能用多副本重复抓同一个边车**(`-promscrape.cluster.replicationFactor` 大于 1,或两套 vmagent 抓同一批目标)。
+边车的增量导出(client_golang `promhttp/delta`)只允许一个抓取方:每次抓取交付的增量就算交出去了,
+两个抓取方会各拿走一部分,每一方都少算。所以只能**按目标分片**(`membersCount` = N、`replicationFactor` = 1),
+每个边车 pod 只归一个实例。
+
+**按目标分片后,各实例写的是同名同标签的部分和。** 每个实例只聚合自己那部分 pod,`_1m_by_*` 和两条合并规则的输出
+在各实例上标签完全一样,只是值各是一部分。vmstorage、vmselect 都开了 `-dedup.minScrapeInterval=1ms`,
+同一序列同一毫秒只留最大的那个值,于是:
+
+- 不开 `sample_timestamps`:各实例都写在同一个刷出边界上,**必撞**,只剩最大的那一份,其余实例的用量丢掉。
+- 开了 `sample_timestamps`:晚到部分提前的毫秒数取自各实例自己的刷出序号,同时启动的实例序号相同,**一样会撞**。
+
+**做法:给每个实例加一个区分标签,读的地方对它求和。**
+
+- 用 `-remoteWrite.label=vmagent_shard=<n>`,每个实例 `<n>` 不同。vmagent 在流式聚合**之后**才加这个标签
+  (`app/vmagent/remotewrite/remotewrite.go` 的 `tryPushTimeSeriesInternal`),全局规则和按 URL 的规则都一样,
+  所以它能留在聚合输出上,各实例的部分和成了不同的序列,不再互相去重。
+- **不要用 `-promscrape.cluster.memberLabel`**:它在抓取时加到目标标签上(`lib/promscrape/config.go`),
+  在聚合之前,规则的 `by:` 会把它丢掉,等于没加。
+- 读这些序列的地方都要对 `vmagent_shard` 求和:ruler 的规则、看板、对账脚本、告警。`sum by (provider_id, …)`
+  这类写法不列出它,自动就合上了;**直接读裸序列、不带 `sum` 的,要改**。ruler 的查询要逐条核对。
+- `sum_samples_total` 的合并规则也一样:每个实例各有一条自己的累计计数器,`increase()` 按序列各算再相加,结果对;
+  没有区分标签时,两个计数器挤在一条序列上,会被当成计数器重置。
+
+**其余影响:**
+
+- 输出序列数最多变成 N 倍:一个 API key 的流量分散在各个 pod 上,每个实例都会写一份它的 `_1m_by_apikey*`。
+  vmstorage 的 `storage.cacheSizeStorageMetricName`、内存配额要按此重估。
+- 改分片数或实例重启时,目标会在实例之间迁移,迁移那一刻可能两个实例都抓了同一个 pod 一两轮。
+  增量按每次抓取交付,不会重复也不会丢,只是分在两个实例名下;有区分标签就没问题,没有就会撞。
+- 分钟级的 ± 对账问题不受影响:同一个 pod 的 cost 和 tokens 总由同一个实例抓取、聚合,
+  开了 `sample_timestamps` 照样落在同一分钟。
+- 每个实例跟不上、刷出超时的风险各自独立,`vm_streamaggr_flush_timeouts_total` 要按实例看。
+
 ## 编号:为什么从 004 起,且是三位
 
 内网那套 VM 已经打了自己的补丁 `001-add_feature_retentionfilter`、
