@@ -179,6 +179,15 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey 
 		// check for stale entries
 		deleted := ctx.flushTimestamp > av.deleteDeadline
 		if deleted {
+			// Under sample_timestamps an entry may still hold sums of intervals
+			// after the flush's boundary, which no flush has written yet: keep it
+			// until they are. Pushes stopped long ago, so this costs a lookup of
+			// the entries about to be dropped, and only of those.
+			if _, ok := av.firstPending(len(ao.configs), ctx.isGreen); ok {
+				deleted = false
+			}
+		}
+		if deleted {
 			if ao.resetMarkerOnStale {
 				ao.appendResetMarkers(ctx, av, outputKey, ctx.flushTimestamp)
 			}

@@ -147,9 +147,9 @@ type Options struct {
 	// EnableWindows enables aggregation in windows
 	EnableWindows bool
 
-	// SampleTimestamps writes sum_samples and sum_samples_total at the timestamps
-	// of the input samples instead of at the flush, so an input processed late
-	// still counts towards the interval it was scraped in.
+	// SampleTimestamps writes sum_samples and sum_samples_total at the end of the
+	// interval the input samples' timestamps fall in instead of at the flush, so
+	// an input processed late still counts towards the interval it was scraped in.
 	//
 	// This option can be overridden individually per each aggregation via sample_timestamps option.
 	SampleTimestamps bool
@@ -661,6 +661,13 @@ type aggregator struct {
 	// interval is the interval between flushes
 	interval time.Duration
 
+	// intervalPhaseMsec is a Unix timestamp on the grid the flushes are aligned
+	// to. time.Truncate counts intervals from the zero time, January 1 of year 1,
+	// not from the Unix epoch, and the two grids differ for an interval that does
+	// not divide a day, such as 7m. sample_timestamps puts samples into intervals
+	// on the flushes' grid.
+	intervalPhaseMsec int64
+
 	// dedupInterval is optional deduplication interval for incoming samples
 	dedupInterval time.Duration
 
@@ -946,8 +953,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		without:             without,
 		aggregateOnlyByTime: aggregateOnlyByTime,
 
-		interval:      interval,
-		dedupInterval: dedupInterval,
+		interval:          interval,
+		intervalPhaseMsec: time.UnixMilli(0).Truncate(interval).UnixMilli(),
+		dedupInterval:     dedupInterval,
 
 		aggrOutputs: aggrOutputs,
 
@@ -1304,6 +1312,13 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	enableWindows := a.enableWindows
 	cs := a.cs.Load()
 
+	// Under sample_timestamps a sample is kept under the end of the interval it
+	// falls in, not under its own timestamp. Every target is scraped at an
+	// offset of its own, so the exact timestamps would give an output fed by N
+	// targets N sums to keep and N samples to write per interval -- N times the
+	// output, and more state still for every interval the aggregator is behind.
+	sampleTimestamps := a.sampleTimestamps
+
 	var maxLagMsec, maxTimestamp int64
 	for idx, ts := range tss {
 		if !a.match.Match(ts.Labels) {
@@ -1352,17 +1367,21 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 				maxLagMsec = lagMsec
 			}
 			maxTimestamp = max(maxTimestamp, s.Timestamp)
+			timestamp := s.Timestamp
+			if sampleTimestamps {
+				timestamp = a.intervalEnd(timestamp)
+			}
 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
 				ctx.green = append(ctx.green, pushSample{
 					key:       key,
 					value:     s.Value,
-					timestamp: s.Timestamp,
+					timestamp: timestamp,
 				})
 			} else {
 				ctx.blue = append(ctx.blue, pushSample{
 					key:       key,
 					value:     s.Value,
-					timestamp: s.Timestamp,
+					timestamp: timestamp,
 				})
 			}
 		}
@@ -1396,6 +1415,16 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 		a.matchedSamples.Add(len(ctx.green))
 		pushSamples(ctx.green, deleteDeadlineMsec, true)
 	}
+}
+
+// intervalEnd returns the end of the interval ts falls in, on the grid the
+// flushes are aligned to: intervals are (end - interval, end].
+func (a *aggregator) intervalEnd(ts int64) int64 {
+	phase, iv := a.intervalPhaseMsec, a.interval.Milliseconds()
+	if ts <= phase {
+		return ts
+	}
+	return phase + ((ts-phase-1)/iv+1)*iv
 }
 
 // compressLabels builds a sample's key: the length of the output part, the
@@ -1560,7 +1589,7 @@ func (ctx *flushCtx) flushSeries() {
 		// Fast path - push the output metrics.
 		if ctx.pushFunc != nil {
 			ctx.pushFunc(tss)
-			ctx.ao.outputSamples.Add(len(tss))
+			ctx.ao.outputSamples.Add(samplesCount(tss))
 		}
 		return
 	}
@@ -1582,7 +1611,7 @@ func (ctx *flushCtx) flushSeries() {
 	}
 	if ctx.pushFunc != nil {
 		ctx.pushFunc(dst)
-		ctx.ao.outputSamples.Add(len(dst))
+		ctx.ao.outputSamples.Add(samplesCount(dst))
 	}
 	auxLabels.Labels = dstLabels
 	promutil.PutLabels(auxLabels)
@@ -1609,6 +1638,54 @@ func (ctx *flushCtx) appendSeriesAt(key, suffix string, timestamp int64, value f
 	})
 
 	// Limit the maximum length of ctx.tss in order to limit memory usage.
+	if len(ctx.tss) >= 10_000 {
+		ctx.flushSeries()
+	}
+}
+
+// samplesCount counts the samples in tss: a series carries several under
+// sample_timestamps, one per pending interval, see beginSeries.
+func samplesCount(tss []prompb.TimeSeries) int {
+	n := 0
+	for i := range tss {
+		n += len(tss[i].Samples)
+	}
+	return n
+}
+
+// beginSeries starts an output series that takes several samples, added with
+// appendSample and closed with endSeries, so that an output writing more than
+// one sample per flush -- one per pending interval under sample_timestamps --
+// decompresses its labels and goes to pushFunc once rather than per sample.
+func (ctx *flushCtx) beginSeries(key, suffix string) (labelsLen, samplesLen int) {
+	labelsLen = len(ctx.labels)
+	samplesLen = len(ctx.samples)
+	ctx.labels = decompressLabels(ctx.labels, key)
+	if !ctx.a.keepMetricNames {
+		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
+	}
+	return labelsLen, samplesLen
+}
+
+// appendSample adds a sample to the series beginSeries started. Samples have to
+// come in timestamp order.
+func (ctx *flushCtx) appendSample(timestamp int64, value float64) {
+	ctx.samples = append(ctx.samples, prompb.Sample{
+		Timestamp: timestamp,
+		Value:     value,
+	})
+}
+
+// endSeries closes the series beginSeries started; one without samples is dropped.
+func (ctx *flushCtx) endSeries(labelsLen, samplesLen int) {
+	if len(ctx.samples) == samplesLen {
+		ctx.labels = ctx.labels[:labelsLen]
+		return
+	}
+	ctx.tss = append(ctx.tss, prompb.TimeSeries{
+		Labels:  ctx.labels[labelsLen:],
+		Samples: ctx.samples[samplesLen:],
+	})
 	if len(ctx.tss) >= 10_000 {
 		ctx.flushSeries()
 	}

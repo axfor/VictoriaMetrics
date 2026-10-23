@@ -39,7 +39,7 @@ var (
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
 	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
-		"at the timestamps of the input samples instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
+		"at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
 		"Can be overridden per aggregation via sample_timestamps option")
 
 	// Per URL config
@@ -69,7 +69,7 @@ var (
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
 	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
-		"write sum_samples and sum_samples_total at the timestamps of the input samples instead of at the flush, so a sample processed late "+
+		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late "+
 		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
 )
 

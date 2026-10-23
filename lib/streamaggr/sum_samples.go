@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"math"
 	"slices"
+	"sync"
 )
 
 type sumSamplesAggrValue struct {
@@ -39,7 +40,7 @@ func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
 }
 
 // sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
-// the interval its samples were scraped in, ending at their timestamp, rather
+// the interval its samples were scraped in, written at the end of it, rather
 // than to the one the aggregator happened to process them in.
 type sumSamplesAtValue struct {
 	pending bySampleTime
@@ -53,12 +54,17 @@ func (av *sumSamplesAtValue) pushSample(_ aggrConfig, sample *pushSample, _ stri
 // as one more sample a few milliseconds earlier -- each flush backs off by its
 // own sequence number -- so the two don't share a timestamp, which
 // deduplication would keep only one of, and sum_over_time() adds them up.
-// Backing off keeps the sample within the interval, (ts - interval, ts].
+// The sample stays within its interval, (ts - interval, ts], see stampWithin.
 func (av *sumSamplesAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
+	if av.pending.empty() {
+		return
+	}
 	back := ctx.seq % 1000
-	av.pending.drain(func(ts int64, sum float64) {
-		ctx.appendSeriesAt(key, "sum_samples", min(ts, ctx.now)-back, sum)
+	labelsLen, samplesLen := ctx.beginSeries(key, "sum_samples")
+	av.pending.drain(closedUpTo(ctx), func(ts int64, sum float64) {
+		ctx.appendSample(stampWithin(ctx, ts, back), sum)
 	})
+	ctx.endSeries(labelsLen, samplesLen)
 }
 
 func (*sumSamplesAtValue) state() any { return nil }
@@ -66,10 +72,10 @@ func (*sumSamplesAtValue) state() any { return nil }
 func (av *sumSamplesAtValue) firstPending() (int64, bool) { return av.pending.first() }
 
 // bySampleTime holds the input sums of one output between two flushes, one per
-// distinct sample timestamp, for sample_timestamps. Scrapes aligned to the
-// interval give every sample of a round the same timestamp, so there is one sum
-// almost always, and more only while the aggregator catches up with rounds it
-// fell behind on.
+// interval, for sample_timestamps: Push keeps every sample under the end of the
+// interval it falls in. There is one sum almost always, two when a round right
+// after a boundary is processed before the flush, and more only while the
+// aggregator catches up with intervals it fell behind on.
 type bySampleTime struct {
 	ts   int64 // 0: nothing pending
 	sum  float64
@@ -81,6 +87,13 @@ type tsSum struct {
 	sum float64
 }
 
+// tsSumsPool keeps the slices of the outputs that held more than one interval
+// at a flush: two is common, a round right after a boundary being processed
+// before the flush, and so is every output while the aggregator is behind.
+var tsSumsPool = sync.Pool{New: func() any { return &[]tsSum{} }}
+
+func (p *bySampleTime) empty() bool { return p.ts == 0 }
+
 func (p *bySampleTime) add(ts int64, v float64) {
 	switch {
 	case p.ts == 0:
@@ -89,7 +102,7 @@ func (p *bySampleTime) add(ts int64, v float64) {
 		p.sum += v
 	default:
 		if p.more == nil {
-			p.more = &[]tsSum{}
+			p.more = tsSumsPool.Get().(*[]tsSum)
 		}
 		for i := range *p.more {
 			if (*p.more)[i].ts == ts {
@@ -115,22 +128,65 @@ func (p *bySampleTime) first() (int64, bool) {
 	return first, true
 }
 
-// drain calls f for every pending sum in timestamp order and empties p.
-func (p *bySampleTime) drain(f func(ts int64, sum float64)) {
+// drain calls f, in timestamp order, for every pending sum at or before limit,
+// and keeps the later ones pending.
+func (p *bySampleTime) drain(limit int64, f func(ts int64, sum float64)) {
 	if p.ts == 0 {
 		return
 	}
 	if p.more == nil {
-		f(p.ts, p.sum)
-		p.ts, p.sum = 0, 0
+		if p.ts <= limit {
+			f(p.ts, p.sum)
+			p.ts, p.sum = 0, 0
+		}
 		return
 	}
 	all := append(*p.more, tsSum{p.ts, p.sum})
 	slices.SortFunc(all, func(a, b tsSum) int { return cmp.Compare(a.ts, b.ts) })
-	for _, x := range all {
-		f(x.ts, x.sum)
+	n := 0
+	for n < len(all) && all[n].ts <= limit {
+		f(all[n].ts, all[n].sum)
+		n++
 	}
-	p.ts, p.sum, p.more = 0, 0, nil
+	p.ts, p.sum = 0, 0
+	kept := all[n:]
+	if len(kept) > 0 {
+		p.ts, p.sum = kept[0].ts, kept[0].sum
+		kept = kept[1:]
+	}
+	if len(kept) > 0 {
+		*p.more = append(all[:0], kept...)
+		return
+	}
+	*p.more = all[:0]
+	tsSumsPool.Put(p.more)
+	p.more = nil
+}
+
+// closedUpTo is the latest interval end a flush writes: the intervals that have
+// ended by the flush's boundary. The ones after it wait for the flush at their
+// end, so that every interval is written at its end and in order. The samples
+// of those come from rounds scraped after the boundary but processed before
+// the flush reached them, which a flush taking longer than its interval does
+// for more than one interval; written now, they would go out before the
+// intervals end, and sum_samples_total, which never writes a timestamp before
+// one it has written, would move the earlier interval into the later one.
+//
+// An entry is not dropped as stale while it holds such sums, see
+// aggrValues.firstPending in flushEntry. The last flush, on shutdown, writes
+// everything.
+func closedUpTo(ctx *flushCtx) int64 {
+	if ctx.isLast {
+		return math.MaxInt64
+	}
+	return ctx.flushTimestamp
+}
+
+// stampWithin is where a sum of the interval ending at end is written: at end,
+// or at the wall clock if that is earlier, backed off by back, and never before
+// the interval starts nor after the wall clock.
+func stampWithin(ctx *flushCtx, end, back int64) int64 {
+	return min(max(min(end, ctx.now)-back, end-ctx.a.interval.Milliseconds()+1), ctx.now)
 }
 
 // sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
@@ -238,13 +294,13 @@ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
 }
 
 // sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
-// writes the total as of each scrape round it has samples of, in timestamp
-// order, so an increment lands in the interval it was scraped in even when the
+// writes the total as of the end of each interval it has samples of, in order,
+// so an increment lands in the interval it was scraped in even when the
 // aggregator processes it minutes later. The written timestamps never go back
-// -- a counter that did would look reset -- so a round whose samples arrive
-// after a later round was written goes to that later one: the error is bounded
-// by how far the targets' rounds are apart in processing, not by how far the
-// aggregator is behind.
+// -- a counter that did would look reset -- so an interval whose samples arrive
+// after a later interval was written goes to that later one: the error is
+// bounded by how far the targets' rounds are apart in processing, not by how far
+// the aggregator is behind.
 //
 // An unchanged total is written again only as the heartbeat, and then at the
 // latest sample timestamp the aggregator has seen rather than at the wall
@@ -266,26 +322,42 @@ func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _
 
 func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
 	sh := av.shared
+	labelsLen, samplesLen, started := 0, 0, false
+	write := func(at int64, v float64) {
+		if !started {
+			labelsLen, samplesLen = ctx.beginSeries(key, "sum_samples_total")
+			started = true
+		}
+		ctx.appendSample(at, v)
+	}
 	wrote := false
-	av.pending.drain(func(ts int64, sum float64) {
+	av.pending.drain(closedUpTo(ctx), func(ts int64, sum float64) {
 		sh.total += sum
 		if sh.written && sh.total == sh.lastWritten {
 			return
 		}
-		at := max(min(ts, ctx.now), sh.lastWrittenAt)
-		ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
+		at := max(stampWithin(ctx, ts, 0), sh.lastWrittenAt)
+		write(at, sh.total)
 		sh.lastWritten, sh.lastWrittenAt, sh.written = sh.total, at, true
 		wrote = true
 	})
 	if !wrote && sh.written {
 		at := min(ctx.watermark, ctx.now)
+		if !ctx.isLast {
+			// Not past the flush's boundary: the total does not include the
+			// intervals after it, whose samples are written at their ends.
+			at = min(at, ctx.flushTimestamp)
+		}
 		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
 		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
-			ctx.appendSeriesAt(key, "sum_samples_total", at, sh.total)
+			write(at, sh.total)
 			sh.lastWrittenAt = at
 		} else {
 			ctx.a.skippedOutputs.Inc()
 		}
+	}
+	if started {
+		ctx.endSeries(labelsLen, samplesLen)
 	}
 	if math.Abs(sh.total) >= (1 << 53) {
 		// It is time to reset the entry, since it starts losing float64 precision

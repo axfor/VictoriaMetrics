@@ -119,9 +119,10 @@ specified individually per each `-remoteWrite.url`:
   #
   # reset_marker_on_stale: false
 
-  # sample_timestamps instructs to write sum_samples and sum_samples_total at the timestamps of the input
-  # samples instead of at the flush, so samples processed late, when vmagent falls behind, still count
-  # towards the interval they were scraped in rather than the one they were processed in.
+  # sample_timestamps instructs to write sum_samples and sum_samples_total at the end of the interval
+  # the input samples' timestamps fall in, instead of at the flush, so samples processed late, when vmagent
+  # falls behind, still count towards the interval they were scraped in rather than the one they were processed in.
+  # Samples of all the targets within one interval are summed together and written once.
   # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
   # enable_windows or dedup_interval, which decide timestamps of their own.
   # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
