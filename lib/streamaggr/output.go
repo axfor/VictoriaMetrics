@@ -155,12 +155,19 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 		sh.mu.RUnlock()
 		for _, e := range entries {
 			ao.flushEntry(ctx, sh, e.key, e.av)
+			if flushEntryHook != nil {
+				flushEntryHook()
+			}
 		}
 		clear(entries)
 		entries = entries[:0]
 	}
 	flushEntriesPool.Put(&entries)
 }
+
+// flushEntryHook, when set, is called after each entry a flush writes: for the
+// tests of samples pushed while a flush is under way only.
+var flushEntryHook func()
 
 // removeEntry drops key from sh if it still maps to av.
 func (sh *aggrOutputShard) removeEntry(key string, av *aggrValues) {

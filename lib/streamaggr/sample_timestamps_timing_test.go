@@ -63,6 +63,8 @@ func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
 				}
 
 				minute := time.Now().Truncate(time.Minute).Add(-time.Hour).UnixMilli()
+				// the rounds are on time: the interval before them is the one written last
+				aggr.stWritten.Store(minute)
 				var matchIdxs []byte
 				b.ReportAllocs()
 				b.ResetTimer()

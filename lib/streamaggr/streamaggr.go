@@ -639,9 +639,9 @@ type aggregator struct {
 
 	dropInputLabels []string
 
-	inputRelabeling   *promrelabel.ParsedConfigs
-	outputRelabeling  *promrelabel.ParsedConfigs
-	stalenessInterval time.Duration
+	inputRelabeling         *promrelabel.ParsedConfigs
+	outputRelabeling        *promrelabel.ParsedConfigs
+	stalenessInterval       time.Duration
 	outputHeartbeatInterval time.Duration
 
 	keepMetricNames  bool
@@ -649,10 +649,16 @@ type aggregator struct {
 	enableWindows    bool
 	sampleTimestamps bool
 
-	// watermark is the latest input sample timestamp seen, and flushSeq counts
-	// the flushes; both are for sample_timestamps.
-	watermark atomic.Int64
-	flushSeq  atomic.Int64
+	// stWritten is the end of the interval written last under
+	// sample_timestamps, and stTailOK whether this process wrote it; see stState.
+	stWritten atomic.Int64
+	stTailOK  atomic.Bool
+	// stLate is where the rounds processed after their interval was written go,
+	// by scrape timestamp, which all samples of a round share: decided at the
+	// first of a round's samples, so that its later ones go there too, whatever
+	// the flushes did in between. See stLateInterval.
+	stLateMu sync.Mutex
+	stLate   map[int64]int64
 
 	by                  []string
 	without             []string
@@ -855,11 +861,11 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 
 	// The global option applies where it can, so one flag covers a config that
 	// also has aggregations it cannot apply to; set on an aggregation, it has to.
-	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval) == nil
+	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples) == nil
 	if v := cfg.SampleTimestamps; v != nil {
 		sampleTimestamps = *v
 		if sampleTimestamps {
-			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval); err != nil {
+			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples); err != nil {
 				return nil, err
 			}
 		}
@@ -1010,6 +1016,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		a.flushAfter = histogram.GetFast()
 	}
 	a.minDeadline.Store(minTime.UnixMilli())
+	// Under sample_timestamps the interval that ended before the start is taken
+	// as written: rounds of it go to the first interval this process writes.
+	a.stWritten.Store(a.intervalFloor(startTime.UnixMilli()))
 	cs := &currentState{}
 	if a.dedupInterval > 0 {
 		cs.maxDeadline = minTime.Add(a.dedupInterval).UnixMilli()
@@ -1029,9 +1038,12 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 
 // sampleTimestampsApply returns why sample_timestamps cannot apply to an
 // aggregation, or nil if it can.
-func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration) error {
+func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration, ignoreOldSamples bool) error {
 	if enableWindows || dedupInterval > 0 {
 		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
+	}
+	if ignoreOldSamples {
+		return fmt.Errorf("`sample_timestamps` cannot be combined with `ignore_old_samples`, which drops the samples of rounds processed late that it puts into the intervals they were scraped in")
 	}
 	for _, o := range outputs {
 		if o != "sum_samples" && o != "sum_samples_total" {
@@ -1267,8 +1279,29 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 		a.minDeadline.Store(cs.maxDeadline)
 		ctx.isGreen = cs.isGreen
 	}
+	if a.sampleTimestamps {
+		ctx.st = stState{written: a.stWritten.Load(), tailOK: a.stTailOK.Load(), closing: math.MaxInt64}
+		if !isLast {
+			// the intervals that have ended by the flush's time; with flushes not
+			// aligned to the interval, the last one ending before it
+			ctx.st.closing = max(a.intervalFloor(ctx.flushTimestamp), ctx.st.written)
+		}
+	}
 	ao.flushState(ctx)
 	ctx.flushSeries()
+	if a.sampleTimestamps && !isLast && ctx.st.closing > ctx.st.written {
+		a.stWritten.Store(ctx.st.closing)
+		a.stTailOK.Store(true)
+		// A late round's interval is of use while it can still be written again
+		// as the tail, that is while it is the one written last or not written.
+		a.stLateMu.Lock()
+		for ts, at := range a.stLate {
+			if at < ctx.st.closing {
+				delete(a.stLate, ts)
+			}
+		}
+		a.stLateMu.Unlock()
+	}
 	putFlushCtx(ctx)
 
 	d := time.Since(startTime)
@@ -1315,11 +1348,16 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	// Under sample_timestamps a sample is kept under the end of the interval it
 	// falls in, not under its own timestamp. Every target is scraped at an
 	// offset of its own, so the exact timestamps would give an output fed by N
-	// targets N sums to keep and N samples to write per interval -- N times the
-	// output, and more state still for every interval the aggregator is behind.
+	// targets N sums to keep and N samples to write per interval. A sample for an
+	// interval before the one written last goes to the first interval not
+	// written, decided here, when its round is processed, so that it is the same
+	// interval in every output, however far the flush has got with them; and
+	// however far behind the aggregator is, an output holds only so many sums.
 	sampleTimestamps := a.sampleTimestamps
+	stWritten := a.stWritten.Load()
+	lateTs, lateAt := int64(0), int64(0) // the round of the last late sample: a push is mostly one round
 
-	var maxLagMsec, maxTimestamp int64
+	var maxLagMsec int64
 	for idx, ts := range tss {
 		if !a.match.Match(ts.Labels) {
 			continue
@@ -1366,10 +1404,17 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 			if lagMsec > maxLagMsec {
 				maxLagMsec = lagMsec
 			}
-			maxTimestamp = max(maxTimestamp, s.Timestamp)
 			timestamp := s.Timestamp
 			if sampleTimestamps {
-				timestamp = a.intervalEnd(timestamp)
+				// a timestamp ahead of the clock is taken as now: its interval
+				// would otherwise be held until the clock got there
+				timestamp = a.intervalEnd(min(timestamp, nowMsec))
+				if timestamp < stWritten {
+					if lateAt == 0 || lateTs != s.Timestamp {
+						lateTs, lateAt = s.Timestamp, a.stLateInterval(s.Timestamp, stWritten)
+					}
+					timestamp = lateAt
+				}
 			}
 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
 				ctx.green = append(ctx.green, pushSample{
@@ -1392,12 +1437,6 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 		a.muFlushAfter.Unlock()
 	}
 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
-	for {
-		wm := a.watermark.Load()
-		if maxTimestamp <= wm || a.watermark.CompareAndSwap(wm, maxTimestamp) {
-			break
-		}
-	}
 
 	ctx.buf = buf
 
@@ -1417,14 +1456,45 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	}
 }
 
-// intervalEnd returns the end of the interval ts falls in, on the grid the
-// flushes are aligned to: intervals are (end - interval, end].
-func (a *aggregator) intervalEnd(ts int64) int64 {
-	phase, iv := a.intervalPhaseMsec, a.interval.Milliseconds()
-	if ts <= phase {
-		return ts
+// stLateInterval returns the interval the round scraped at ts goes to, now that
+// written, the end of the interval written last, is after its own: the first
+// interval not written when its first sample was processed. The flush writes it
+// with the interval or, for the outputs it had already written by the time the
+// sample got to them, the next flush writes it again with the sample, as the
+// tail of the interval written last. Only a round whose processing goes on
+// after that, past a whole interval more, has its later samples go further.
+func (a *aggregator) stLateInterval(ts, written int64) int64 {
+	a.stLateMu.Lock()
+	defer a.stLateMu.Unlock()
+	at, ok := a.stLate[ts]
+	if !ok {
+		at = written + a.interval.Milliseconds()
+		if a.stLate == nil {
+			a.stLate = make(map[int64]int64)
+		}
+		a.stLate[ts] = at
 	}
-	return phase + ((ts-phase-1)/iv+1)*iv
+	return at
+}
+
+// intervalEnd returns the end of the interval ts falls in, on the grid the
+// flushes are aligned to. Intervals are [end - interval, end): a round scraped
+// right on a boundary, as scrape_align_interval has them, belongs to the
+// interval that starts there, and so does every later one of the same target,
+// each an interval after the one before.
+func (a *aggregator) intervalEnd(ts int64) int64 {
+	return a.intervalFloor(ts) + a.interval.Milliseconds()
+}
+
+// intervalFloor returns the boundary at or before ts on the flushes' grid.
+func (a *aggregator) intervalFloor(ts int64) int64 {
+	phase, iv := a.intervalPhaseMsec, a.interval.Milliseconds()
+	d := ts - phase
+	q := d / iv
+	if d < 0 && d%iv != 0 {
+		q--
+	}
+	return phase + q*iv
 }
 
 // compressLabels builds a sample's key: the length of the output part, the
@@ -1523,8 +1593,6 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
 	ctx.flushTimestamp = flushTimestamp
 	ctx.isLast = isLast
 	ctx.now = time.Now().UnixMilli()
-	ctx.watermark = a.watermark.Load()
-	ctx.seq = a.flushSeq.Add(1)
 	return ctx
 }
 
@@ -1543,11 +1611,12 @@ type flushCtx struct {
 	isGreen        bool
 	isLast         bool
 
-	// now, watermark and seq are for sample_timestamps: the wall clock no output
-	// is stamped after, the latest input sample timestamp, and which flush this is.
-	now       int64
-	watermark int64
-	seq       int64
+	// now and st are for sample_timestamps: the wall clock no output is stamped
+	// after, and where the aggregator is in the intervals, the same for every
+	// output; slots is scratch for an output's sums.
+	now   int64
+	st    stState
+	slots []slot
 
 	tss     []prompb.TimeSeries
 	labels  []prompb.Label
@@ -1561,7 +1630,8 @@ func (ctx *flushCtx) reset() {
 	ctx.isGreen = false
 	ctx.isLast = false
 	ctx.flushTimestamp = 0
-	ctx.now, ctx.watermark, ctx.seq = 0, 0, 0
+	ctx.now, ctx.st = 0, stState{}
+	ctx.slots = ctx.slots[:0]
 	ctx.resetSeries()
 }
 

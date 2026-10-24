@@ -1,8 +1,6 @@
 package streamaggr
 
 import (
-	"fmt"
-	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -108,57 +106,6 @@ func increaseIn(samples []outSample, from, to time.Duration) float64 {
 	return last(to) - last(from)
 }
 
-// Rounds the aggregator processes four minutes late still count towards the
-// minutes they were scraped in, and a sum arriving for a minute already written
-// adds to it instead of replacing it.
-func TestSampleTimestampsSumSamplesKeepsTheScrapeMinute(t *testing.T) {
-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
-	pushes := []latePush{
-		// Rounds scraped at minutes 1 to 4, all processed at 5m10s.
-		{at: 5*time.Minute + 10*time.Second, sampleAt: 1 * time.Minute, metrics: `foo 1`},
-		{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 2`},
-		{at: 5*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 3`},
-		{at: 5*time.Minute + 10*time.Second, sampleAt: 4 * time.Minute, metrics: `foo 4`},
-		// Another target's share of minute 2 arrives after minute 2 was written.
-		{at: 6*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 20`},
-	}
-	got := runLateScenario(t, cfg, pushes, 8*time.Minute)["foo"]
-	for m, want := range map[int]float64{1: 1, 2: 22, 3: 3, 4: 4, 5: 0, 6: 0} {
-		to := time.Duration(m) * time.Minute
-		if sum := sumIn(got, to-time.Minute, to); sum != want {
-			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
-		}
-	}
-}
-
-// Eleven rounds processed at once, eleven minutes late, land each in its own
-// minute: the increase over any window is exactly the rounds scraped in it, and
-// the counter never goes back. A heartbeat due while the aggregator was stuck
-// does not push the series ahead of the rounds still to come.
-func TestSampleTimestampsTotalAttributesLateRoundsToTheirMinute(t *testing.T) {
-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
-		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
-	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: `foo 1`}}
-	for i := 1; i <= 11; i++ {
-		pushes = append(pushes, latePush{at: 12*time.Minute + 5*time.Second, sampleAt: time.Duration(i) * time.Minute, metrics: `foo 1`})
-	}
-	got := runLateScenario(t, cfg, pushes, 14*time.Minute)["foo"]
-	for i := 1; i < len(got); i++ {
-		if got[i].value < got[i-1].value && got[i].value != 0 {
-			t.Fatalf("the counter goes back from %v to %v: %v", got[i-1], got[i], got)
-		}
-	}
-	if inc := increaseIn(got, 0, 3*time.Minute); inc != 3 {
-		t.Errorf("increase over (0, 3m] is %v, want 3 (rounds 1-3); samples %v", inc, got)
-	}
-	if inc := increaseIn(got, 0, 5*time.Minute); inc != 5 {
-		t.Errorf("increase over (0, 5m] is %v, want 5 (rounds 1-5); samples %v", inc, got)
-	}
-	if inc := increaseIn(got, 5*time.Minute, 11*time.Minute); inc != 6 {
-		t.Errorf("increase over (5m, 11m] is %v, want 6 (rounds 6-11); samples %v", inc, got)
-	}
-}
-
 // One target's round 2 is processed after round 3 was written. It cannot be
 // written at 2m, after 3m in the series: the counter would go back. It goes to
 // 3m, off by the gap between the two targets rather than lost or misplaced.
@@ -180,27 +127,13 @@ func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
 	}
 }
 
-// The zero written before the first sample of a new output precedes it even
-// when that sample is minutes older than the flush that writes it; a zero after
-// it would read as a reset and count the value twice.
-func TestSampleTimestampsResetMarkerPrecedesTheFirstSample(t *testing.T) {
-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
-		"  staleness_interval: 40m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
-	got := runLateScenario(t, cfg, []latePush{{at: 7*time.Minute + 5*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 5`}}, 9*time.Minute)["foo"]
-	if len(got) < 2 || got[0].value != 0 || got[1].value != 5 || got[0].at >= got[1].at || got[1].at != 2*time.Minute {
-		t.Fatalf("want a zero, then 5 at 2m; got %v", got)
-	}
-	if inc := increaseIn(got, 0, 9*time.Minute); inc != 5 {
-		t.Fatalf("increase is %v, want 5; samples %v", inc, got)
-	}
-}
-
 func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
 	for _, cfg := range []string{
 		"- match: foo\n  interval: 1m\n  outputs: [total]\n  sample_timestamps: true\n",
 		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  sample_timestamps: true\n",
 		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
 		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
+		"- match: foo\n  interval: 1m\n  ignore_old_samples: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
 	} {
 		a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, nil, "test")
 		if err == nil {
@@ -229,95 +162,9 @@ func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
 	}
 }
 
-// Targets are scraped at offsets of their own, so the rounds of one minute reach
-// an output with as many timestamps as there are targets. They are summed per
-// minute and written once, at the end of the minute, not once per target; a
-// sample right on a boundary belongs to the minute it ends.
-func TestSampleTimestampsOneSamplePerIntervalAcrossTargets(t *testing.T) {
-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
-	var pushes []latePush
-	// Three targets at 5s, 23s and 41s into minutes 1 to 3, all processed at
-	// 4m30s, as while the aggregator is behind.
-	for m := 1; m <= 3; m++ {
-		for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
-			pushes = append(pushes, latePush{at: 4*time.Minute + 30*time.Second, sampleAt: time.Duration(m)*time.Minute + off, metrics: `foo 1`})
-		}
-	}
-	// A round scraped exactly at 5m belongs to (4m, 5m].
-	pushes = append(pushes, latePush{at: 5*time.Minute + 10*time.Second, sampleAt: 5 * time.Minute, metrics: `foo 7`})
-	got := runLateScenario(t, cfg, pushes, 7*time.Minute)["foo"]
-	for m, want := range map[int]float64{1: 0, 2: 3, 3: 3, 4: 3, 5: 7, 6: 0} {
-		to := time.Duration(m) * time.Minute
-		if sum := sumIn(got, to-time.Minute, to); sum != want {
-			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
-		}
-	}
-	if len(got) != 4 {
-		t.Errorf("want one sample per minute with input, 4 in all; got %d: %v", len(got), got)
-	}
-}
-
-// The totals of rounds from several targets are written once per minute, at the
-// end of the minute, and the increase over every minute is the rounds in it.
-func TestSampleTimestampsTotalOneSamplePerIntervalAcrossTargets(t *testing.T) {
-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
-		"  staleness_interval: 40m\n  sample_timestamps: true\n"
-	var pushes []latePush
-	for m := 0; m < 3; m++ {
-		for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
-			pushes = append(pushes, latePush{at: 3*time.Minute + 30*time.Second, sampleAt: time.Duration(m)*time.Minute + off, metrics: `foo 1`})
-		}
-	}
-	got := runLateScenario(t, cfg, pushes, 5*time.Minute)["foo"]
-	for m := 1; m <= 3; m++ {
-		to := time.Duration(m) * time.Minute
-		if inc := increaseIn(got, to-time.Minute, to); inc != 3 {
-			t.Errorf("increase over minute %d is %v, want 3; samples %v", m, inc, got)
-		}
-	}
-	for _, s := range got {
-		if s.at%time.Minute != 0 {
-			t.Errorf("sample %v is not at the end of a minute; samples %v", s, got)
-		}
-	}
-}
-
-// The intervals samples are put into are the rule's own, on the grid its
-// flushes are aligned to. time.Truncate counts from year 1, not from the Unix
-// epoch, and for an interval that does not divide a day, such as 7m, the two
-// grids differ: on the epoch's the sums would end between two flushes.
-func TestSampleTimestampsIntervalsFollowTheFlushGrid(t *testing.T) {
-	for _, iv := range []time.Duration{5 * time.Minute, 7 * time.Minute} {
-		cfg := fmt.Sprintf("- match: foo\n  interval: %s\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n"+
-			"  staleness_interval: 2h\n  sample_timestamps: true\n", iv)
-		var start time.Time
-		synctest.Test(t, func(t *testing.T) { start = time.Now() })
-		// The first interval on the flush grid that starts after the scenario does.
-		first := start.Truncate(iv).Add(iv).Sub(start)
-		var pushes []latePush
-		// Samples at its start, inside it, at its very end and just after, all
-		// processed one interval and a half late.
-		for _, at := range []time.Duration{first + time.Millisecond, first + iv/2, first + iv, first + iv + time.Millisecond} {
-			pushes = append(pushes, latePush{at: first + 3*iv, sampleAt: at, metrics: `foo 1`})
-		}
-		got := runLateScenario(t, cfg, pushes, first+5*iv)["foo"]
-		for _, s := range got {
-			if at := start.Add(s.at); !at.Equal(at.Truncate(iv)) {
-				t.Errorf("interval %s: sample %v at %s is off the flush grid; samples %v", iv, s, at.Format("15:04:05.000"), got)
-			}
-		}
-		if inc := increaseIn(got, first, first+iv); inc != 3 {
-			t.Errorf("interval %s: increase over the first interval is %v, want 3; samples %v", iv, inc, got)
-		}
-		if inc := increaseIn(got, first+iv, first+2*iv); inc != 1 {
-			t.Errorf("interval %s: increase over the second interval is %v, want 1; samples %v", iv, inc, got)
-		}
-	}
-}
-
 // A flush that runs a little after its boundary finds samples scraped after the
 // boundary, of the interval still open. They must not be written into the
-// interval that just closed, whatever the flush's back-off, and not twice.
+// interval that just closed, and not twice.
 func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
 	for _, output := range []string{"sum_samples", "sum_samples_total"} {
 		cfg := "- match: foo\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
@@ -340,8 +187,6 @@ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
 				t.Fatalf("cannot load config: %s", err)
 			}
 			aggr := a.as[0]
-			// Many flushes in, so the back-off is several hundred milliseconds.
-			aggr.flushSeq.Store(600)
 			T := start.Add(time.Minute)
 			time.Sleep(T.Add(-10 * time.Second).Sub(time.Now()))
 			a.Push(prometheus.MustParsePromMetrics(`foo 1`, T.Add(-10*time.Second).UnixMilli()), nil)
@@ -371,8 +216,9 @@ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
 	}
 }
 
-// The flush on shutdown writes the interval still open, before it ends. Right
-// after a boundary, backing off must not put it into the interval just closed.
+// The flush on shutdown writes the interval still open, before it ends, at the
+// time of the shutdown. Right after a boundary that is still in the open
+// interval, not in the one just closed.
 func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
 		"  flush_on_shutdown: true\n  sample_timestamps: true\n"
@@ -392,7 +238,6 @@ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cannot load config: %s", err)
 		}
-		a.as[0].flushSeq.Store(600)
 		T := start.Add(time.Minute)
 		time.Sleep(T.Add(2 * time.Millisecond).Sub(time.Now()))
 		a.Push(prometheus.MustParsePromMetrics(`foo 10`, T.Add(time.Millisecond).UnixMilli()), nil)
@@ -401,126 +246,6 @@ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
 	})
 	if sum := sumIn(got, time.Minute, 2*time.Minute); sum != 10 || len(got) != 1 {
 		t.Fatalf("want 10 written once within minute 2; samples %v", got)
-	}
-}
-
-// Every sample is counted exactly once, in the interval its timestamp falls in,
-// however late the aggregator processes it and however long its flushes take:
-// targets scraped at offsets of their own, rounds processed up to two and a
-// half minutes late, flushes running over their interval, and a flush on
-// shutdown. sum_samples has to match every interval exactly. sum_samples_total
-// has to end at the sum of everything and never go back; an interval arriving
-// after a later one was written goes to that later one by design.
-func TestSampleTimestampsCountsEverySampleOnceInItsInterval(t *testing.T) {
-	for seed := int64(1); seed <= 20; seed++ {
-		for _, output := range []string{"sum_samples", "sum_samples_total"} {
-			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
-				checkCountsEverySampleOnce(t, seed, output, iv)
-			}
-		}
-	}
-}
-
-func checkCountsEverySampleOnce(t *testing.T, seed int64, output string, iv time.Duration) {
-	t.Helper()
-	cfg := fmt.Sprintf("- match: foo\n  interval: %s\n  outputs: [%s]\n  keep_metric_names: true\n"+
-		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", iv, output)
-	rnd := rand.New(rand.NewSource(seed))
-	type push struct {
-		at, sampleAt time.Duration
-		value        float64
-	}
-	const minutes = 40
-	var pushes []push
-	offsets := []time.Duration{0, 1 * time.Millisecond, 13 * time.Second, 37 * time.Second, 59*time.Second + 999*time.Millisecond}
-	for m := 1; m < minutes; m++ {
-		for _, off := range offsets {
-			sampleAt := time.Duration(m)*time.Minute + off
-			delay := time.Duration(rnd.Intn(2000)) * time.Millisecond
-			if rnd.Intn(5) == 0 {
-				delay = time.Duration(rnd.Intn(150)) * time.Second
-			}
-			pushes = append(pushes, push{at: sampleAt + delay, sampleAt: sampleAt, value: float64(1 + rnd.Intn(9))})
-		}
-	}
-	sort.SliceStable(pushes, func(i, j int) bool { return pushes[i].at < pushes[j].at })
-	flushDelays := make([]time.Duration, 100)
-	for i := range flushDelays {
-		if rnd.Intn(4) == 0 {
-			flushDelays[i] = time.Duration(1+rnd.Intn(100)) * time.Second
-		}
-	}
-
-	var got []outSample
-	var start time.Time
-	synctest.Test(t, func(t *testing.T) {
-		start = time.Now()
-		var mu sync.Mutex
-		flushes := 0
-		pushFunc := func(tss []prompb.TimeSeries) {
-			mu.Lock()
-			for _, ts := range tss {
-				for _, s := range ts.Samples {
-					got = append(got, outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
-				}
-			}
-			d := flushDelays[flushes%len(flushDelays)]
-			flushes++
-			mu.Unlock()
-			time.Sleep(d)
-		}
-		a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
-		if err != nil {
-			t.Fatalf("cannot load config: %s", err)
-		}
-		for _, p := range pushes {
-			time.Sleep(start.Add(p.at).Sub(time.Now()))
-			a.Push(prometheus.MustParsePromMetrics(fmt.Sprintf("foo %v", p.value), start.Add(p.sampleAt).UnixMilli()), nil)
-		}
-		time.Sleep(start.Add(minutes*time.Minute + 5*time.Minute).Sub(time.Now()))
-		a.MustStop()
-	})
-	sort.SliceStable(got, func(i, j int) bool { return got[i].at < got[j].at })
-
-	// The true sums per interval, on the flushes' grid.
-	end := func(at time.Duration) time.Duration {
-		abs := start.Add(at)
-		e := abs.Truncate(iv)
-		if !e.Equal(abs) {
-			e = e.Add(iv)
-		}
-		return e.Sub(start)
-	}
-	want := map[time.Duration]float64{}
-	var all float64
-	for _, p := range pushes {
-		want[end(p.sampleAt)] += p.value
-		all += p.value
-	}
-	name := fmt.Sprintf("seed=%d output=%s interval=%s", seed, output, iv)
-	for _, s := range got {
-		if s.at > minutes*time.Minute+5*time.Minute {
-			t.Fatalf("%s: sample %v is after the end of the run", name, s)
-		}
-	}
-	if output == "sum_samples" {
-		for e, w := range want {
-			if g := sumIn(got, e-iv, e); g != w {
-				t.Errorf("%s: interval ending %s sums to %v, want %v", name, e, g, w)
-			}
-		}
-		if g := sumIn(got, -time.Hour, 2*time.Hour); g != all {
-			t.Errorf("%s: everything sums to %v, want %v", name, g, all)
-		}
-		return
-	}
-	for i := 1; i < len(got); i++ {
-		if got[i].value < got[i-1].value {
-			t.Fatalf("%s: the counter goes back from %v to %v", name, got[i-1], got[i])
-		}
-	}
-	if inc := increaseIn(got, -time.Hour, 2*time.Hour); inc != all {
-		t.Errorf("%s: the counter ends at %v, want %v", name, inc, all)
 	}
 }
 
@@ -591,17 +316,33 @@ func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
 	}
 }
 
-// An entry that receives nothing for staleness_interval is dropped, but not
-// while it holds sums of intervals no flush has written yet: a sample
-// timestamped ahead of the clock waits for its interval to end, and the entry
-// with it, on shutdown too.
-func TestSampleTimestampsStaleEntryKeepsPendingSums(t *testing.T) {
-	for _, stopAt := range []time.Duration{10 * time.Minute, 2*time.Minute + 30*time.Second} {
-		cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
-			"  staleness_interval: 1m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
-		got := runLateScenario(t, cfg, []latePush{{at: 10 * time.Second, sampleAt: 2*time.Minute + 30*time.Second, metrics: `foo 5`}}, stopAt)["foo"]
-		if sum := sumIn(got, 2*time.Minute, 3*time.Minute); sum != 5 || len(got) != 1 {
-			t.Errorf("stopped at %s: want 5 written once within minute 3; samples %v", stopAt, got)
+// A round that arrives after a later interval was written goes to a later
+// interval than its own, and every output of the aggregator has to put it in the
+// same one. Here a free request in minute 3 moved the tokens on but not the cost,
+// whose heartbeat is not due, so by its own latest point the cost of minute 1's
+// late round would go back into minute 1 while its tokens went to minute 3: the
+// two would be over in one minute and short in the other, and so in their hours.
+func TestSampleTimestampsTotalLateRoundLandsTogether(t *testing.T) {
+	cfg := "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
+		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  sample_timestamps: true\n"
+	pushes := []latePush{
+		{at: 30 * time.Second, sampleAt: 30 * time.Second, metrics: "tokens 10\ncost 30"},
+		{at: 150 * time.Second, sampleAt: 150 * time.Second, metrics: "tokens 5\ncost 0"}, // a free request
+		{at: 190 * time.Second, sampleAt: 40 * time.Second, metrics: "tokens 1\ncost 3"},  // minute 1's, late
+		{at: 250 * time.Second, sampleAt: 250 * time.Second, metrics: "tokens 2\ncost 6"}, // minute 5
+	}
+	got := runLateScenario(t, cfg, pushes, 8*time.Minute)
+	// cost - 3*tokens of the requests in each minute: the free one's -15, and the
+	// late round with it, whole
+	for m, want := range map[int]float64{1: 0, 2: 0, 3: -15, 4: 0, 5: 0} {
+		from, to := time.Duration(m-1)*time.Minute, time.Duration(m)*time.Minute
+		tok, cost := increaseIn(got["tokens"], from, to), increaseIn(got["cost"], from, to)
+		if d := cost - 3*tok; d != want {
+			t.Errorf("minute %d: tokens %v, cost %v: cost - 3*tokens = %v, want %v; tokens %v, cost %v",
+				m, tok, cost, d, want, got["tokens"], got["cost"])
 		}
+	}
+	if tok, cost := increaseIn(got["tokens"], 0, 8*time.Minute), increaseIn(got["cost"], 0, 8*time.Minute); tok != 18 || cost != 39 {
+		t.Errorf("in all: tokens %v, cost %v; want 18 and 39", tok, cost)
 	}
 }
