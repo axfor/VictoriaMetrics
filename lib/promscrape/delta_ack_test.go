@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
 )
 
 // The client sends the acknowledgement it is given and returns the round the
@@ -57,7 +61,7 @@ func TestClientReadDeltaData(t *testing.T) {
 // target's response sends AckPeek and changes nothing.
 func TestScrapeWorkDeltaAck(t *testing.T) {
 	var sw scrapeWork
-	sw.Config = &ScrapeWork{ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
+	sw.Config = &ScrapeWork{ScrapeURL: "http://delta-ack-test-1/metrics", ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
 	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
 	var sent []string
 	nextRound, nextBody, nextErr := "", "foo 1\n", error(nil)
@@ -98,7 +102,7 @@ func TestScrapeWorkDeltaAck(t *testing.T) {
 // scraping goes through ReadData and acknowledges nothing.
 func TestScrapeWorkWithoutDeltaAck(t *testing.T) {
 	var sw scrapeWork
-	sw.Config = &ScrapeWork{ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
+	sw.Config = &ScrapeWork{ScrapeURL: "http://delta-ack-test-2/metrics", ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
 	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
 	calls := 0
 	sw.ReadData = func(dst *chunkedbuffer.Buffer) (string, error) {
@@ -111,7 +115,115 @@ func TestScrapeWorkWithoutDeltaAck(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 	tsmGlobal.Unregister(&sw)
-	if calls != 1 || sw.deltaAck.Load() != nil {
-		t.Fatalf("ReadData called %d times, ack %v; want once and no ack", calls, sw.deltaAck.Load())
+	if calls != 1 || sw.deltaAck != nil {
+		t.Fatalf("ReadData called %d times, ack state %v; want once and none", calls, sw.deltaAck)
 	}
+}
+
+// A scrapeWork is replaced whenever its scrape config or target labels change,
+// as editing sample_limit does. The new one goes on acknowledging what the old
+// one processed, rather than AckNew, which the target answers by committing the
+// round the old one did not process, with every round rolled into it.
+func TestScrapeWorkDeltaAckSurvivesReplacement(t *testing.T) {
+	const url = "http://delta-ack-test-3/metrics"
+	newWork := func(sampleLimit int) (*scrapeWork, *[]string) {
+		sw := &scrapeWork{Config: &ScrapeWork{ScrapeURL: url, ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true, SampleLimit: sampleLimit}}
+		sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
+		sent := &[]string{}
+		round := 0
+		sw.ReadDeltaData = func(dst *chunkedbuffer.Buffer, ack string) (string, string, error) {
+			*sent = append(*sent, ack)
+			round++
+			_, _ = dst.Write([]byte("foo 1\nbar 2\nbaz 3\n"))
+			return "", fmt.Sprintf("s1:%d%d", sampleLimit, round), nil
+		}
+		return sw, sent
+	}
+	scrape := func(sw *scrapeWork) {
+		tsmGlobal.Register(sw)
+		_ = sw.scrapeInternal(123000, 123000)
+		tsmGlobal.Unregister(sw)
+	}
+	old, oldSent := newWork(0)
+	scrape(old) // processed: round s1:01
+	limited, limitedSent := newWork(1)
+	scrape(limited) // replaced with sample_limit: 1; rejected
+	scrape(limited) // rejected again
+	freed, freedSent := newWork(0)
+	scrape(freed) // replaced again with the limit gone
+	got := fmt.Sprint(*oldSent, *limitedSent, *freedSent)
+	want := fmt.Sprint([]string{deltaAckNew}, []string{"s1:01", "s1:01"}, []string{"s1:01"})
+	if got != want {
+		t.Fatalf("acknowledged %s; want %s", got, want)
+	}
+}
+
+// States not used for an hour are dropped, the others kept.
+func TestPruneDeltaAcks(t *testing.T) {
+	idle := deltaAckOf("http://delta-ack-test-4/metrics")
+	idle.used.Store(1000)
+	busy := deltaAckOf("http://delta-ack-test-5/metrics")
+	busy.used.Store(1000 + deltaAckIdle)
+	pruneDeltaAcks(1001 + deltaAckIdle)
+	if _, ok := deltaAcks.Load("http://delta-ack-test-4/metrics"); ok {
+		t.Fatalf("a state idle for over an hour was kept")
+	}
+	if _, ok := deltaAcks.Load("http://delta-ack-test-5/metrics"); !ok {
+		t.Fatalf("a state used within the hour was dropped")
+	}
+}
+
+// A delta round that stream parsing would fail partway through, after pushing
+// some of its blocks, is not pushed at all: it is not acknowledged, so the target
+// sends it again with the next round, and the blocks pushed would count twice.
+func TestScrapeWorkDeltaRoundPushedWholeOrNot(t *testing.T) {
+	protoparserutil.StartUnmarshalWorkers()
+	defer protoparserutil.StopUnmarshalWorkers()
+	const rows = 200000 // about 4MB: many blocks
+	var sb strings.Builder
+	for i := 0; i < rows; i++ {
+		fmt.Fprintf(&sb, "tokens_total{key=\"k%d\"} 1\n", i)
+	}
+	plain := []byte(sb.String())
+	damaged := encoding.CompressZSTDLevel(nil, plain, 1)
+	damaged[len(damaged)*3/4] ^= 0xff // past the first blocks
+
+	f := func(name string, cfg ScrapeWork, body []byte, encoding string, wantPushed int64) {
+		t.Helper()
+		var sw scrapeWork
+		cfg.ScrapeURL = "http://delta-whole-" + name + "/metrics"
+		cfg.ScrapeTimeout = 42 * time.Second
+		cfg.StreamParse = true
+		sw.Config = &cfg
+		var pushed atomic.Int64
+		sw.PushData = func(_ *auth.Token, wr *prompb.WriteRequest) {
+			for _, ts := range wr.Timeseries {
+				for _, l := range ts.Labels {
+					if l.Name == "__name__" && l.Value == "tokens_total" {
+						pushed.Add(int64(len(ts.Samples)))
+					}
+				}
+			}
+		}
+		sw.ReadDeltaData = func(dst *chunkedbuffer.Buffer, _ string) (string, string, error) {
+			_, _ = dst.Write(body)
+			return encoding, "s1:1", nil
+		}
+		tsmGlobal.Register(&sw)
+		err := sw.scrapeInternal(123000, 123000)
+		tsmGlobal.Unregister(&sw)
+		if got := pushed.Load(); got != wantPushed {
+			t.Errorf("%s: pushed %d samples of the round (scrape error: %v); want %d", name, got, err, wantPushed)
+		}
+		if wantPushed == 0 && err == nil {
+			t.Errorf("%s: the scrape succeeded; want it failed, and so the round not acknowledged", name)
+		}
+	}
+	// read and parsed at once, without the uncompressed body: no stale markers
+	f("limit-streamed", ScrapeWork{NoStaleMarkers: true, SampleLimit: rows - 1}, plain, "", 0)
+	f("damaged-streamed", ScrapeWork{NoStaleMarkers: true}, damaged, "zstd", 0)
+	// the uncompressed body kept for stale markers
+	f("limit-body", ScrapeWork{SampleLimit: rows - 1}, plain, "", 0)
+	// and a round that fits goes out whole
+	f("fits", ScrapeWork{NoStaleMarkers: true, SampleLimit: rows}, plain, "", rows)
 }

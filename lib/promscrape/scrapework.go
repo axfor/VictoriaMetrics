@@ -21,6 +21,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/leveledbytebufferpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -207,12 +208,9 @@ type scrapeWork struct {
 	ReadDeltaData func(dst *chunkedbuffer.Buffer, ack string) (contentEncoding, round string, err error)
 
 	// deltaAck is what the next scrape acknowledges to a target exposing
-	// increments through client_golang's promhttp/delta: nil before it has
-	// answered with a round, then the last round processed in full, or
-	// "<session>:0" when none of its session was. Such a target holds each round
-	// until the next request names it, and reports it again otherwise; see
-	// -promscrape.deltaAck.
-	deltaAck atomic.Pointer[string]
+	// increments through client_golang's promhttp/delta, shared by every
+	// scrapeWork of the same scrape URL; see deltaAckOf.
+	deltaAck *deltaAckState
 
 	// PushData is called for pushing collected data.
 	//
@@ -483,11 +481,72 @@ func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEn
 	}
 	if ack == "" {
 		ack = deltaAckNew
-		if p := sw.deltaAck.Load(); p != nil {
+		if p := sw.deltaAckState().ack.Load(); p != nil {
 			ack = *p
 		}
 	}
 	return sw.ReadDeltaData(dst, ack)
+}
+
+// deltaAckState is what the next scrape of a target acknowledges: nil before it
+// has answered with a round, then the last round processed in full, or
+// "<session>:0" when none of its session was. Such a target holds each round
+// until the next request names it, and reports it again otherwise; see
+// -promscrape.deltaAck.
+type deltaAckState struct {
+	ack  atomic.Pointer[string]
+	used atomic.Uint64 // last use, in Unix seconds
+}
+
+// deltaAcks keeps a deltaAckState per scrape URL rather than per scrapeWork. A
+// scrapeWork is replaced whenever its scrape config or target labels change, a
+// sample_limit edited or a config reload with such a change, and a new one that
+// knew nothing would send AckNew, which the target answers by committing the
+// round it holds: the round the old scrapeWork did not process, with every one
+// rolled into it since. Entries not used for an hour go.
+var (
+	deltaAcks        sync.Map // scrape URL -> *deltaAckState
+	deltaAcksJanitor sync.Once
+)
+
+const deltaAckIdle = 3600 // seconds
+
+// deltaAckState returns the acknowledgement state of the target sw scrapes.
+func (sw *scrapeWork) deltaAckState() *deltaAckState {
+	if sw.deltaAck == nil {
+		sw.deltaAck = deltaAckOf(sw.Config.ScrapeURL)
+	}
+	sw.deltaAck.used.Store(fasttime.UnixTimestamp())
+	return sw.deltaAck
+}
+
+func deltaAckOf(scrapeURL string) *deltaAckState {
+	deltaAcksJanitor.Do(func() {
+		go func() {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for range t.C {
+				pruneDeltaAcks(fasttime.UnixTimestamp())
+			}
+		}()
+	})
+	if v, ok := deltaAcks.Load(scrapeURL); ok {
+		return v.(*deltaAckState)
+	}
+	v, _ := deltaAcks.LoadOrStore(scrapeURL, &deltaAckState{})
+	return v.(*deltaAckState)
+}
+
+// pruneDeltaAcks drops the states not used for deltaAckIdle. A scrapeWork still
+// holding one goes on with it, and its scrape URL gets a new one only once it
+// is replaced by a scrapeWork that has not used it for an hour.
+func pruneDeltaAcks(now uint64) {
+	deltaAcks.Range(func(k, v any) bool {
+		if now-v.(*deltaAckState).used.Load() > deltaAckIdle {
+			deltaAcks.Delete(k)
+		}
+		return true
+	})
 }
 
 // processedDeltaRound records what the next scrape acknowledges after one that
@@ -497,15 +556,16 @@ func (sw *scrapeWork) processedDeltaRound(round string, processed bool) {
 		return
 	}
 	if processed {
-		sw.deltaAck.Store(&round)
+		sw.deltaAckState().ack.Store(&round)
 		return
 	}
 	// A round of a session none of whose rounds was processed yet, as after
 	// the target restarted, acknowledges nothing of it.
 	session, _, _ := strings.Cut(round, ":")
-	if p := sw.deltaAck.Load(); p == nil || !strings.HasPrefix(*p, session+":") {
+	st := sw.deltaAckState()
+	if p := st.ack.Load(); p == nil || !strings.HasPrefix(*p, session+":") {
 		none := session + ":0"
-		sw.deltaAck.Store(&none)
+		st.ack.Store(&none)
 	}
 }
 
@@ -533,7 +593,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) (err 
 	if err == nil && sw.canStreamWithoutBody(cb.Len()) {
 		// Decompress and parse the read response block by block, so the uncompressed response is never held in memory.
 		scrapesStreamedWithoutBody.Inc()
-		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds)
+		err = sw.processReadDataInStreamMode(scrapeTimestamp, realTimestamp, cb, contentEncoding, scrapeDurationSeconds, round != "")
 		chunkedbuffer.Put(cb)
 		<-processScrapedDataConcurrencyLimitCh
 		return err
@@ -556,7 +616,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) (err 
 		// This case is optimized for targets exposing more than ten thousand of metrics per target,
 		// such as kube-state-metrics.
 		scrapesStreamed.Inc()
-		err = sw.processDataInStreamMode(scrapeTimestamp, realTimestamp, body, scrapeDurationSeconds)
+		err = sw.processDataInStreamMode(scrapeTimestamp, realTimestamp, body, scrapeDurationSeconds, round != "")
 	} else {
 		// Process response body from scrape target at once.
 		// This case should work more optimally than stream parse for common case when scrape target exposes
@@ -600,7 +660,21 @@ func (sw *scrapeWork) canStreamWithoutBody(readSize int) bool {
 //
 // Unlike processDataInStreamMode, a decompression error in the middle of the response marks the scrape as failed
 // after some samples may have been already pushed. This is the same as for parsing errors in stream parsing mode.
-func (sw *scrapeWork) processReadDataInStreamMode(scrapeTimestamp, realTimestamp int64, cb *chunkedbuffer.Buffer, contentEncoding string, scrapeDurationSeconds float64) error {
+//
+// A delta round is read through first, see checkWhole: nothing of it is pushed unless all of it can be.
+func (sw *scrapeWork) processReadDataInStreamMode(scrapeTimestamp, realTimestamp int64, cb *chunkedbuffer.Buffer, contentEncoding string, scrapeDurationSeconds float64, delta bool) error {
+	if delta {
+		err := sw.checkWhole(scrapeTimestamp, true, func() (io.Reader, func(), error) {
+			reader, err := protoparserutil.GetUncompressedReader(cb.NewReader(), contentEncoding)
+			if err != nil {
+				return nil, nil, fmt.Errorf("cannot decompress response body: %w", err)
+			}
+			return &responseReader{r: reader, contentEncoding: contentEncoding}, func() { protoparserutil.PutUncompressedReader(reader) }, nil
+		})
+		if err != nil {
+			return sw.processDataOneShot(scrapeTimestamp, realTimestamp, nil, scrapeDurationSeconds, err)
+		}
+	}
 	reader, err := protoparserutil.GetUncompressedReader(cb.NewReader(), contentEncoding)
 	if err != nil {
 		return sw.processDataOneShot(scrapeTimestamp, realTimestamp, nil, scrapeDurationSeconds, fmt.Errorf("cannot decompress response body: %w", err))
@@ -747,9 +821,66 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 	return err
 }
 
-func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64) error {
+func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int64, body *bytesutil.ByteBuffer, scrapeDurationSeconds float64, delta bool) error {
+	if delta {
+		err := sw.checkWhole(scrapeTimestamp, false, func() (io.Reader, func(), error) { return body.NewReader(), func() {}, nil })
+		if err != nil {
+			return sw.processDataOneShot(scrapeTimestamp, realTimestamp, nil, scrapeDurationSeconds, err)
+		}
+	}
 	bodyString := bytesutil.ToUnsafeString(body.B)
 	return sw.processStream(scrapeTimestamp, realTimestamp, body.NewReader(), bodyString, func() int { return len(bodyString) }, scrapeDurationSeconds)
+}
+
+// checkWhole reads a response of a delta round through, pushing nothing, and returns the error that
+// would make stream parsing fail it partway through: damaged compressed data, label_limit or sample_limit.
+//
+// Stream parsing pushes each block as it is parsed. A delta round failed after some of its blocks are
+// pushed is not acknowledged, so the target sends it again, in full, with the next round: the blocks
+// pushed already would be counted twice. Every one of these errors follows from the response alone,
+// which is in memory, so a response that passes this check passes the parse that pushes it.
+// Without the limits only decompression can fail, and only that is done.
+func (sw *scrapeWork) checkWhole(scrapeTimestamp int64, compressed bool, open func() (io.Reader, func(), error)) error {
+	cfg := sw.Config
+	if !compressed && cfg.SampleLimit <= 0 && cfg.LabelLimit <= 0 {
+		return nil
+	}
+	r, done, err := open()
+	if err != nil {
+		return err
+	}
+	defer done()
+	if cfg.SampleLimit <= 0 && cfg.LabelLimit <= 0 {
+		_, err := io.Copy(io.Discard, r)
+		return err
+	}
+	var samples atomic.Int64
+	return stream.Parse(r, scrapeTimestamp, "", false, false, func(rows []parser.Row, _ []parser.Metadata) error {
+		wc := writeRequestCtxPool.Get(sw.prevLabelsLen)
+		defer writeRequestCtxPool.Put(wc)
+		if err := wc.addRows(cfg, rows, scrapeTimestamp, true); err != nil {
+			if errors.Is(err, errLabelsLimitExceeded) {
+				scrapesSkippedByLabelLimit.Inc()
+				return labelLimitError(cfg)
+			}
+			return err
+		}
+		if n := samples.Add(int64(len(wc.writeRequest.Timeseries))); cfg.SampleLimit > 0 && int(n) > cfg.SampleLimit {
+			scrapesSkippedBySampleLimit.Inc()
+			return sampleLimitError(cfg)
+		}
+		return nil
+	}, func(string) {}) // the parse that pushes it logs these
+}
+
+func labelLimitError(cfg *ScrapeWork) error {
+	return fmt.Errorf("the response from %q contains samples with a number of labels exceeding label_limit=%d; "+
+		"either reduce the labels count for the target or increase label_limit", cfg.ScrapeURL, cfg.LabelLimit)
+}
+
+func sampleLimitError(cfg *ScrapeWork) error {
+	return fmt.Errorf("the response from %q exceeds sample_limit=%d; "+
+		"either reduce the sample count for the target or increase sample_limit", cfg.ScrapeURL, cfg.SampleLimit)
 }
 
 // processStream parses the uncompressed response from r in stream parsing mode.
@@ -792,16 +923,14 @@ func (sw *scrapeWork) processStream(scrapeTimestamp, realTimestamp int64, r io.R
 		if err := wc.addRows(cfg, rows, scrapeTimestamp, true); err != nil {
 			if errors.Is(err, errLabelsLimitExceeded) {
 				scrapesSkippedByLabelLimit.Inc()
-				return fmt.Errorf("the response from %q contains samples with a number of labels exceeding label_limit=%d; "+
-					"either reduce the labels count for the target or increase label_limit", cfg.ScrapeURL, cfg.LabelLimit)
+				return labelLimitError(cfg)
 			}
 			return err
 		}
 		n := samplesPostRelabeling.Add(int64(len(wc.writeRequest.Timeseries)))
 		if cfg.SampleLimit > 0 && int(n) > cfg.SampleLimit {
 			scrapesSkippedBySampleLimit.Inc()
-			return fmt.Errorf("the response from %q exceeds sample_limit=%d; "+
-				"either reduce the sample count for the target or increase sample_limit", cfg.ScrapeURL, cfg.SampleLimit)
+			return sampleLimitError(cfg)
 		}
 		wc.addMetadata(mms)
 
