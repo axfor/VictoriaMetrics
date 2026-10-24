@@ -1,0 +1,1728 @@
+From 0b4ecfe8c908a44ac6606f058c2df6cfa3a8ec6c Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sat, 24 Oct 2026 00:55:14 -0700
+Subject: [PATCH 33/33] lib/streamaggr: place sample_timestamps rounds once,
+ write each interval once and complete
+
+sample_timestamps put a sample by what the aggregator's flush had already
+written, which differed between outputs and changed in the middle of a round:
+a late round processed while a flush walked the outputs went to one interval
+in some outputs and to the next in others, and the cost and the tokens of one
+round came out short in one minute and over in the next.
+
+Where a sample goes now follows from its round alone, the same in every output:
+
+- A sample belongs to the interval [end - interval, end) its scrape timestamp
+  falls in, so a round scraped on a boundary, as scrape_align_interval has
+  them, goes to the interval that starts there.
+- Processed before that interval is written, it is written with it, at its end.
+- Processed after, while it is the interval written last, it is the tail of a
+  round crossing the boundary: the next flush writes the interval again, at the
+  same timestamp, complete; deduplication keeps the bigger value. A tail that
+  would make it smaller -- negative, or after sum_samples_total started its
+  total again -- goes to the next interval instead.
+- Processed later than that, it goes to the first interval not written when
+  its round's first sample was processed, decided once per scrape timestamp, so
+  the rest of the round goes there too. Only a round still being processed a
+  whole interval after that has its later samples go further.
+- Rounds scraped before the aggregator started go to its first interval; a
+  timestamp ahead of the clock counts as now.
+
+Nothing is dropped however far behind the aggregator is, and an output holds a
+fixed number of sums: no back-off milliseconds, no watermark, no latest-written
+tracking across outputs. sample_timestamps is refused with ignore_old_samples,
+which drops the late rounds it places.
+
+Tests: a named test per rule; a round processed while a flush walks the
+outputs, on time and late, stays in one interval (a hook between entries
+pushes it there); a randomized test, 20 seeds x both outputs x 1m and 7m x with
+and without flushes running over, checks that every interval has cost three
+times the tokens, totals are exact and nothing is written early, and without
+overruns every interval against a reference model of the rules. Each of the 11
+rules, broken in turn, fails at least one test. -race passes.
+
+Cost: 163 bytes per output series, two intervals pending or one (032: 147 and
+188, option off about 131); a flush of 20 targets x 2000 keys 7.7 ms (off 7.5).
+At 37% of the full ACG response with the 102 production rules, 9.5M samples a
+minute: no flush timeouts, lag 0.2s, every minute exact in two separate rules,
+heap +250 MB over the option off.
+---
+ lib/streamaggr/output.go                      |   7 +
+ .../sample_timestamps_rules_test.go           | 555 ++++++++++++++++++
+ lib/streamaggr/sample_timestamps_test.go      | 325 ++--------
+ .../sample_timestamps_timing_test.go          |   2 +
+ lib/streamaggr/streamaggr.go                  | 136 +++--
+ lib/streamaggr/sum_samples.go                 | 329 +++++++----
+ 6 files changed, 904 insertions(+), 450 deletions(-)
+ create mode 100644 lib/streamaggr/sample_timestamps_rules_test.go
+
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index 3094a7991..2ecefd8d7 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -155,6 +155,9 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 		sh.mu.RUnlock()
+ 		for _, e := range entries {
+ 			ao.flushEntry(ctx, sh, e.key, e.av)
++			if flushEntryHook != nil {
++				flushEntryHook()
++			}
+ 		}
+ 		clear(entries)
+ 		entries = entries[:0]
+@@ -162,6 +165,10 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
+ 	flushEntriesPool.Put(&entries)
+ }
+ 
++// flushEntryHook, when set, is called after each entry a flush writes: for the
++// tests of samples pushed while a flush is under way only.
++var flushEntryHook func()
++
+ // removeEntry drops key from sh if it still maps to av.
+ func (sh *aggrOutputShard) removeEntry(key string, av *aggrValues) {
+ 	sh.mu.Lock()
+diff --git a/lib/streamaggr/sample_timestamps_rules_test.go b/lib/streamaggr/sample_timestamps_rules_test.go
+new file mode 100644
+index 000000000..d4622de20
+--- /dev/null
++++ b/lib/streamaggr/sample_timestamps_rules_test.go
+@@ -0,0 +1,555 @@
++package streamaggr
++
++import (
++	"fmt"
++	"math/rand"
++	"sort"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
++)
++
++// The rules of sample_timestamps, as these tests check them. A sample belongs
++// to the interval [end - interval, end) its scrape timestamp falls in, and is
++// written at the end of it:
++//
++//   - processed before that interval is written, it is written with it;
++//   - processed after, while it is still the interval written last, it is the
++//     tail of a round that crossed the boundary: the interval is written again,
++//     at the same timestamp, complete, and VM keeps the bigger value;
++//   - processed later than that, it goes to the first interval not written.
++//
++// Either way every sample is counted once, and the samples of one round -- one
++// push here -- go to the same interval in every output.
++
++// tokensCost is a round of usage: tokens, and cost three times as much.
++func tokensCost(v float64) string { return fmt.Sprintf("tokens %v\ncost %v", v, 3*v) }
++
++func stConfig(output string, extra string) string {
++	return "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  sample_timestamps: true\n" + extra
++}
++
++// perInterval is what an output wrote for the interval ending at to: the sum
++// of its samples for sum_samples, the increase for sum_samples_total.
++func perInterval(output string, samples []outSample, to, iv time.Duration) float64 {
++	if output == "sum_samples" {
++		return sumIn(samples, to-iv, to)
++	}
++	return increaseIn(samples, to-iv, to)
++}
++
++// checkMinutes checks tokens per minute against want, and that cost is three
++// times the tokens in every minute: the samples of a round were not split.
++func checkMinutes(t *testing.T, output string, got map[string][]outSample, want map[int]float64, minutes int) {
++	t.Helper()
++	for m := 1; m <= minutes; m++ {
++		to := time.Duration(m) * time.Minute
++		tok, cost := perInterval(output, got["tokens"], to, time.Minute), perInterval(output, got["cost"], to, time.Minute)
++		if tok != want[m] {
++			t.Errorf("%s: minute ending %dm has tokens %v, want %v; tokens %v", output, m, tok, want[m], got["tokens"])
++		}
++		if cost != 3*tok {
++			t.Errorf("%s: minute ending %dm has tokens %v but cost %v: a round was split; cost %v", output, m, tok, cost, got["cost"])
++		}
++	}
++}
++
++var stOutputs = []string{"sum_samples", "sum_samples_total"}
++
++// Rounds processed within their interval are written with it, once per
++// interval however many targets feed it.
++func TestSampleTimestampsOnTimeRoundsGoToTheirInterval(t *testing.T) {
++	for _, output := range stOutputs {
++		var pushes []latePush
++		for m := 0; m < 3; m++ {
++			for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
++				at := time.Duration(m)*time.Minute + off
++				pushes = append(pushes, latePush{at: at + 2*time.Second, sampleAt: at, metrics: tokensCost(1)})
++			}
++		}
++		got := runLateScenario(t, stConfig(output, ""), pushes, 5*time.Minute)
++		checkMinutes(t, output, got, map[int]float64{1: 3, 2: 3, 3: 3}, 5)
++		for _, s := range got["tokens"] {
++			if s.at%time.Minute != 0 {
++				t.Errorf("%s: sample %v is not at the end of a minute", output, s)
++			}
++		}
++		if output == "sum_samples" && len(got["tokens"]) != 3 {
++			t.Errorf("%s: want one sample per minute, 3 in all; got %v", output, got["tokens"])
++		}
++	}
++}
++
++// A round scraped right on a boundary, as scrape_align_interval has them,
++// belongs to the interval that starts there; one scraped a millisecond before
++// it, to the one that ends there.
++func TestSampleTimestampsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
++	for _, output := range stOutputs {
++		got := runLateScenario(t, stConfig(output, ""), []latePush{
++			{at: 2*time.Minute - time.Millisecond, sampleAt: 2*time.Minute - time.Millisecond, metrics: tokensCost(1)},
++			{at: 2*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: tokensCost(5)},
++		}, 4*time.Minute)
++		checkMinutes(t, output, got, map[int]float64{2: 1, 3: 5}, 4)
++	}
++}
++
++// The tail of a round that crossed the boundary -- processed after its interval
++// was written, before the next one was -- completes that interval: it is written
++// again at the same timestamp, with the whole round.
++func TestSampleTimestampsTailCompletesTheIntervalWrittenLast(t *testing.T) {
++	for _, output := range stOutputs {
++		got := runLateScenario(t, stConfig(output, ""), []latePush{
++			{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: tokensCost(4)},
++			{at: 2*time.Minute + 10*time.Second, sampleAt: 80 * time.Second, metrics: tokensCost(6)},
++		}, 4*time.Minute)
++		checkMinutes(t, output, got, map[int]float64{2: 10, 3: 0}, 4)
++		n := 0
++		for _, s := range got["tokens"] {
++			if s.at == 2*time.Minute {
++				n++
++			}
++		}
++		if n != 2 {
++			t.Errorf("%s: want the minute ending 2m written twice, the second time complete; tokens %v", output, got["tokens"])
++		}
++	}
++}
++
++// A tail that would make the interval smaller cannot complete it -- VM keeps the
++// bigger of two values at one timestamp -- so it goes to the next interval.
++func TestSampleTimestampsNegativeTailGoesToTheNextInterval(t *testing.T) {
++	got := runLateScenario(t, stConfig("sum_samples", ""), []latePush{
++		{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: `tokens 4`},
++		{at: 2*time.Minute + 10*time.Second, sampleAt: 80 * time.Second, metrics: `tokens -1`},
++	}, 4*time.Minute)["tokens"]
++	if a, b := sumIn(got, time.Minute, 2*time.Minute), sumIn(got, 2*time.Minute, 3*time.Minute); a != 4 || b != -1 {
++		t.Fatalf("want 4 in the minute ending 2m and -1 in the next; got %v and %v: %v", a, b, got)
++	}
++}
++
++// Rounds processed after a later interval was written go to the first interval
++// not written, all of them together; the round of the interval written last is
++// its tail. Nothing is lost, nothing counted twice.
++func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) {
++	for _, output := range stOutputs {
++		got := runLateScenario(t, stConfig(output, ""), []latePush{
++			// scraped in the minutes ending 2m to 5m, all processed at 5m10s
++			{at: 5*time.Minute + 10*time.Second, sampleAt: 1 * time.Minute, metrics: tokensCost(1)},
++			{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: tokensCost(2)},
++			{at: 5*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: tokensCost(3)},
++			{at: 5*time.Minute + 10*time.Second, sampleAt: 4 * time.Minute, metrics: tokensCost(4)},
++			// another target's, scraped in the minute ending 3m, processed at 6m10s
++			{at: 6*time.Minute + 10*time.Second, sampleAt: 2*time.Minute + 7*time.Second, metrics: tokensCost(20)},
++		}, 8*time.Minute)
++		checkMinutes(t, output, got, map[int]float64{5: 4, 6: 1 + 2 + 3, 7: 20}, 8)
++	}
++}
++
++// The rest of a late round processed after the flush of the interval it was
++// put in goes there too, as that interval's tail: samples sharing a scrape
++// timestamp are taken as one round, whose interval is decided at the first.
++func TestSampleTimestampsLateRoundKeepsItsInterval(t *testing.T) {
++	for _, output := range stOutputs {
++		got := runLateScenario(t, stConfig(output, ""), []latePush{
++			{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: tokensCost(2)},
++			{at: 6*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: tokensCost(20)},
++		}, 8*time.Minute)
++		checkMinutes(t, output, got, map[int]float64{6: 22}, 8)
++	}
++}
++
++// Rounds scraped before the aggregator started go to the first interval it
++// writes: the one before is the previous process's, which may have written it.
++func TestSampleTimestampsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T) {
++	for _, output := range stOutputs {
++		got := runLateScenario(t, stConfig(output, ""), []latePush{
++			{at: 10 * time.Second, sampleAt: -30 * time.Second, metrics: tokensCost(7)},
++		}, 3*time.Minute)
++		checkMinutes(t, output, got, map[int]float64{1: 7}, 3)
++		for _, s := range got["tokens"] {
++			if s.at <= 0 && s.value != 0 {
++				t.Errorf("%s: %v written at or before the start", output, s)
++			}
++		}
++	}
++}
++
++// A sample stamped ahead of the clock counts as processed now; held until its
++// time came, it would keep its output from being dropped as stale.
++func TestSampleTimestampsFutureTimestampCountsNow(t *testing.T) {
++	got := runLateScenario(t, stConfig("sum_samples", "  flush_on_shutdown: true\n"), []latePush{
++		{at: 10 * time.Second, sampleAt: 2*time.Minute + 30*time.Second, metrics: `tokens 5`},
++	}, 4*time.Minute)["tokens"]
++	if sumIn(got, 0, time.Minute) != 5 || len(got) != 1 {
++		t.Fatalf("want 5 written once in the minute ending 1m; got %v", got)
++	}
++}
++
++// sum_samples_total never goes back, puts the reset marker before its first
++// sample, and its heartbeat does not get ahead of the intervals written.
++func TestSampleTimestampsTotalStaysACounter(t *testing.T) {
++	cfg := stConfig("sum_samples_total", "  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n")
++	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: tokensCost(1)}}
++	for i := 1; i <= 11; i++ {
++		pushes = append(pushes, latePush{at: 12*time.Minute + 5*time.Second, sampleAt: time.Duration(i) * time.Minute, metrics: tokensCost(1)})
++	}
++	got := runLateScenario(t, cfg, pushes, 14*time.Minute)
++	tok := got["tokens"]
++	if len(tok) == 0 || tok[0].value != 0 {
++		t.Fatalf("want the reset marker first; got %v", tok)
++	}
++	for i := 1; i < len(tok); i++ {
++		if tok[i].value < tok[i-1].value {
++			t.Fatalf("the counter goes back from %v to %v: %v", tok[i-1], tok[i], tok)
++		}
++	}
++	// the round of the minute ending 12m is its tail; the ten before it are late
++	checkMinutes(t, "sum_samples_total", got, map[int]float64{1: 1, 12: 1, 13: 10}, 14)
++}
++
++// However far behind the aggregator is, an output holds only a few sums: the
++// samples of intervals before the one written last go to the first one not
++// written. What is left is that one, the tail of the one written last and, for
++// sum_samples, what was written for it, and the next one.
++func TestSampleTimestampsPendingStaysBounded(t *testing.T) {
++	for _, output := range stOutputs {
++		synctest.Test(t, func(t *testing.T) {
++			a, err := LoadFromData([]byte(stConfig(output, "")), func([]prompb.TimeSeries) {}, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			defer a.MustStop()
++			start := time.Now()
++			time.Sleep(30*time.Minute + 10*time.Second)
++			// a round of every minute so far, all processed now, and one of now
++			for m := 0; m <= 30; m++ {
++				a.Push(prometheus.MustParsePromMetrics(tokensCost(1), start.Add(time.Duration(m)*time.Minute+time.Second).UnixMilli()), nil)
++			}
++			for i := range a.as[0].aggrOutputs.shards {
++				sh := &a.as[0].aggrOutputs.shards[i]
++				sh.mu.RLock()
++				for k, av := range sh.m {
++					var p *bySampleTime
++					switch v := av.one[0].(type) {
++					case *sumSamplesAtValue:
++						p = &v.pending
++					case *sumSamplesTotalAtValue:
++						p = &v.pending
++					}
++					if n := len(p.take(nil)); n > 4 {
++						t.Errorf("%s: output %q holds %d sums", output, k, n)
++					}
++				}
++				sh.mu.RUnlock()
++			}
++		})
++	}
++}
++
++// Every sample is counted exactly once, a round's samples always go to the same
++// interval, and each goes where the rules put it: rounds from targets scraped
++// at offsets of their own, some right on a boundary, processed up to two and a
++// half minutes late.
++//
++// Without flushes taking longer than their interval, where a sample goes follows
++// from when it was processed alone, and every interval is checked against that.
++// With them -- the flush holding up the next one -- it depends on what the flush
++// had reached, and the intervals are checked for what holds regardless: a round
++// never split, no sample written before its interval, and everything counted.
++func TestSampleTimestampsRules(t *testing.T) {
++	for seed := int64(1); seed <= 20; seed++ {
++		for _, output := range stOutputs {
++			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
++				for _, overrun := range []bool{false, true} {
++					checkSampleTimestampsRules(t, seed, output, iv, overrun)
++				}
++			}
++		}
++	}
++}
++
++func checkSampleTimestampsRules(t *testing.T, seed int64, output string, iv time.Duration, overrun bool) {
++	t.Helper()
++	name := fmt.Sprintf("seed=%d output=%s interval=%s overrun=%v", seed, output, iv, overrun)
++	cfg := fmt.Sprintf("- match: '{__name__=~\"tokens|cost\"}'\n  interval: %s\n  outputs: [%s]\n  keep_metric_names: true\n"+
++		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", iv, output)
++	rnd := rand.New(rand.NewSource(seed))
++	type push struct {
++		at, sampleAt time.Duration
++		value        float64
++	}
++	const minutes = 40
++	var pushes []push
++	offsets := []time.Duration{0, time.Millisecond, 13 * time.Second, 37 * time.Second, 59*time.Second + 999*time.Millisecond}
++	for m := 1; m < minutes; m++ {
++		for _, off := range offsets {
++			sampleAt := time.Duration(m)*time.Minute + off
++			delay := time.Duration(1+rnd.Intn(2000)) * time.Millisecond
++			if rnd.Intn(5) == 0 {
++				delay = time.Duration(rnd.Intn(150))*time.Second + time.Duration(1+rnd.Intn(999))*time.Millisecond
++			}
++			pushes = append(pushes, push{at: sampleAt + delay, sampleAt: sampleAt, value: float64(1 + rnd.Intn(9))})
++		}
++	}
++	sort.SliceStable(pushes, func(i, j int) bool { return pushes[i].at < pushes[j].at })
++	flushDelays := make([]time.Duration, 100)
++	for i := range flushDelays {
++		if overrun && rnd.Intn(4) == 0 {
++			flushDelays[i] = time.Duration(1+rnd.Intn(100)) * time.Second
++		}
++	}
++
++	got := map[string][]outSample{}
++	var start time.Time
++	var phase int64
++	synctest.Test(t, func(t *testing.T) {
++		start = time.Now()
++		var mu sync.Mutex
++		flushes := 0
++		pushFunc := func(tss []prompb.TimeSeries) {
++			mu.Lock()
++			for _, ts := range tss {
++				name := ""
++				for _, l := range ts.Labels {
++					if l.Name == "__name__" {
++						name = l.Value
++					}
++				}
++				for _, s := range ts.Samples {
++					got[name] = append(got[name], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++				}
++			}
++			d := flushDelays[flushes%len(flushDelays)]
++			flushes++
++			mu.Unlock()
++			time.Sleep(d)
++		}
++		a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		phase = a.as[0].intervalPhaseMsec
++		for _, p := range pushes {
++			time.Sleep(start.Add(p.at).Sub(time.Now()))
++			a.Push(prometheus.MustParsePromMetrics(tokensCost(p.value), start.Add(p.sampleAt).UnixMilli()), nil)
++		}
++		time.Sleep(start.Add(minutes*time.Minute + 5*time.Minute).Sub(time.Now()))
++		a.MustStop()
++	})
++	for k := range got {
++		sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
++	}
++
++	// The flushes' grid, relative to the start: floor gives the boundary at or
++	// before at, end the end of the interval [end - iv, end) at falls in.
++	ivMs := iv.Milliseconds()
++	floor := func(at time.Duration) time.Duration {
++		abs := start.Add(at).UnixMilli()
++		d := abs - phase
++		q := d / ivMs
++		if d < 0 && d%ivMs != 0 {
++			q--
++		}
++		return time.UnixMilli(phase + q*ivMs).Sub(start)
++	}
++	end := func(at time.Duration) time.Duration { return floor(at) + iv }
++
++	var all float64
++	own := map[time.Duration]float64{} // by the interval each was scraped in
++	for _, p := range pushes {
++		all += p.value
++		own[end(p.sampleAt)] += p.value
++	}
++	ends := map[time.Duration]bool{}
++	for e := range own {
++		ends[e], ends[e+iv] = true, true
++	}
++	// the flush on shutdown waits for the one before, which a flush delay holds up
++	runEnd := minutes*time.Minute + 5*time.Minute
++	for _, d := range flushDelays {
++		runEnd = max(runEnd, minutes*time.Minute+5*time.Minute+d)
++	}
++	for _, s := range got["tokens"] {
++		ends[s.at] = true
++		if s.at > runEnd {
++			t.Fatalf("%s: sample %v is after the end of the run", name, s)
++		}
++	}
++
++	// Everything counted once, and a round never split: cost is three times the
++	// tokens over everything and in every interval.
++	total := func(samples []outSample) float64 {
++		if output == "sum_samples" {
++			return sumIn(samples, -time.Hour, 2*time.Hour)
++		}
++		return increaseIn(samples, -time.Hour, 2*time.Hour)
++	}
++	if tok, cost := total(got["tokens"]), total(got["cost"]); tok != all || cost != 3*all {
++		t.Errorf("%s: tokens %v, cost %v; want %v and %v", name, tok, cost, all, 3*all)
++	}
++	for e := range ends {
++		tok, cost := perInterval(output, got["tokens"], e, iv), perInterval(output, got["cost"], e, iv)
++		if cost != 3*tok {
++			t.Errorf("%s: interval ending %s has tokens %v but cost %v: a round was split", name, e, tok, cost)
++		}
++	}
++	if output == "sum_samples_total" {
++		for i := 1; i < len(got["tokens"]); i++ {
++			if got["tokens"][i].value < got["tokens"][i-1].value {
++				t.Fatalf("%s: the counter goes back from %v to %v", name, got["tokens"][i-1], got["tokens"][i])
++			}
++		}
++	}
++
++	// No sample is written before its interval: by the end of any interval, no
++	// more has been written than was scraped by then.
++	var sortedEnds []time.Duration
++	for e := range ends {
++		sortedEnds = append(sortedEnds, e)
++	}
++	sort.Slice(sortedEnds, func(i, j int) bool { return sortedEnds[i] < sortedEnds[j] })
++	for _, e := range sortedEnds {
++		var scraped float64
++		for oe, v := range own {
++			if oe <= e {
++				scraped += v
++			}
++		}
++		var written float64
++		if output == "sum_samples" {
++			written = sumIn(got["tokens"], -time.Hour, e)
++		} else {
++			written = increaseIn(got["tokens"], -time.Hour, e)
++		}
++		if written > scraped {
++			t.Errorf("%s: %v written by %s, but only %v scraped by then", name, written, e, scraped)
++		}
++	}
++	if overrun {
++		return
++	}
++
++	// Where each push goes, from when it was processed: the flushes run at the
++	// boundaries, and at once.
++	first := floor(0) // the interval before the start counts as written, by another process
++	want := map[time.Duration]float64{}
++	for _, p := range pushes {
++		e := end(min(p.sampleAt, p.at))
++		written := floor(p.at)
++		switch {
++		case e > written:
++		case e == written && written > first:
++		default:
++			e = written + iv
++		}
++		want[e] += p.value
++	}
++	for e := range ends {
++		if g := perInterval(output, got["tokens"], e, iv); g != want[e] {
++			t.Errorf("%s: interval ending %s has %v, want %v (scraped in it: %v)", name, e, g, want[e], own[e])
++		}
++	}
++}
++
++// A round still being processed when a flush walks the outputs reaches some of
++// them before the flush does and some after: the ones reached after write it
++// with the interval, the others hold it as the tail of the interval written
++// last and write that again at the next flush. Either way the round is in the
++// same interval in every output -- for a round of the interval being written,
++// and for one processed late, whose interval is decided at its first sample.
++func TestSampleTimestampsRoundDuringTheFlushStaysTogether(t *testing.T) {
++	for _, c := range []struct {
++		name               string
++		scrapedAt, firstAt time.Duration
++		want               map[int]float64
++	}{
++		{"of the interval being written", 100 * time.Second, 110 * time.Second, map[int]float64{2: 3}},
++		{"late, begun before the flush", 10 * time.Second, 170 * time.Second, map[int]float64{3: 3}},
++	} {
++		for _, output := range stOutputs {
++			got := roundDuringTheFlush(t, output, c.scrapedAt, c.firstAt)
++			t.Run(c.name, func(t *testing.T) { checkMinutes(t, output, got, c.want, 5) })
++		}
++	}
++}
++
++// roundDuringTheFlush pushes the first part of a round scraped at scrapedAt at
++// firstAt, and the rest of it once the next flush has written one output.
++func roundDuringTheFlush(t *testing.T, output string, scrapedAt, firstAt time.Duration) map[string][]outSample {
++	t.Helper()
++	got := map[string][]outSample{}
++	synctest.Test(t, func(t *testing.T) {
++		start := time.Now()
++		var mu sync.Mutex
++		// The hook is in place before the flusher starts and gone after it
++		// stops; armed and pushed are shared with it.
++		var a *Aggregators
++		var armed, pushed atomic.Bool
++		var scraped int64
++		flushEntryHook = func() {
++			if armed.Load() && !pushed.Swap(true) {
++				a.Push(prometheus.MustParsePromMetrics(tokensCost(2), scraped), nil)
++			}
++		}
++		defer func() { flushEntryHook = nil }()
++		var err error
++		a, err = LoadFromData([]byte(stConfig(output, "")), func(tss []prompb.TimeSeries) {
++			mu.Lock()
++			defer mu.Unlock()
++			for _, ts := range tss {
++				for _, l := range ts.Labels {
++					if l.Name == "__name__" {
++						for _, s := range ts.Samples {
++							got[l.Value] = append(got[l.Value], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++						}
++					}
++				}
++			}
++		}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		scraped = start.Add(scrapedAt).UnixMilli()
++		time.Sleep(firstAt)
++		a.Push(prometheus.MustParsePromMetrics(tokensCost(1), scraped), nil)
++		armed.Store(true)
++		time.Sleep(5*time.Minute - time.Since(start))
++		a.MustStop()
++		if !pushed.Load() {
++			t.Fatalf("no flush ran")
++		}
++	})
++	for k := range got {
++		sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
++	}
++	return got
++}
++
++// After sum_samples_total starts its total again, as it does before float64
++// loses precision, a tail would be smaller than what was written at its
++// interval and lost to deduplication; it goes to the next interval instead.
++func TestSampleTimestampsTotalTailAfterRestartOfTheTotal(t *testing.T) {
++	big := float64(1 << 53)
++	got := runLateScenario(t, stConfig("sum_samples_total", ""), []latePush{
++		{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: fmt.Sprintf("tokens %v", big)},
++		{at: 2*time.Minute + 10*time.Second, sampleAt: 80 * time.Second, metrics: `tokens 5`},
++	}, 4*time.Minute)["tokens"]
++	var at2 []float64
++	for _, s := range got {
++		if s.at == 2*time.Minute {
++			at2 = append(at2, s.value)
++		}
++	}
++	if len(at2) != 1 || at2[0] != big {
++		t.Fatalf("want only %v at 2m; got %v", big, got)
++	}
++	if v := got[len(got)-1].value; v != 5 {
++		t.Fatalf("want the total started again at 5 after 2m; got %v", got)
++	}
++}
+diff --git a/lib/streamaggr/sample_timestamps_test.go b/lib/streamaggr/sample_timestamps_test.go
+index 847708a63..e7ea461dc 100644
+--- a/lib/streamaggr/sample_timestamps_test.go
++++ b/lib/streamaggr/sample_timestamps_test.go
+@@ -1,8 +1,6 @@
+ package streamaggr
+ 
+ import (
+-	"fmt"
+-	"math/rand"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+@@ -108,57 +106,6 @@ func increaseIn(samples []outSample, from, to time.Duration) float64 {
+ 	return last(to) - last(from)
+ }
+ 
+-// Rounds the aggregator processes four minutes late still count towards the
+-// minutes they were scraped in, and a sum arriving for a minute already written
+-// adds to it instead of replacing it.
+-func TestSampleTimestampsSumSamplesKeepsTheScrapeMinute(t *testing.T) {
+-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
+-	pushes := []latePush{
+-		// Rounds scraped at minutes 1 to 4, all processed at 5m10s.
+-		{at: 5*time.Minute + 10*time.Second, sampleAt: 1 * time.Minute, metrics: `foo 1`},
+-		{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 2`},
+-		{at: 5*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 3`},
+-		{at: 5*time.Minute + 10*time.Second, sampleAt: 4 * time.Minute, metrics: `foo 4`},
+-		// Another target's share of minute 2 arrives after minute 2 was written.
+-		{at: 6*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 20`},
+-	}
+-	got := runLateScenario(t, cfg, pushes, 8*time.Minute)["foo"]
+-	for m, want := range map[int]float64{1: 1, 2: 22, 3: 3, 4: 4, 5: 0, 6: 0} {
+-		to := time.Duration(m) * time.Minute
+-		if sum := sumIn(got, to-time.Minute, to); sum != want {
+-			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
+-		}
+-	}
+-}
+-
+-// Eleven rounds processed at once, eleven minutes late, land each in its own
+-// minute: the increase over any window is exactly the rounds scraped in it, and
+-// the counter never goes back. A heartbeat due while the aggregator was stuck
+-// does not push the series ahead of the rounds still to come.
+-func TestSampleTimestampsTotalAttributesLateRoundsToTheirMinute(t *testing.T) {
+-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
+-		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
+-	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: `foo 1`}}
+-	for i := 1; i <= 11; i++ {
+-		pushes = append(pushes, latePush{at: 12*time.Minute + 5*time.Second, sampleAt: time.Duration(i) * time.Minute, metrics: `foo 1`})
+-	}
+-	got := runLateScenario(t, cfg, pushes, 14*time.Minute)["foo"]
+-	for i := 1; i < len(got); i++ {
+-		if got[i].value < got[i-1].value && got[i].value != 0 {
+-			t.Fatalf("the counter goes back from %v to %v: %v", got[i-1], got[i], got)
+-		}
+-	}
+-	if inc := increaseIn(got, 0, 3*time.Minute); inc != 3 {
+-		t.Errorf("increase over (0, 3m] is %v, want 3 (rounds 1-3); samples %v", inc, got)
+-	}
+-	if inc := increaseIn(got, 0, 5*time.Minute); inc != 5 {
+-		t.Errorf("increase over (0, 5m] is %v, want 5 (rounds 1-5); samples %v", inc, got)
+-	}
+-	if inc := increaseIn(got, 5*time.Minute, 11*time.Minute); inc != 6 {
+-		t.Errorf("increase over (5m, 11m] is %v, want 6 (rounds 6-11); samples %v", inc, got)
+-	}
+-}
+-
+ // One target's round 2 is processed after round 3 was written. It cannot be
+ // written at 2m, after 3m in the series: the counter would go back. It goes to
+ // 3m, off by the gap between the two targets rather than lost or misplaced.
+@@ -180,27 +127,13 @@ func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
+ 	}
+ }
+ 
+-// The zero written before the first sample of a new output precedes it even
+-// when that sample is minutes older than the flush that writes it; a zero after
+-// it would read as a reset and count the value twice.
+-func TestSampleTimestampsResetMarkerPrecedesTheFirstSample(t *testing.T) {
+-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
+-		"  staleness_interval: 40m\n  reset_marker_on_stale: true\n  sample_timestamps: true\n"
+-	got := runLateScenario(t, cfg, []latePush{{at: 7*time.Minute + 5*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 5`}}, 9*time.Minute)["foo"]
+-	if len(got) < 2 || got[0].value != 0 || got[1].value != 5 || got[0].at >= got[1].at || got[1].at != 2*time.Minute {
+-		t.Fatalf("want a zero, then 5 at 2m; got %v", got)
+-	}
+-	if inc := increaseIn(got, 0, 9*time.Minute); inc != 5 {
+-		t.Fatalf("increase is %v, want 5; samples %v", inc, got)
+-	}
+-}
+-
+ func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
+ 	for _, cfg := range []string{
+ 		"- match: foo\n  interval: 1m\n  outputs: [total]\n  sample_timestamps: true\n",
+ 		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  sample_timestamps: true\n",
+ 		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
+ 		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  ignore_old_samples: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
+ 	} {
+ 		a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, nil, "test")
+ 		if err == nil {
+@@ -229,95 +162,9 @@ func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
+ 	}
+ }
+ 
+-// Targets are scraped at offsets of their own, so the rounds of one minute reach
+-// an output with as many timestamps as there are targets. They are summed per
+-// minute and written once, at the end of the minute, not once per target; a
+-// sample right on a boundary belongs to the minute it ends.
+-func TestSampleTimestampsOneSamplePerIntervalAcrossTargets(t *testing.T) {
+-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  sample_timestamps: true\n"
+-	var pushes []latePush
+-	// Three targets at 5s, 23s and 41s into minutes 1 to 3, all processed at
+-	// 4m30s, as while the aggregator is behind.
+-	for m := 1; m <= 3; m++ {
+-		for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
+-			pushes = append(pushes, latePush{at: 4*time.Minute + 30*time.Second, sampleAt: time.Duration(m)*time.Minute + off, metrics: `foo 1`})
+-		}
+-	}
+-	// A round scraped exactly at 5m belongs to (4m, 5m].
+-	pushes = append(pushes, latePush{at: 5*time.Minute + 10*time.Second, sampleAt: 5 * time.Minute, metrics: `foo 7`})
+-	got := runLateScenario(t, cfg, pushes, 7*time.Minute)["foo"]
+-	for m, want := range map[int]float64{1: 0, 2: 3, 3: 3, 4: 3, 5: 7, 6: 0} {
+-		to := time.Duration(m) * time.Minute
+-		if sum := sumIn(got, to-time.Minute, to); sum != want {
+-			t.Errorf("minute %d sums to %v, want %v; samples %v", m, sum, want, got)
+-		}
+-	}
+-	if len(got) != 4 {
+-		t.Errorf("want one sample per minute with input, 4 in all; got %d: %v", len(got), got)
+-	}
+-}
+-
+-// The totals of rounds from several targets are written once per minute, at the
+-// end of the minute, and the increase over every minute is the rounds in it.
+-func TestSampleTimestampsTotalOneSamplePerIntervalAcrossTargets(t *testing.T) {
+-	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
+-		"  staleness_interval: 40m\n  sample_timestamps: true\n"
+-	var pushes []latePush
+-	for m := 0; m < 3; m++ {
+-		for _, off := range []time.Duration{5 * time.Second, 23 * time.Second, 41 * time.Second} {
+-			pushes = append(pushes, latePush{at: 3*time.Minute + 30*time.Second, sampleAt: time.Duration(m)*time.Minute + off, metrics: `foo 1`})
+-		}
+-	}
+-	got := runLateScenario(t, cfg, pushes, 5*time.Minute)["foo"]
+-	for m := 1; m <= 3; m++ {
+-		to := time.Duration(m) * time.Minute
+-		if inc := increaseIn(got, to-time.Minute, to); inc != 3 {
+-			t.Errorf("increase over minute %d is %v, want 3; samples %v", m, inc, got)
+-		}
+-	}
+-	for _, s := range got {
+-		if s.at%time.Minute != 0 {
+-			t.Errorf("sample %v is not at the end of a minute; samples %v", s, got)
+-		}
+-	}
+-}
+-
+-// The intervals samples are put into are the rule's own, on the grid its
+-// flushes are aligned to. time.Truncate counts from year 1, not from the Unix
+-// epoch, and for an interval that does not divide a day, such as 7m, the two
+-// grids differ: on the epoch's the sums would end between two flushes.
+-func TestSampleTimestampsIntervalsFollowTheFlushGrid(t *testing.T) {
+-	for _, iv := range []time.Duration{5 * time.Minute, 7 * time.Minute} {
+-		cfg := fmt.Sprintf("- match: foo\n  interval: %s\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n"+
+-			"  staleness_interval: 2h\n  sample_timestamps: true\n", iv)
+-		var start time.Time
+-		synctest.Test(t, func(t *testing.T) { start = time.Now() })
+-		// The first interval on the flush grid that starts after the scenario does.
+-		first := start.Truncate(iv).Add(iv).Sub(start)
+-		var pushes []latePush
+-		// Samples at its start, inside it, at its very end and just after, all
+-		// processed one interval and a half late.
+-		for _, at := range []time.Duration{first + time.Millisecond, first + iv/2, first + iv, first + iv + time.Millisecond} {
+-			pushes = append(pushes, latePush{at: first + 3*iv, sampleAt: at, metrics: `foo 1`})
+-		}
+-		got := runLateScenario(t, cfg, pushes, first+5*iv)["foo"]
+-		for _, s := range got {
+-			if at := start.Add(s.at); !at.Equal(at.Truncate(iv)) {
+-				t.Errorf("interval %s: sample %v at %s is off the flush grid; samples %v", iv, s, at.Format("15:04:05.000"), got)
+-			}
+-		}
+-		if inc := increaseIn(got, first, first+iv); inc != 3 {
+-			t.Errorf("interval %s: increase over the first interval is %v, want 3; samples %v", iv, inc, got)
+-		}
+-		if inc := increaseIn(got, first+iv, first+2*iv); inc != 1 {
+-			t.Errorf("interval %s: increase over the second interval is %v, want 1; samples %v", iv, inc, got)
+-		}
+-	}
+-}
+-
+ // A flush that runs a little after its boundary finds samples scraped after the
+ // boundary, of the interval still open. They must not be written into the
+-// interval that just closed, whatever the flush's back-off, and not twice.
++// interval that just closed, and not twice.
+ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
+ 	for _, output := range []string{"sum_samples", "sum_samples_total"} {
+ 		cfg := "- match: foo\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+@@ -340,8 +187,6 @@ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
+ 				t.Fatalf("cannot load config: %s", err)
+ 			}
+ 			aggr := a.as[0]
+-			// Many flushes in, so the back-off is several hundred milliseconds.
+-			aggr.flushSeq.Store(600)
+ 			T := start.Add(time.Minute)
+ 			time.Sleep(T.Add(-10 * time.Second).Sub(time.Now()))
+ 			a.Push(prometheus.MustParsePromMetrics(`foo 1`, T.Add(-10*time.Second).UnixMilli()), nil)
+@@ -371,8 +216,9 @@ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
+ 	}
+ }
+ 
+-// The flush on shutdown writes the interval still open, before it ends. Right
+-// after a boundary, backing off must not put it into the interval just closed.
++// The flush on shutdown writes the interval still open, before it ends, at the
++// time of the shutdown. Right after a boundary that is still in the open
++// interval, not in the one just closed.
+ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
+ 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
+ 		"  flush_on_shutdown: true\n  sample_timestamps: true\n"
+@@ -392,7 +238,6 @@ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("cannot load config: %s", err)
+ 		}
+-		a.as[0].flushSeq.Store(600)
+ 		T := start.Add(time.Minute)
+ 		time.Sleep(T.Add(2 * time.Millisecond).Sub(time.Now()))
+ 		a.Push(prometheus.MustParsePromMetrics(`foo 10`, T.Add(time.Millisecond).UnixMilli()), nil)
+@@ -404,126 +249,6 @@ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
+ 	}
+ }
+ 
+-// Every sample is counted exactly once, in the interval its timestamp falls in,
+-// however late the aggregator processes it and however long its flushes take:
+-// targets scraped at offsets of their own, rounds processed up to two and a
+-// half minutes late, flushes running over their interval, and a flush on
+-// shutdown. sum_samples has to match every interval exactly. sum_samples_total
+-// has to end at the sum of everything and never go back; an interval arriving
+-// after a later one was written goes to that later one by design.
+-func TestSampleTimestampsCountsEverySampleOnceInItsInterval(t *testing.T) {
+-	for seed := int64(1); seed <= 20; seed++ {
+-		for _, output := range []string{"sum_samples", "sum_samples_total"} {
+-			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
+-				checkCountsEverySampleOnce(t, seed, output, iv)
+-			}
+-		}
+-	}
+-}
+-
+-func checkCountsEverySampleOnce(t *testing.T, seed int64, output string, iv time.Duration) {
+-	t.Helper()
+-	cfg := fmt.Sprintf("- match: foo\n  interval: %s\n  outputs: [%s]\n  keep_metric_names: true\n"+
+-		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", iv, output)
+-	rnd := rand.New(rand.NewSource(seed))
+-	type push struct {
+-		at, sampleAt time.Duration
+-		value        float64
+-	}
+-	const minutes = 40
+-	var pushes []push
+-	offsets := []time.Duration{0, 1 * time.Millisecond, 13 * time.Second, 37 * time.Second, 59*time.Second + 999*time.Millisecond}
+-	for m := 1; m < minutes; m++ {
+-		for _, off := range offsets {
+-			sampleAt := time.Duration(m)*time.Minute + off
+-			delay := time.Duration(rnd.Intn(2000)) * time.Millisecond
+-			if rnd.Intn(5) == 0 {
+-				delay = time.Duration(rnd.Intn(150)) * time.Second
+-			}
+-			pushes = append(pushes, push{at: sampleAt + delay, sampleAt: sampleAt, value: float64(1 + rnd.Intn(9))})
+-		}
+-	}
+-	sort.SliceStable(pushes, func(i, j int) bool { return pushes[i].at < pushes[j].at })
+-	flushDelays := make([]time.Duration, 100)
+-	for i := range flushDelays {
+-		if rnd.Intn(4) == 0 {
+-			flushDelays[i] = time.Duration(1+rnd.Intn(100)) * time.Second
+-		}
+-	}
+-
+-	var got []outSample
+-	var start time.Time
+-	synctest.Test(t, func(t *testing.T) {
+-		start = time.Now()
+-		var mu sync.Mutex
+-		flushes := 0
+-		pushFunc := func(tss []prompb.TimeSeries) {
+-			mu.Lock()
+-			for _, ts := range tss {
+-				for _, s := range ts.Samples {
+-					got = append(got, outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+-				}
+-			}
+-			d := flushDelays[flushes%len(flushDelays)]
+-			flushes++
+-			mu.Unlock()
+-			time.Sleep(d)
+-		}
+-		a, err := LoadFromData([]byte(cfg), pushFunc, nil, "test")
+-		if err != nil {
+-			t.Fatalf("cannot load config: %s", err)
+-		}
+-		for _, p := range pushes {
+-			time.Sleep(start.Add(p.at).Sub(time.Now()))
+-			a.Push(prometheus.MustParsePromMetrics(fmt.Sprintf("foo %v", p.value), start.Add(p.sampleAt).UnixMilli()), nil)
+-		}
+-		time.Sleep(start.Add(minutes*time.Minute + 5*time.Minute).Sub(time.Now()))
+-		a.MustStop()
+-	})
+-	sort.SliceStable(got, func(i, j int) bool { return got[i].at < got[j].at })
+-
+-	// The true sums per interval, on the flushes' grid.
+-	end := func(at time.Duration) time.Duration {
+-		abs := start.Add(at)
+-		e := abs.Truncate(iv)
+-		if !e.Equal(abs) {
+-			e = e.Add(iv)
+-		}
+-		return e.Sub(start)
+-	}
+-	want := map[time.Duration]float64{}
+-	var all float64
+-	for _, p := range pushes {
+-		want[end(p.sampleAt)] += p.value
+-		all += p.value
+-	}
+-	name := fmt.Sprintf("seed=%d output=%s interval=%s", seed, output, iv)
+-	for _, s := range got {
+-		if s.at > minutes*time.Minute+5*time.Minute {
+-			t.Fatalf("%s: sample %v is after the end of the run", name, s)
+-		}
+-	}
+-	if output == "sum_samples" {
+-		for e, w := range want {
+-			if g := sumIn(got, e-iv, e); g != w {
+-				t.Errorf("%s: interval ending %s sums to %v, want %v", name, e, g, w)
+-			}
+-		}
+-		if g := sumIn(got, -time.Hour, 2*time.Hour); g != all {
+-			t.Errorf("%s: everything sums to %v, want %v", name, g, all)
+-		}
+-		return
+-	}
+-	for i := 1; i < len(got); i++ {
+-		if got[i].value < got[i-1].value {
+-			t.Fatalf("%s: the counter goes back from %v to %v", name, got[i-1], got[i])
+-		}
+-	}
+-	if inc := increaseIn(got, -time.Hour, 2*time.Hour); inc != all {
+-		t.Errorf("%s: the counter ends at %v, want %v", name, inc, all)
+-	}
+-}
+-
+ // A flush that takes longer than its interval reaches some entries only after
+ // the next interval has started, or ended: such an entry holds samples of the
+ // interval right after the boundary and of the one after that. Neither may be
+@@ -591,17 +316,33 @@ func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
+ 	}
+ }
+ 
+-// An entry that receives nothing for staleness_interval is dropped, but not
+-// while it holds sums of intervals no flush has written yet: a sample
+-// timestamped ahead of the clock waits for its interval to end, and the entry
+-// with it, on shutdown too.
+-func TestSampleTimestampsStaleEntryKeepsPendingSums(t *testing.T) {
+-	for _, stopAt := range []time.Duration{10 * time.Minute, 2*time.Minute + 30*time.Second} {
+-		cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
+-			"  staleness_interval: 1m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
+-		got := runLateScenario(t, cfg, []latePush{{at: 10 * time.Second, sampleAt: 2*time.Minute + 30*time.Second, metrics: `foo 5`}}, stopAt)["foo"]
+-		if sum := sumIn(got, 2*time.Minute, 3*time.Minute); sum != 5 || len(got) != 1 {
+-			t.Errorf("stopped at %s: want 5 written once within minute 3; samples %v", stopAt, got)
+-		}
++// A round that arrives after a later interval was written goes to a later
++// interval than its own, and every output of the aggregator has to put it in the
++// same one. Here a free request in minute 3 moved the tokens on but not the cost,
++// whose heartbeat is not due, so by its own latest point the cost of minute 1's
++// late round would go back into minute 1 while its tokens went to minute 3: the
++// two would be over in one minute and short in the other, and so in their hours.
++func TestSampleTimestampsTotalLateRoundLandsTogether(t *testing.T) {
++	cfg := "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
++		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  sample_timestamps: true\n"
++	pushes := []latePush{
++		{at: 30 * time.Second, sampleAt: 30 * time.Second, metrics: "tokens 10\ncost 30"},
++		{at: 150 * time.Second, sampleAt: 150 * time.Second, metrics: "tokens 5\ncost 0"}, // a free request
++		{at: 190 * time.Second, sampleAt: 40 * time.Second, metrics: "tokens 1\ncost 3"},  // minute 1's, late
++		{at: 250 * time.Second, sampleAt: 250 * time.Second, metrics: "tokens 2\ncost 6"}, // minute 5
++	}
++	got := runLateScenario(t, cfg, pushes, 8*time.Minute)
++	// cost - 3*tokens of the requests in each minute: the free one's -15, and the
++	// late round with it, whole
++	for m, want := range map[int]float64{1: 0, 2: 0, 3: -15, 4: 0, 5: 0} {
++		from, to := time.Duration(m-1)*time.Minute, time.Duration(m)*time.Minute
++		tok, cost := increaseIn(got["tokens"], from, to), increaseIn(got["cost"], from, to)
++		if d := cost - 3*tok; d != want {
++			t.Errorf("minute %d: tokens %v, cost %v: cost - 3*tokens = %v, want %v; tokens %v, cost %v",
++				m, tok, cost, d, want, got["tokens"], got["cost"])
++		}
++	}
++	if tok, cost := increaseIn(got["tokens"], 0, 8*time.Minute), increaseIn(got["cost"], 0, 8*time.Minute); tok != 18 || cost != 39 {
++		t.Errorf("in all: tokens %v, cost %v; want 18 and 39", tok, cost)
+ 	}
+ }
+diff --git a/lib/streamaggr/sample_timestamps_timing_test.go b/lib/streamaggr/sample_timestamps_timing_test.go
+index a29cc8215..7b957c272 100644
+--- a/lib/streamaggr/sample_timestamps_timing_test.go
++++ b/lib/streamaggr/sample_timestamps_timing_test.go
+@@ -63,6 +63,8 @@ func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
+ 				}
+ 
+ 				minute := time.Now().Truncate(time.Minute).Add(-time.Hour).UnixMilli()
++				// the rounds are on time: the interval before them is the one written last
++				aggr.stWritten.Store(minute)
+ 				var matchIdxs []byte
+ 				b.ReportAllocs()
+ 				b.ResetTimer()
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 6648a3e51..042ff2cf1 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -639,9 +639,9 @@ type aggregator struct {
+ 
+ 	dropInputLabels []string
+ 
+-	inputRelabeling   *promrelabel.ParsedConfigs
+-	outputRelabeling  *promrelabel.ParsedConfigs
+-	stalenessInterval time.Duration
++	inputRelabeling         *promrelabel.ParsedConfigs
++	outputRelabeling        *promrelabel.ParsedConfigs
++	stalenessInterval       time.Duration
+ 	outputHeartbeatInterval time.Duration
+ 
+ 	keepMetricNames  bool
+@@ -649,10 +649,16 @@ type aggregator struct {
+ 	enableWindows    bool
+ 	sampleTimestamps bool
+ 
+-	// watermark is the latest input sample timestamp seen, and flushSeq counts
+-	// the flushes; both are for sample_timestamps.
+-	watermark atomic.Int64
+-	flushSeq  atomic.Int64
++	// stWritten is the end of the interval written last under
++	// sample_timestamps, and stTailOK whether this process wrote it; see stState.
++	stWritten atomic.Int64
++	stTailOK  atomic.Bool
++	// stLate is where the rounds processed after their interval was written go,
++	// by scrape timestamp, which all samples of a round share: decided at the
++	// first of a round's samples, so that its later ones go there too, whatever
++	// the flushes did in between. See stLateInterval.
++	stLateMu sync.Mutex
++	stLate   map[int64]int64
+ 
+ 	by                  []string
+ 	without             []string
+@@ -855,11 +861,11 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+ 	// The global option applies where it can, so one flag covers a config that
+ 	// also has aggregations it cannot apply to; set on an aggregation, it has to.
+-	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval) == nil
++	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples) == nil
+ 	if v := cfg.SampleTimestamps; v != nil {
+ 		sampleTimestamps = *v
+ 		if sampleTimestamps {
+-			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval); err != nil {
++			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples); err != nil {
+ 				return nil, err
+ 			}
+ 		}
+@@ -1010,6 +1016,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		a.flushAfter = histogram.GetFast()
+ 	}
+ 	a.minDeadline.Store(minTime.UnixMilli())
++	// Under sample_timestamps the interval that ended before the start is taken
++	// as written: rounds of it go to the first interval this process writes.
++	a.stWritten.Store(a.intervalFloor(startTime.UnixMilli()))
+ 	cs := &currentState{}
+ 	if a.dedupInterval > 0 {
+ 		cs.maxDeadline = minTime.Add(a.dedupInterval).UnixMilli()
+@@ -1029,10 +1038,13 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+ // sampleTimestampsApply returns why sample_timestamps cannot apply to an
+ // aggregation, or nil if it can.
+-func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration) error {
++func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration, ignoreOldSamples bool) error {
+ 	if enableWindows || dedupInterval > 0 {
+ 		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
+ 	}
++	if ignoreOldSamples {
++		return fmt.Errorf("`sample_timestamps` cannot be combined with `ignore_old_samples`, which drops the samples of rounds processed late that it puts into the intervals they were scraped in")
++	}
+ 	for _, o := range outputs {
+ 		if o != "sum_samples" && o != "sum_samples_total" {
+ 			return fmt.Errorf("`sample_timestamps` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
+@@ -1267,8 +1279,29 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
+ 		a.minDeadline.Store(cs.maxDeadline)
+ 		ctx.isGreen = cs.isGreen
+ 	}
++	if a.sampleTimestamps {
++		ctx.st = stState{written: a.stWritten.Load(), tailOK: a.stTailOK.Load(), closing: math.MaxInt64}
++		if !isLast {
++			// the intervals that have ended by the flush's time; with flushes not
++			// aligned to the interval, the last one ending before it
++			ctx.st.closing = max(a.intervalFloor(ctx.flushTimestamp), ctx.st.written)
++		}
++	}
+ 	ao.flushState(ctx)
+ 	ctx.flushSeries()
++	if a.sampleTimestamps && !isLast && ctx.st.closing > ctx.st.written {
++		a.stWritten.Store(ctx.st.closing)
++		a.stTailOK.Store(true)
++		// A late round's interval is of use while it can still be written again
++		// as the tail, that is while it is the one written last or not written.
++		a.stLateMu.Lock()
++		for ts, at := range a.stLate {
++			if at < ctx.st.closing {
++				delete(a.stLate, ts)
++			}
++		}
++		a.stLateMu.Unlock()
++	}
+ 	putFlushCtx(ctx)
+ 
+ 	d := time.Since(startTime)
+@@ -1315,11 +1348,16 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	// Under sample_timestamps a sample is kept under the end of the interval it
+ 	// falls in, not under its own timestamp. Every target is scraped at an
+ 	// offset of its own, so the exact timestamps would give an output fed by N
+-	// targets N sums to keep and N samples to write per interval -- N times the
+-	// output, and more state still for every interval the aggregator is behind.
++	// targets N sums to keep and N samples to write per interval. A sample for an
++	// interval before the one written last goes to the first interval not
++	// written, decided here, when its round is processed, so that it is the same
++	// interval in every output, however far the flush has got with them; and
++	// however far behind the aggregator is, an output holds only so many sums.
+ 	sampleTimestamps := a.sampleTimestamps
++	stWritten := a.stWritten.Load()
++	lateTs, lateAt := int64(0), int64(0) // the round of the last late sample: a push is mostly one round
+ 
+-	var maxLagMsec, maxTimestamp int64
++	var maxLagMsec int64
+ 	for idx, ts := range tss {
+ 		if !a.match.Match(ts.Labels) {
+ 			continue
+@@ -1366,10 +1404,17 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 			if lagMsec > maxLagMsec {
+ 				maxLagMsec = lagMsec
+ 			}
+-			maxTimestamp = max(maxTimestamp, s.Timestamp)
+ 			timestamp := s.Timestamp
+ 			if sampleTimestamps {
+-				timestamp = a.intervalEnd(timestamp)
++				// a timestamp ahead of the clock is taken as now: its interval
++				// would otherwise be held until the clock got there
++				timestamp = a.intervalEnd(min(timestamp, nowMsec))
++				if timestamp < stWritten {
++					if lateAt == 0 || lateTs != s.Timestamp {
++						lateTs, lateAt = s.Timestamp, a.stLateInterval(s.Timestamp, stWritten)
++					}
++					timestamp = lateAt
++				}
+ 			}
+ 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
+ 				ctx.green = append(ctx.green, pushSample{
+@@ -1392,12 +1437,6 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 		a.muFlushAfter.Unlock()
+ 	}
+ 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
+-	for {
+-		wm := a.watermark.Load()
+-		if maxTimestamp <= wm || a.watermark.CompareAndSwap(wm, maxTimestamp) {
+-			break
+-		}
+-	}
+ 
+ 	ctx.buf = buf
+ 
+@@ -1417,14 +1456,45 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+ 	}
+ }
+ 
++// stLateInterval returns the interval the round scraped at ts goes to, now that
++// written, the end of the interval written last, is after its own: the first
++// interval not written when its first sample was processed. The flush writes it
++// with the interval or, for the outputs it had already written by the time the
++// sample got to them, the next flush writes it again with the sample, as the
++// tail of the interval written last. Only a round whose processing goes on
++// after that, past a whole interval more, has its later samples go further.
++func (a *aggregator) stLateInterval(ts, written int64) int64 {
++	a.stLateMu.Lock()
++	defer a.stLateMu.Unlock()
++	at, ok := a.stLate[ts]
++	if !ok {
++		at = written + a.interval.Milliseconds()
++		if a.stLate == nil {
++			a.stLate = make(map[int64]int64)
++		}
++		a.stLate[ts] = at
++	}
++	return at
++}
++
+ // intervalEnd returns the end of the interval ts falls in, on the grid the
+-// flushes are aligned to: intervals are (end - interval, end].
++// flushes are aligned to. Intervals are [end - interval, end): a round scraped
++// right on a boundary, as scrape_align_interval has them, belongs to the
++// interval that starts there, and so does every later one of the same target,
++// each an interval after the one before.
+ func (a *aggregator) intervalEnd(ts int64) int64 {
++	return a.intervalFloor(ts) + a.interval.Milliseconds()
++}
++
++// intervalFloor returns the boundary at or before ts on the flushes' grid.
++func (a *aggregator) intervalFloor(ts int64) int64 {
+ 	phase, iv := a.intervalPhaseMsec, a.interval.Milliseconds()
+-	if ts <= phase {
+-		return ts
++	d := ts - phase
++	q := d / iv
++	if d < 0 && d%iv != 0 {
++		q--
+ 	}
+-	return phase + ((ts-phase-1)/iv+1)*iv
++	return phase + q*iv
+ }
+ 
+ // compressLabels builds a sample's key: the length of the output part, the
+@@ -1523,8 +1593,6 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
+ 	ctx.flushTimestamp = flushTimestamp
+ 	ctx.isLast = isLast
+ 	ctx.now = time.Now().UnixMilli()
+-	ctx.watermark = a.watermark.Load()
+-	ctx.seq = a.flushSeq.Add(1)
+ 	return ctx
+ }
+ 
+@@ -1543,11 +1611,12 @@ type flushCtx struct {
+ 	isGreen        bool
+ 	isLast         bool
+ 
+-	// now, watermark and seq are for sample_timestamps: the wall clock no output
+-	// is stamped after, the latest input sample timestamp, and which flush this is.
+-	now       int64
+-	watermark int64
+-	seq       int64
++	// now and st are for sample_timestamps: the wall clock no output is stamped
++	// after, and where the aggregator is in the intervals, the same for every
++	// output; slots is scratch for an output's sums.
++	now   int64
++	st    stState
++	slots []slot
+ 
+ 	tss     []prompb.TimeSeries
+ 	labels  []prompb.Label
+@@ -1561,7 +1630,8 @@ func (ctx *flushCtx) reset() {
+ 	ctx.isGreen = false
+ 	ctx.isLast = false
+ 	ctx.flushTimestamp = 0
+-	ctx.now, ctx.watermark, ctx.seq = 0, 0, 0
++	ctx.now, ctx.st = 0, stState{}
++	ctx.slots = ctx.slots[:0]
+ 	ctx.resetSeries()
+ }
+ 
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index e1513e487..4cb7af8b8 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -41,7 +41,8 @@ func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
+ 
+ // sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
+ // the interval its samples were scraped in, written at the end of it, rather
+-// than to the one the aggregator happened to process them in.
++// than to the one the aggregator happened to process them in. See stPlace for
++// where a sample goes and stFlush for when it is written.
+ type sumSamplesAtValue struct {
+ 	pending bySampleTime
+ }
+@@ -50,143 +51,204 @@ func (av *sumSamplesAtValue) pushSample(_ aggrConfig, sample *pushSample, _ stri
+ 	av.pending.add(sample.timestamp, sample.value)
+ }
+ 
+-// flush writes a sum arriving after its interval has been written once already
+-// as one more sample a few milliseconds earlier -- each flush backs off by its
+-// own sequence number -- so the two don't share a timestamp, which
+-// deduplication would keep only one of, and sum_over_time() adds them up.
+-// The sample stays within its interval, (ts - interval, ts], see stampWithin.
++// flush writes every interval closed by this flush at its end, once, with
++// everything the aggregator has for it. The interval written last is kept, so
++// that a sample of it processed after the flush -- the tail of a round crossing
++// the boundary -- makes the next flush write it again, complete, at the same
++// timestamp; VM's deduplication keeps the bigger of the two, which is the
++// complete one, as long as what is added is not negative. Anything else
++// arriving for an interval already written goes to the first one not written.
+ func (av *sumSamplesAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
+ 	if av.pending.empty() {
+ 		return
+ 	}
+-	back := ctx.seq % 1000
+-	labelsLen, samplesLen := ctx.beginSeries(key, "sum_samples")
+-	av.pending.drain(closedUpTo(ctx), func(ts int64, sum float64) {
+-		ctx.appendSample(stampWithin(ctx, ts, back), sum)
+-	})
+-	ctx.endSeries(labelsLen, samplesLen)
++	st := &ctx.st
++	slots := av.pending.take(ctx.slots[:0])
++	defer func() { ctx.slots = slots[:0] }()
++	labelsLen, samplesLen, started := 0, 0, false
++	write := func(at int64, v float64) {
++		if !started {
++			labelsLen, samplesLen = ctx.beginSeries(key, "sum_samples")
++			started = true
++		}
++		ctx.appendSample(min(at, ctx.now), v)
++	}
++
++	// The interval written last, if this output wrote it: its sum, kept for its tail.
++	var last slot
++	for i := range slots {
++		if slots[i].ts < 0 {
++			last = slot{-slots[i].ts, slots[i].sum}
++			slots[i].ts = 0
++		}
++	}
++	if last.ts != st.written {
++		last = slot{}
++	}
++	var late float64
++	lateAny := false
++	for i := range slots {
++		x := &slots[i]
++		switch {
++		case x.ts == 0 || x.ts > st.written:
++		case x.ts == st.written && st.tailOK && x.sum >= 0:
++			// The tail of the interval written last: written again, complete.
++			last = slot{x.ts, last.sum + x.sum}
++			write(last.ts, last.sum)
++			x.ts = 0
++		default:
++			// Too late for its own interval: the first one not written takes it.
++			late, lateAny = late+x.sum, true
++			x.ts = 0
++		}
++	}
++	if lateAny {
++		slots = append(slots, slot{st.written + ctx.a.interval.Milliseconds(), late})
++	}
++	slices.SortFunc(slots, func(a, b slot) int { return cmp.Compare(a.ts, b.ts) })
++	for _, x := range mergeSlots(slots) {
++		if x.ts > st.closing {
++			av.pending.add(x.ts, x.sum)
++			continue
++		}
++		write(x.ts, x.sum)
++		last = x
++	}
++	if !ctx.isLast && last.ts != 0 && last.ts == max(st.closing, st.written) {
++		av.pending.setWritten(last.ts, last.sum)
++	}
++	if started {
++		ctx.endSeries(labelsLen, samplesLen)
++	}
+ }
+ 
+ func (*sumSamplesAtValue) state() any { return nil }
+ 
+ func (av *sumSamplesAtValue) firstPending() (int64, bool) { return av.pending.first() }
+ 
+-// bySampleTime holds the input sums of one output between two flushes, one per
+-// interval, for sample_timestamps: Push keeps every sample under the end of the
+-// interval it falls in. There is one sum almost always, two when a round right
+-// after a boundary is processed before the flush, and more only while the
+-// aggregator catches up with intervals it fell behind on.
+-type bySampleTime struct {
+-	ts   int64 // 0: nothing pending
+-	sum  float64
+-	more *[]tsSum
+-}
+-
+-type tsSum struct {
++// slot is the sum of one interval, under its end. A negative end marks the
++// interval written last, kept for its tail, see sumSamplesAtValue.flush.
++type slot struct {
+ 	ts  int64
+ 	sum float64
+ }
+ 
+-// tsSumsPool keeps the slices of the outputs that held more than one interval
+-// at a flush: two is common, a round right after a boundary being processed
+-// before the flush, and so is every output while the aggregator is behind.
+-var tsSumsPool = sync.Pool{New: func() any { return &[]tsSum{} }}
++// bySampleTime holds the input sums of one output, one per interval, for
++// sample_timestamps. Two are inline, which covers what an output has at any
++// time but while the aggregator is far behind on flushing: the interval being
++// filled, and the one written last -- or the next one, which the rounds right
++// after a boundary start before the flush gets to the output.
++type bySampleTime struct {
++	a, b slot
++	more *[]slot
++}
++
++// tsSumsPool keeps the slices of the outputs that held more than two intervals.
++var tsSumsPool = sync.Pool{New: func() any { return &[]slot{} }}
+ 
+-func (p *bySampleTime) empty() bool { return p.ts == 0 }
++// empty reports whether nothing is held, written or not.
++func (p *bySampleTime) empty() bool { return p.a.ts == 0 && p.b.ts == 0 && p.more == nil }
+ 
+ func (p *bySampleTime) add(ts int64, v float64) {
+ 	switch {
+-	case p.ts == 0:
+-		p.ts, p.sum = ts, v
+-	case p.ts == ts:
+-		p.sum += v
+-	default:
+-		if p.more == nil {
+-			p.more = tsSumsPool.Get().(*[]tsSum)
+-		}
++	case p.a.ts == ts:
++		p.a.sum += v
++		return
++	case p.b.ts == ts:
++		p.b.sum += v
++		return
++	}
++	if p.more != nil {
+ 		for i := range *p.more {
+ 			if (*p.more)[i].ts == ts {
+ 				(*p.more)[i].sum += v
+ 				return
+ 			}
+ 		}
+-		*p.more = append(*p.more, tsSum{ts, v})
++	}
++	switch {
++	case p.a.ts == 0:
++		p.a = slot{ts, v}
++	case p.b.ts == 0:
++		p.b = slot{ts, v}
++	default:
++		if p.more == nil {
++			p.more = tsSumsPool.Get().(*[]slot)
++		}
++		*p.more = append(*p.more, slot{ts, v})
+ 	}
+ }
+ 
+-// first is the earliest pending timestamp.
+-func (p *bySampleTime) first() (int64, bool) {
+-	if p.ts == 0 {
+-		return 0, false
++// setWritten keeps the sum of the interval ending at ts as the one written last.
++func (p *bySampleTime) setWritten(ts int64, sum float64) { p.add(-ts, sum) }
++
++// take appends everything held to dst and empties p.
++func (p *bySampleTime) take(dst []slot) []slot {
++	for _, x := range [2]slot{p.a, p.b} {
++		if x.ts != 0 {
++			dst = append(dst, x)
++		}
+ 	}
+-	first := p.ts
+ 	if p.more != nil {
+-		for _, x := range *p.more {
+-			first = min(first, x.ts)
+-		}
++		dst = append(dst, *p.more...)
++		*p.more = (*p.more)[:0]
++		tsSumsPool.Put(p.more)
+ 	}
+-	return first, true
++	*p = bySampleTime{}
++	return dst
+ }
+ 
+-// drain calls f, in timestamp order, for every pending sum at or before limit,
+-// and keeps the later ones pending.
+-func (p *bySampleTime) drain(limit int64, f func(ts int64, sum float64)) {
+-	if p.ts == 0 {
+-		return
+-	}
+-	if p.more == nil {
+-		if p.ts <= limit {
+-			f(p.ts, p.sum)
+-			p.ts, p.sum = 0, 0
++// first is the earliest interval with input not yet written.
++func (p *bySampleTime) first() (int64, bool) {
++	first, ok := int64(0), false
++	visit := func(x slot) {
++		if x.ts > 0 && (!ok || x.ts < first) {
++			first, ok = x.ts, true
+ 		}
+-		return
+-	}
+-	all := append(*p.more, tsSum{p.ts, p.sum})
+-	slices.SortFunc(all, func(a, b tsSum) int { return cmp.Compare(a.ts, b.ts) })
+-	n := 0
+-	for n < len(all) && all[n].ts <= limit {
+-		f(all[n].ts, all[n].sum)
+-		n++
+-	}
+-	p.ts, p.sum = 0, 0
+-	kept := all[n:]
+-	if len(kept) > 0 {
+-		p.ts, p.sum = kept[0].ts, kept[0].sum
+-		kept = kept[1:]
+ 	}
+-	if len(kept) > 0 {
+-		*p.more = append(all[:0], kept...)
+-		return
++	visit(p.a)
++	visit(p.b)
++	if p.more != nil {
++		for _, x := range *p.more {
++			visit(x)
++		}
+ 	}
+-	*p.more = all[:0]
+-	tsSumsPool.Put(p.more)
+-	p.more = nil
++	return first, ok
+ }
+ 
+-// closedUpTo is the latest interval end a flush writes: the intervals that have
+-// ended by the flush's boundary. The ones after it wait for the flush at their
+-// end, so that every interval is written at its end and in order. The samples
+-// of those come from rounds scraped after the boundary but processed before
+-// the flush reached them, which a flush taking longer than its interval does
+-// for more than one interval; written now, they would go out before the
+-// intervals end, and sum_samples_total, which never writes a timestamp before
+-// one it has written, would move the earlier interval into the later one.
+-//
+-// An entry is not dropped as stale while it holds such sums, see
+-// aggrValues.firstPending in flushEntry. The last flush, on shutdown, writes
+-// everything.
+-func closedUpTo(ctx *flushCtx) int64 {
+-	if ctx.isLast {
+-		return math.MaxInt64
++// mergeSlots adds up the slots of one interval, in a slice sorted by end.
++func mergeSlots(s []slot) []slot {
++	n := 0
++	for _, x := range s {
++		if x.ts == 0 {
++			continue
++		}
++		if n > 0 && s[n-1].ts == x.ts {
++			s[n-1].sum += x.sum
++			continue
++		}
++		s[n] = x
++		n++
+ 	}
+-	return ctx.flushTimestamp
++	return s[:n]
+ }
+ 
+-// stampWithin is where a sum of the interval ending at end is written: at end,
+-// or at the wall clock if that is earlier, backed off by back, and never before
+-// the interval starts nor after the wall clock.
+-func stampWithin(ctx *flushCtx, end, back int64) int64 {
+-	return min(max(min(end, ctx.now)-back, end-ctx.a.interval.Milliseconds()+1), ctx.now)
++// stState is the aggregator's position in the intervals under
++// sample_timestamps, as of the start of a flush. Every output of the aggregator
++// decides with the same one, so a round's samples go to the same interval in
++// all of them.
++type stState struct {
++	// written is the end of the interval written last: every interval ending at
++	// or before it has been written. tailOK is false until this process has
++	// written one -- at start, the interval before is the previous process's,
++	// which may have written it, and a value written again at its timestamp would
++	// be deduplicated against that one instead of completing it.
++	written int64
++	tailOK  bool
++	// closing is the end of the last interval this flush writes; the intervals
++	// after it are kept for later flushes. On the flush at shutdown it is
++	// math.MaxInt64: everything is written.
++	closing int64
+ }
+ 
+ // sumSamplesTotalAggrValue sums input sample values like sum_samples, but doesn't reset the sum on flush,
+@@ -296,16 +358,11 @@ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+ // sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
+ // writes the total as of the end of each interval it has samples of, in order,
+ // so an increment lands in the interval it was scraped in even when the
+-// aggregator processes it minutes later. The written timestamps never go back
+-// -- a counter that did would look reset -- so an interval whose samples arrive
+-// after a later interval was written goes to that later one: the error is
+-// bounded by how far the targets' rounds are apart in processing, not by how far
+-// the aggregator is behind.
+-//
+-// An unchanged total is written again only as the heartbeat, and then at the
+-// latest sample timestamp the aggregator has seen rather than at the wall
+-// clock: while it is behind, a heartbeat at the wall clock would push the
+-// series ahead of the rounds still to come, and they would all land there.
++// aggregator processes it minutes later. A sample for the interval written
++// last -- the tail of a round crossing the boundary -- is written into it again,
++// at the same timestamp, with the bigger total, which VM's deduplication keeps;
++// anything for an interval before that goes to the first interval not written,
++// as a total written before one written already would look like a reset.
+ type sumSamplesTotalAtValue struct {
+ 	shared  *sumSamplesTotalShared
+ 	pending bySampleTime
+@@ -322,36 +379,56 @@ func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _
+ 
+ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
+ 	sh := av.shared
++	st := &ctx.st
+ 	labelsLen, samplesLen, started := 0, 0, false
++	wrote := false
+ 	write := func(at int64, v float64) {
++		at = min(at, ctx.now)
+ 		if !started {
+ 			labelsLen, samplesLen = ctx.beginSeries(key, "sum_samples_total")
+ 			started = true
+ 		}
+ 		ctx.appendSample(at, v)
++		sh.lastWritten, sh.lastWrittenAt, sh.written = v, at, true
++		wrote = true
+ 	}
+-	wrote := false
+-	av.pending.drain(closedUpTo(ctx), func(ts int64, sum float64) {
+-		sh.total += sum
++	slots := av.pending.take(ctx.slots[:0])
++	defer func() { ctx.slots = slots[:0] }()
++	var late float64
++	lateAny := false
++	for i := range slots {
++		x := &slots[i]
++		switch {
++		case x.ts == st.written && st.tailOK && x.sum >= 0 && (!sh.written || sh.lastWrittenAt <= x.ts && sh.total+x.sum >= sh.lastWritten):
++			// the tail of the interval written last: write it again, with it
++			sh.total += x.sum
++			write(x.ts, sh.total)
++			x.ts = 0
++		case x.ts <= st.written:
++			late, lateAny = late+x.sum, true
++			x.ts = 0
++		}
++	}
++	if lateAny {
++		slots = append(slots, slot{st.written + ctx.a.interval.Milliseconds(), late})
++	}
++	slices.SortFunc(slots, func(a, b slot) int { return cmp.Compare(a.ts, b.ts) })
++	for _, x := range mergeSlots(slots) {
++		if x.ts > st.closing {
++			av.pending.add(x.ts, x.sum)
++			continue
++		}
++		sh.total += x.sum
+ 		if sh.written && sh.total == sh.lastWritten {
+-			return
++			continue
+ 		}
+-		at := max(stampWithin(ctx, ts, 0), sh.lastWrittenAt)
+-		write(at, sh.total)
+-		sh.lastWritten, sh.lastWrittenAt, sh.written = sh.total, at, true
+-		wrote = true
+-	})
++		write(x.ts, sh.total)
++	}
+ 	if !wrote && sh.written {
+-		at := min(ctx.watermark, ctx.now)
+-		if !ctx.isLast {
+-			// Not past the flush's boundary: the total does not include the
+-			// intervals after it, whose samples are written at their ends.
+-			at = min(at, ctx.flushTimestamp)
+-		}
++		at := min(st.closing, ctx.now)
+ 		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
+ 		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
+ 			write(at, sh.total)
+-			sh.lastWrittenAt = at
+ 		} else {
+ 			ctx.a.skippedOutputs.Inc()
+ 		}
+@@ -360,7 +437,9 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
+ 		ctx.endSeries(labelsLen, samplesLen)
+ 	}
+ 	if math.Abs(sh.total) >= (1 << 53) {
+-		// It is time to reset the entry, since it starts losing float64 precision
++		// It is time to reset the entry, since it starts losing float64 precision.
++		// A tail after this is smaller than what was written, and so goes to the
++		// next interval instead, see above.
+ 		sh.total = 0
+ 	}
+ }
+-- 
+2.50.1 (Apple Git-155)
+
