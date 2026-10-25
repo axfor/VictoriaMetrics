@@ -1,0 +1,197 @@
+From eaaf837859fad98432892651d135fd0d797e0afc Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 25 Oct 2026 06:29:07 -0700
+Subject: [PATCH 38/38] lib/streamaggr: one time for every rule's last flush on
+ stop
+
+On a vmagent restart in the lab, with tokens and cost in rules of their own,
+the round in progress was written with the cost at 12:20:14.724 and the tokens
+at 12:20:14.725. The totals were right, but a query at either timestamp saw
+half the round.
+
+Aggregators.MustStop stopped the rules one after another, and each rule's last
+flush capped what it wrote at its own reading of the clock. Now the regular
+flushes of every rule stop first, and then every rule's last flush is capped at
+one time: the stop time, or the last interval any rule has written if that is
+later, so no rule writes behind what it has written. The last flushes still run
+one rule at a time, as before.
+
+TestSampleTimestampsShutdownWritesEveryRuleAtOneTime holds up one rule's last
+flush for 3 ms: before, the tokens were written at 1m20s and the cost at
+1m20.003s; now both are at 1m20s. In the lab rerun, every rule's closing write
+on restart is at one timestamp, and tokens, cost and the three rule levels
+agree in every minute.
+---
+ .../sample_timestamps_rules_test.go           | 70 +++++++++++++++++++
+ lib/streamaggr/streamaggr.go                  | 35 +++++++++-
+ 2 files changed, 102 insertions(+), 3 deletions(-)
+
+diff --git a/lib/streamaggr/sample_timestamps_rules_test.go b/lib/streamaggr/sample_timestamps_rules_test.go
+index f4159f1eb..bb25eecb5 100644
+--- a/lib/streamaggr/sample_timestamps_rules_test.go
++++ b/lib/streamaggr/sample_timestamps_rules_test.go
+@@ -939,3 +939,73 @@ func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
+ 		checkMinutes(t, output, got, map[int]float64{2: 3}, 6)
+ 	}
+ }
++
++// On shutdown every rule writes what it holds, capped at the time of the stop:
++// one time for all of them, or a round whose tokens and cost are in rules of
++// their own is written at two timestamps a few milliseconds apart, and a query
++// at either one sees half of it. The tokens rule's last flush is held up for a
++// few milliseconds, as one rule's flush is behind another's on a real stop.
++func TestSampleTimestampsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
++	for _, output := range stOutputs {
++		cfg := ""
++		for _, name := range []string{"tokens", "cost"} {
++			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
++				"  staleness_interval: 40m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
++		}
++		got := map[string][]outSample{}
++		synctest.Test(t, func(t *testing.T) {
++			start := time.Now()
++			var mu sync.Mutex
++			var a *Aggregators
++			var held atomic.Bool
++			flushEntryHook = func(ag *aggregator) {
++				if ag == a.as[0] && time.Since(start) >= 80*time.Second && !held.Swap(true) {
++					time.Sleep(3 * time.Millisecond)
++				}
++			}
++			defer func() { flushEntryHook = nil }()
++			var err error
++			a, err = LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
++				mu.Lock()
++				defer mu.Unlock()
++				for _, ts := range tss {
++					for _, l := range ts.Labels {
++						if l.Name == "__name__" {
++							for _, s := range ts.Samples {
++								got[l.Value] = append(got[l.Value], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
++							}
++						}
++					}
++				}
++			}, nil, "test")
++			if err != nil {
++				t.Fatalf("cannot load config: %s", err)
++			}
++			time.Sleep(10 * time.Second)
++			a.Push(prometheus.MustParsePromMetrics(tokensCost(1), start.Add(5*time.Second).UnixMilli()), nil)
++			// in the interval ending 2m, which has not ended when vmagent stops
++			time.Sleep(70*time.Second - time.Since(start))
++			a.Push(prometheus.MustParsePromMetrics(tokensCost(5), start.Add(65*time.Second).UnixMilli()), nil)
++			time.Sleep(80*time.Second - time.Since(start))
++			a.MustStop()
++			if !held.Load() {
++				t.Fatalf("the tokens rule's last flush was not held")
++			}
++		})
++		for k := range got {
++			sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
++		}
++		if len(got["tokens"]) == 0 || len(got["tokens"]) != len(got["cost"]) {
++			t.Fatalf("%s: tokens %v, cost %v", output, got["tokens"], got["cost"])
++		}
++		for i, tok := range got["tokens"] {
++			if c := got["cost"][i]; c.at != tok.at || c.value != 3*tok.value {
++				t.Errorf("%s: tokens %v at %v, cost %v at %v: the round was written at two times; tokens %v, cost %v",
++					output, tok.value, tok.at, c.value, c.at, got["tokens"], got["cost"])
++			}
++		}
++		if last := got["tokens"][len(got["tokens"])-1]; last.at > 80*time.Second+3*time.Millisecond {
++			t.Errorf("%s: the last round was written at %v, after the stop", output, last.at)
++		}
++	}
++}
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index c11a6b77e..1551a267d 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -426,8 +426,22 @@ func (a *Aggregators) MustStop() {
+ 	metrics.UnregisterSet(a.ms, true)
+ 	a.ms = nil
+ 
++	// The last flush of every rule is capped at one time, taken once their
++	// regular flushes have all stopped: under sample_timestamps a round whose
++	// samples are in rules of their own, tokens in one and cost in another, is
++	// otherwise written at as many timestamps as the milliseconds the rules took
++	// to stop, and a query at any one of them sees part of it.
+ 	for _, aggr := range a.as {
+-		aggr.MustStop()
++		close(aggr.stopCh)
++	}
++	stopAt := time.Now().UnixMilli()
++	for _, aggr := range a.as {
++		<-aggr.flushingDone
++		stopAt = max(stopAt, aggr.stWritten.Load())
++	}
++	for _, aggr := range a.as {
++		aggr.lastFlushAt <- stopAt
++		aggr.wg.Wait()
+ 	}
+ 	a.as = nil
+ }
+@@ -707,6 +721,11 @@ type aggregator struct {
+ 
+ 	wg     sync.WaitGroup
+ 	stopCh chan struct{}
++	// flushingDone is closed once the flusher has stopped its regular flushes;
++	// it then waits for lastFlushAt, the time its last flush is capped at.
++	flushingDone chan struct{}
++	lastFlushAt  chan int64
++	stopAt       int64 // as received from lastFlushAt; only the flusher touches it
+ 
+ 	flushDuration *metrics.Histogram
+ 	samplesLag    *metrics.Histogram
+@@ -973,7 +992,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+ 		suffix: suffix,
+ 
+-		stopCh: make(chan struct{}),
++		stopCh:       make(chan struct{}),
++		flushingDone: make(chan struct{}),
++		lastFlushAt:  make(chan int64, 1),
+ 
+ 		flushDuration: ms.NewHistogram(fmt.Sprintf(`vm_streamaggr_flush_duration_seconds{%s}`, metricLabels)),
+ 		samplesLag:    ms.NewHistogram(fmt.Sprintf(`vm_streamaggr_samples_lag_seconds{%s}`, metricLabels)),
+@@ -1231,13 +1252,15 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+ 		}
+ 	}
+ 
++	close(a.flushingDone)
++	a.stopAt = <-a.lastFlushAt
+ 	a.dedupFlush(dedupTime, cs)
+ 	pf := pushFunc
+ 	if skipIncompleteFlush || ignoreFirstIntervals > 0 {
+ 		pf = nil
+ 	}
+ 	if pf != nil && a.aggrOutputs.resetMarkerOnStale {
+-		if now := time.Now(); flushTime.After(now) {
++		if now := time.UnixMilli(a.stopAt); flushTime.After(now) {
+ 			// Don't stamp the incomplete flush on shutdown with the next flush boundary, which is in the future:
+ 			// a restarted aggregator emits the leading zero of reset_marker_on_stale at its own start,
+ 			// and increase() would see X → 0 → X for the same series and count X twice.
+@@ -1281,6 +1304,10 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
+ 	ao := a.aggrOutputs
+ 
+ 	ctx := getFlushCtx(a, ao, pushFunc, flushTime.UnixMilli(), isLast)
++	if isLast && a.stopAt != 0 {
++		// the time of the stop, the same for every rule, see Aggregators.MustStop
++		ctx.now = a.stopAt
++	}
+ 	if a.dedupInterval <= 0 {
+ 		a.minDeadline.Store(cs.maxDeadline)
+ 		ctx.isGreen = cs.isGreen
+@@ -1322,6 +1349,8 @@ var flushConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
+ // The aggregator stops pushing the aggregated metrics after this call.
+ func (a *aggregator) MustStop() {
+ 	close(a.stopCh)
++	<-a.flushingDone
++	a.lastFlushAt <- max(time.Now().UnixMilli(), a.stWritten.Load())
+ 	a.wg.Wait()
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

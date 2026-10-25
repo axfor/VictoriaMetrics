@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-三十七个补丁,**按编号顺序打**。004~027、030~033、035~040 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+三十八个补丁,**按编号顺序打**。004~027、030~033、035~041 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -45,13 +45,14 @@
 | `038-acg_vmagent-sample-timestamps-default-on` | `-remoteWrite.streamAggr.sampleTimestamps`、`-streamAggr.sampleTimestamps` 默认改为打开(第十八部分) | **必须**,要求 `-dedup.minScrapeInterval=1ms` |
 | `039-acg_promscrape-delta-final-ack` | vmagent 停止时给报增量的目标发最后一次确认:正在路上的那轮(边车已写出、vmagent 还没处理)回滚重报,而不是被下一个 vmagent 的 `new` 提交掉。此前每次重启、滚动发布赶上抓取都丢一轮(第十九部分) | **必须**,配合 client_golang v1.24.1025;对旧边车无影响 |
 | `040-acg_streamaggr-memory` | 流式聚合省内存:刷出每批 1000 条而不是 1 万条(102 条规则同时刷出,每条规则的缓冲在两次刷出之间一直留着);输出键不再进全局 intern 表;`sum_samples_total` 每条输出 80 → 64 字节。ACG 102 条规则下堆 1251 → 752 MiB(−40%),每条规则刷出 80 → 36 毫秒,输出逐字节不变(第二十部分) | 建议,纯内存与性能 |
+| `041-acg_streamaggr-stop-one-time` | vmagent 停止(重启、发版)时,所有规则最后一次刷出用同一个时刻:原来每条规则各取各的时钟,tokens 和 cost 在不同规则里时,进行中的那一轮会写在相差几毫秒的两个时间戳上,查其中一个时刻只看到半轮(第二十一部分) | **必须**,配合 039 |
 
 只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(15 个补丁碰它)和 `output.go`(11 个)。
+冲突热点是 `streamaggr.go`(16 个补丁碰它)和 `output.go`(11 个)。
 
 ## 基线:为什么是集群版
 
@@ -204,7 +205,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十节是 `030`~`040`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十一节是 `030`~`041`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -861,3 +862,28 @@ vmagent 停止时,正在进行的抓取被取消。如果边车已经把响应�
 ### 用法与约束
 
 - 不用改配置。vmagent 的内存 limit 暂按 `vm-side.md` 不变,生产灰度确认后再下调。
+
+## 二十一、停止时所有规则同一时刻收尾(041)
+
+### 解决什么
+
+实验集群验证 040 时,vmagent 重启那一刻,进行中的那一轮 cost 写在 `12:20:14.724`、tokens 写在 `12:20:14.725`。
+按分钟的总量是对的,但查 `.724` 这个时刻只看到 cost、看不到 tokens,正是要消除的 ± 形态,只出现在停止这条路径上。
+
+原因:`Aggregators.MustStop` 逐条停止规则,每条规则最后一次刷出把写入时间截在自己读到的时钟上,规则之间差几毫秒。
+
+### 改了什么
+
+- 先停掉所有规则的定时刷出,再取一个时刻:停止时刻,如果有规则已写过更晚的区间就取那个区间,保证不写到自己已写过的时间之前。
+- 每条规则的最后一次刷出都截在这个时刻。最后一次刷出仍是一条一条做,停止时的内存和原来一样。
+
+### 已做的验证
+
+- 新测试 `TestSampleTimestampsShutdownWritesEveryRuleAtOneTime`:让 tokens 规则的最后一次刷出慢 3 毫秒。修之前 tokens 在 1m20s、cost 在 1m20.003s(和实验集群同一形态),修之后都在 1m20s。
+- 全部单测通过,`-race` 通过。
+- 实验集群重跑(真实流量,sample_limit 开关、配置重载、vmagent 重启):重启那一轮所有规则写在同一时间戳 `12:51:06.024`;
+  请求数、tokens 在应用、`_1m` 聚合、原始序列三处逐个相等;cost 与各分项之和、业务组 cost 与总 cost、三个聚合层级之间,每分钟 250 项比较全部一致。
+
+### 用法与约束
+
+- 不用改配置。
