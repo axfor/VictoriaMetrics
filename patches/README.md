@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-三十五个补丁,**按编号顺序打**。004~027、030~033、035~038 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+三十六个补丁,**按编号顺序打**。004~027、030~033、035~039 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -43,6 +43,7 @@
 | `036-acg_streamaggr-sample-timestamps-rounds` | 重做 `sample_timestamps` 的归属:一轮的去向只由这一轮决定,每个输出、每条规则都一样;刚过边界的尾巴把那一分钟按同一时间戳重写完整,更晚的归到第一个还没写的分钟、每轮只定一次;每个区间只写一次且完整。修掉 032 里一轮跨刷出时 token 和费用分到两分钟的 ±、提前毫秒撞车丢数、边界抖动、与 `ignore_old_samples` 同用时静默丢数(第十六部分) | **必须**,打开 `sample_timestamps` 前打;打开后要求 vmselect、vmstorage 的 `-dedup.minScrapeInterval=1ms` |
 | `037-acg_streamaggr-sample-timestamps-across-rules` | 036 之后仍有的 ±:token 和费用分在不同规则(`_1m_by_*` 就是这样)时,vmagent 积压下一轮在两条规则里可能进不同分钟。一轮的去向改为在它第一块被任一规则处理时定下,本配置的所有规则共用;每次推送各规则用同一个时刻;刷出先等进行中的推送;刷出不会提前写一个还没结束的区间(第十七部分) | **必须**,036 之后打 |
 | `038-acg_vmagent-sample-timestamps-default-on` | `-remoteWrite.streamAggr.sampleTimestamps`、`-streamAggr.sampleTimestamps` 默认改为打开(第十八部分) | **必须**,要求 `-dedup.minScrapeInterval=1ms` |
+| `039-acg_promscrape-delta-final-ack` | vmagent 停止时给报增量的目标发最后一次确认:正在路上的那轮(边车已写出、vmagent 还没处理)回滚重报,而不是被下一个 vmagent 的 `new` 提交掉。此前每次重启、滚动发布赶上抓取都丢一轮(第十九部分) | **必须**,配合 client_golang v1.24.1025;对旧边车无影响 |
 
 只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
@@ -202,7 +203,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~十八节是 `030`~`038`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~十九节是 `030`~`039`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -661,7 +662,7 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
 ### 用法与约束
 
 - 需要边车用含确认协议的 client_golang(2026-10-23 之后的版本);旧边车不带轮次头,033 对它没有任何影响。
-- 剩下的两种情况协议表达不了:vmagent 在一轮和下一次请求之间重启(发 `new`,按原来的方式提交,可能丢一轮);
+- 剩下的两种情况协议表达不了:vmagent 在一轮和下一次请求之间重启(发 `new`,按原来的方式提交,可能丢一轮——正常停止时已由 `039` 修掉,见第十九部分;崩溃、被强杀时仍会);
   vmagent 处理一半失败、已处理的部分再算一次——这一条已由 `035` 修掉,见第十五部分。
 - 只确认「边车 → vmagent」这一段;vmagent 之后在内存里丢的(没配 `flush_on_shutdown` 时停机)不会重报,见「部署检查」。
 
@@ -794,3 +795,36 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
   (`sum_samples`、`sum_samples_total`,且没有 `dedup_interval`、`enable_windows`),其余跳过。
 - 关掉:单条规则写 `sample_timestamps: false`,或把参数设为 `false`(只写一次即对所有 `-remoteWrite.url` 生效)。
 - 存储侧必须是 `-dedup.minScrapeInterval=1ms`。换回 036 之前的镜像时它默认是关的,行为随之退回。
+
+## 十九、vmagent 停止时发最后一次确认(039)
+
+### 解决什么
+
+vmagent 停止时,正在进行的抓取被取消。如果边车已经把响应写出(对它来说就是交付了)、vmagent 还没处理,边车就一直挂着这一轮;
+下一个 vmagent 启动后第一次请求发 `new`,边车按协议把挂着的那轮提交掉——这一轮没人处理,丢了。每次重启、每次滚动发布,
+只要赶上抓取,每个边车丢一轮。端到端实测:四次重启都卡在「边车已交付、vmagent 还没读完」的时刻,
+`v1.126.1031-cluster` 收到 9167 万,实际写入 1.010 亿 token,少 9.2%,每个 key 都少。
+
+### 改了什么
+
+- 抓取停止之后,vmagent 给每个报过轮次、且声明支持的目标发最后一次确认:最后一轮完整处理过的轮次,单独一个请求,带 `X-Prometheus-Delta-Final`。
+  边车用它结清挂着的那轮(是这一轮就提交,不是就回滚),不再取新的一轮,回 204。下一个 vmagent 的 `new` 时已没有挂着的轮次,没处理的那轮会重报给它。
+- 停止时正在处理的抓取会先处理完,所以确认的就是它。
+- 只发给响应里带 `X-Prometheus-Delta-Features: final` 的目标(client_golang v1.24.1025 起);旧边车会把这个请求当成一次抓取、挂起一轮没人处理的数据,所以不发,行为与之前相同。
+- 并发 64 个,每个 5 秒超时。
+
+### 已做的验证
+
+- vmagent 单测:没声明支持的目标不发;声明后带轮次和头发出、204 视为完成;停止时只给报过轮次且有客户端的目标发最后处理的轮次;抓取会登记它的客户端。
+- client_golang 单测:没处理的那轮被最后一次确认回滚、下一个抓取方拿到,每个增量恰好一次;不发时这一轮丢失(对照);处理过的那轮提交、不重报;这个请求不取数据;Gather 路径相同。忽略这个头,测试失败。
+- 端到端:边车与 vmagent 之间放一个慢代理(一次把边车的响应读完,再慢慢交给 vmagent),在慢交付进行中重启 vmagent 四次。
+
+  | | 写入 | 收到 | 对不上的 key |
+  |---|---|---|---|
+  | 本补丁 + client_golang v1.24.1025 | 102,451,114 | **102,451,114** | **0 / 20000** |
+  | `v1.126.1031-cluster`(对照) | 100,964,977 | 91,665,911(**−9.2%**) | 20000 / 20000 |
+
+### 用法与约束
+
+- 不用改配置;边车升级到 client_golang v1.24.1025 才生效。
+- 只覆盖正常停止(SIGTERM,含滚动发布)。崩溃、OOM、`kill -9` 时发不出最后一次确认,且 vmagent 内存里还没刷出的那一分钟也会丢,见「部署检查」。

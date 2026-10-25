@@ -1,0 +1,357 @@
+From 0f10023f8303495b941e347eab4bde3a7a1e781c Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 25 Oct 2026 02:18:34 -0700
+Subject: [PATCH 36/36] lib/promscrape: send targets exposing increments a last
+ acknowledgement on stop
+
+A vmagent stopped while a scrape was on its way -- the target had written the
+response and counted it delivered, the scrape was cancelled before it was
+processed -- left the target holding that round, and the vmagent started after
+it opens with AckNew, which commits it: the round was lost. Every graceful
+restart and rolling deploy that came during a scrape lost one round per target.
+With four such restarts end to end, v1.126.1031-cluster received 91.7M of
+101.0M tokens written.
+
+Once the scrapers have stopped, every target that had rounds and said it takes
+one gets a last acknowledgement: the last round processed in full, on a request
+of its own with X-Prometheus-Delta-Final. The target settles the round it holds
+by it and takes nothing, so a round fetched and not processed is reported again
+to the next vmagent instead. A scrape that was processing when the stop came
+finishes first, so its round is the one acknowledged. It goes only to targets
+whose rounds carry X-Prometheus-Delta-Features: final; others get nothing, as
+before. Requests go out 64 at a time, each within 5 seconds.
+
+Tests: the client sends it only to a target that said it takes one, with the
+round and the header; on stop every target with rounds gets the last round
+processed, one with none or without a client gets nothing; a scrape registers
+its client. End to end with client_golang v1.24.1025, four restarts each during
+a delivered response: 102,451,114 tokens written and received, every key exact.
+---
+ lib/promscrape/client.go         |  54 ++++++++++++++--
+ lib/promscrape/delta_ack_test.go | 103 +++++++++++++++++++++++++++++++
+ lib/promscrape/scraper.go        |   4 ++
+ lib/promscrape/scrapework.go     |  54 +++++++++++++++-
+ 4 files changed, 210 insertions(+), 5 deletions(-)
+
+diff --git a/lib/promscrape/client.go b/lib/promscrape/client.go
+index c03e4d650..824ac0266 100644
+--- a/lib/promscrape/client.go
++++ b/lib/promscrape/client.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/VictoriaMetrics/metrics"
+@@ -48,6 +49,10 @@ type client struct {
+ 	setProxyHeaders         func(req *http.Request) error
+ 	maxScrapeSize           int64
+ 	disableCompression      bool
++
++	// deltaFinal is whether the target said it takes a last acknowledgement,
++	// see FinalDeltaAck.
++	deltaFinal atomic.Bool
+ }
+ 
+ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
+@@ -130,10 +135,12 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
+ // The headers of acknowledged delivery with targets exposing increments through
+ // client_golang's promhttp/delta; see its ack.go.
+ const (
+-	deltaRoundHeader = "X-Prometheus-Delta-Round"
+-	deltaAckHeader   = "X-Prometheus-Delta-Ack"
+-	deltaAckNew      = "new"  // no round of this target was had yet
+-	deltaAckPeek     = "peek" // the response is looked at, not processed
++	deltaRoundHeader    = "X-Prometheus-Delta-Round"
++	deltaAckHeader      = "X-Prometheus-Delta-Ack"
++	deltaFinalHeader    = "X-Prometheus-Delta-Final"    // a last acknowledgement, see sendFinalDeltaAcks
++	deltaFeaturesHeader = "X-Prometheus-Delta-Features" // "final": the target takes one
++	deltaAckNew         = "new"                         // no round of this target was had yet
++	deltaAckPeek        = "peek"                        // the response is looked at, not processed
+ )
+ 
+ // ReadDeltaData is ReadData that also sends ack, when not empty, as the
+@@ -215,6 +222,9 @@ func (c *client) ReadDeltaData(dst *chunkedbuffer.Buffer, ack string) (string, s
+ 	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
+ 	// Any other Content-Encoding is treated as uncompressed data, like before.
+ 	round := resp.Header.Get(deltaRoundHeader)
++	if round != "" && strings.Contains(resp.Header.Get(deltaFeaturesHeader), "final") {
++		c.deltaFinal.Store(true)
++	}
+ 	switch ce := resp.Header.Get("Content-Encoding"); ce {
+ 	case "gzip", "zstd":
+ 		return ce, round, nil
+@@ -229,3 +239,39 @@ var (
+ 	scrapesOK             = metrics.NewCounter(`vm_promscrape_scrapes_total{status_code="200"}`)
+ 	scrapeRequests        = metrics.NewCounter(`vm_promscrape_scrape_requests_total`)
+ )
++
++// FinalDeltaAck sends ack to the target as its last acknowledgement, see
++// sendFinalDeltaAcks, and reports whether it was sent: only to a target that
++// said it takes one, as one that does not would take the request for a scrape
++// and hold a round nobody processes. It does not use the scrape's context, which
++// is done by the time it is sent.
++func (c *client) FinalDeltaAck(ack string, timeout time.Duration) (bool, error) {
++	if !c.deltaFinal.Load() {
++		return false, nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
++	if err != nil {
++		return true, fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
++	}
++	req.Header.Set(deltaAckHeader, ack)
++	req.Header.Set(deltaFinalHeader, "1")
++	req.Header.Set("User-Agent", "vm_promscrape")
++	if err := c.setHeaders(req); err != nil {
++		return true, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
++	}
++	if err := c.setProxyHeaders(req); err != nil {
++		return true, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
++	}
++	resp, err := c.c.Do(req)
++	if err != nil {
++		return true, fmt.Errorf("cannot send the last acknowledgement to %q: %w", c.scrapeURL, err)
++	}
++	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
++	_ = resp.Body.Close()
++	if resp.StatusCode != http.StatusNoContent {
++		return true, fmt.Errorf("unexpected status code for the last acknowledgement to %q: %d; expecting %d", c.scrapeURL, resp.StatusCode, http.StatusNoContent)
++	}
++	return true, nil
++}
+diff --git a/lib/promscrape/delta_ack_test.go b/lib/promscrape/delta_ack_test.go
+index 26c8c2349..390862003 100644
+--- a/lib/promscrape/delta_ack_test.go
++++ b/lib/promscrape/delta_ack_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -227,3 +228,105 @@ func TestScrapeWorkDeltaRoundPushedWholeOrNot(t *testing.T) {
+ 	// and a round that fits goes out whole
+ 	f("fits", ScrapeWork{NoStaleMarkers: true, SampleLimit: rows}, plain, "", rows)
+ }
++
++// The last acknowledgement goes only to a target that said it takes one, with
++// the round and the final header, and the target's 204 is taken as done.
++func TestClientFinalDeltaAck(t *testing.T) {
++	var features bool
++	var finals []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get(deltaFinalHeader) != "" {
++			finals = append(finals, r.Header.Get(deltaAckHeader))
++			w.WriteHeader(http.StatusNoContent)
++			return
++		}
++		w.Header().Set(deltaRoundHeader, "s1:7")
++		if features {
++			w.Header().Set(deltaFeaturesHeader, "final")
++		}
++		fmt.Fprintln(w, "foo 1")
++	}))
++	defer srv.Close()
++	c, err := newClient(context.Background(), &ScrapeWork{
++		ScrapeURL:          srv.URL,
++		ScrapeTimeout:      5 * time.Second,
++		AuthConfig:         newTestAuthConfig(t, false, nil),
++		ProxyAuthConfig:    newTestAuthConfig(t, false, nil),
++		MaxScrapeSize:      16000,
++		DisableCompression: true,
++	})
++	if err != nil {
++		t.Fatalf("cannot create client: %s", err)
++	}
++	var cb chunkedbuffer.Buffer
++	if _, _, err := c.ReadDeltaData(&cb, deltaAckNew); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if sent, err := c.FinalDeltaAck("s1:7", time.Second); sent || err != nil || len(finals) != 0 {
++		t.Fatalf("sent %v, error %v, finals %q to a target that does not take one; want nothing sent", sent, err, finals)
++	}
++	features = true
++	cb.Reset()
++	if _, _, err := c.ReadDeltaData(&cb, "s1:7"); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if sent, err := c.FinalDeltaAck("s1:7", time.Second); !sent || err != nil || fmt.Sprint(finals) != "[s1:7]" {
++		t.Fatalf("sent %v, error %v, finals %q; want s1:7 sent and taken", sent, err, finals)
++	}
++}
++
++// Stopping, every target that had rounds gets the last round processed, through
++// the client that last scraped it; one that had none, or no client, gets nothing.
++func TestSendFinalDeltaAcks(t *testing.T) {
++	var mu sync.Mutex
++	got := map[string]string{}
++	final := func(url string) func(string, time.Duration) (bool, error) {
++		return func(ack string, _ time.Duration) (bool, error) {
++			mu.Lock()
++			defer mu.Unlock()
++			got[url] = ack
++			return true, nil
++		}
++	}
++	processed := deltaAckOf("http://delta-final-1/metrics")
++	ack := "s1:3"
++	processed.ack.Store(&ack)
++	f1 := final("1")
++	processed.final.Store(&f1)
++	noRound := deltaAckOf("http://delta-final-2/metrics")
++	f2 := final("2")
++	noRound.final.Store(&f2)
++	noClient := deltaAckOf("http://delta-final-3/metrics")
++	noClient.ack.Store(&ack)
++	sendFinalDeltaAcks(time.Second)
++	if fmt.Sprint(got) != "map[1:s1:3]" {
++		t.Fatalf("last acknowledgements sent %v; want only s1:3 to the target that had rounds", got)
++	}
++	for _, u := range []string{"http://delta-final-1/metrics", "http://delta-final-2/metrics", "http://delta-final-3/metrics"} {
++		deltaAcks.Delete(u)
++	}
++}
++
++// A scrape registers the client that sends its target's last acknowledgement.
++func TestScrapeWorkRegistersFinalDeltaAck(t *testing.T) {
++	var sw scrapeWork
++	sw.Config = &ScrapeWork{ScrapeURL: "http://delta-final-4/metrics", ScrapeTimeout: 42 * time.Second, NoStaleMarkers: true}
++	sw.PushData = func(_ *auth.Token, _ *prompb.WriteRequest) {}
++	sw.ReadDeltaData = func(dst *chunkedbuffer.Buffer, _ string) (string, string, error) {
++		_, _ = dst.Write([]byte("foo 1\n"))
++		return "", "s1:1", nil
++	}
++	var sentAck string
++	sw.FinalDeltaAck = func(ack string, _ time.Duration) (bool, error) { sentAck = ack; return true, nil }
++	tsmGlobal.Register(&sw)
++	_ = sw.scrapeInternal(123000, 123000)
++	tsmGlobal.Unregister(&sw)
++	defer deltaAcks.Delete("http://delta-final-4/metrics")
++	fn := sw.deltaAckState().final.Load()
++	if fn == nil {
++		t.Fatalf("the scrape did not register its client for the last acknowledgement")
++	}
++	if _, err := (*fn)("s1:1", time.Second); err != nil || sentAck != "s1:1" {
++		t.Fatalf("the registered client sent %q, error %v", sentAck, err)
++	}
++}
+diff --git a/lib/promscrape/scraper.go b/lib/promscrape/scraper.go
+index 65e156c04..19c71800a 100644
+--- a/lib/promscrape/scraper.go
++++ b/lib/promscrape/scraper.go
+@@ -204,6 +204,9 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompb.Writ
+ 			startTime := time.Now()
+ 			scs.stop()
+ 			logger.Infof("stopped Prometheus scrapers in %.3f seconds", time.Since(startTime).Seconds())
++			if *deltaAck {
++				sendFinalDeltaAcks(deltaFinalAckTimeout)
++			}
+ 			return
+ 		}
+ 	}
+@@ -466,6 +469,7 @@ func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *
+ 	sc.sw.ReadData = c.ReadData
+ 	if *deltaAck {
+ 		sc.sw.ReadDeltaData = c.ReadDeltaData
++		sc.sw.FinalDeltaAck = c.FinalDeltaAck
+ 	}
+ 	sc.sw.PushData = pushData
+ 	return sc, nil
+diff --git a/lib/promscrape/scrapework.go b/lib/promscrape/scrapework.go
+index 2a116d969..c9f23404b 100644
+--- a/lib/promscrape/scrapework.go
++++ b/lib/promscrape/scrapework.go
+@@ -212,6 +212,10 @@ type scrapeWork struct {
+ 	// scrapeWork of the same scrape URL; see deltaAckOf.
+ 	deltaAck *deltaAckState
+ 
++	// FinalDeltaAck sends a target exposing increments its last
++	// acknowledgement, see sendFinalDeltaAcks; nil without -promscrape.deltaAck.
++	FinalDeltaAck func(ack string, timeout time.Duration) (bool, error)
++
+ 	// PushData is called for pushing collected data.
+ 	//
+ 	// The PushData must be safe for calling from multiple concurrent goroutines.
+@@ -480,10 +484,14 @@ func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEn
+ 		return contentEncoding, "", err
+ 	}
+ 	if ack == "" {
++		st := sw.deltaAckState()
+ 		ack = deltaAckNew
+-		if p := sw.deltaAckState().ack.Load(); p != nil {
++		if p := st.ack.Load(); p != nil {
+ 			ack = *p
+ 		}
++		if sw.FinalDeltaAck != nil {
++			st.final.Store(&sw.FinalDeltaAck)
++		}
+ 	}
+ 	return sw.ReadDeltaData(dst, ack)
+ }
+@@ -496,6 +504,9 @@ func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEn
+ type deltaAckState struct {
+ 	ack  atomic.Pointer[string]
+ 	used atomic.Uint64 // last use, in Unix seconds
++	// final sends the last acknowledgement, see sendFinalDeltaAcks: the client of
++	// the scrapeWork that last scraped the target.
++	final atomic.Pointer[func(ack string, timeout time.Duration) (bool, error)]
+ }
+ 
+ // deltaAcks keeps a deltaAckState per scrape URL rather than per scrapeWork. A
+@@ -511,6 +522,47 @@ var (
+ 
+ const deltaAckIdle = 3600 // seconds
+ 
++// deltaFinalAckTimeout bounds how long a target's last acknowledgement may take.
++const deltaFinalAckTimeout = 5 * time.Second
++
++// sendFinalDeltaAcks sends every target exposing increments that takes one its
++// last acknowledgement, once the scrapers have stopped: the last round processed
++// in full. The target settles the round it holds by it and takes nothing, so the
++// vmagent started after this one, which starts with AckNew, finds no round held
++// for it to commit: a round fetched and not processed -- the scrape cancelled
++// with the response written -- is reported again rather than lost.
++func sendFinalDeltaAcks(timeout time.Duration) {
++	startTime := time.Now()
++	sem := make(chan struct{}, 64)
++	var wg sync.WaitGroup
++	var sent, failed atomic.Int64
++	deltaAcks.Range(func(_, v any) bool {
++		st := v.(*deltaAckState)
++		fn, ack := st.final.Load(), st.ack.Load()
++		if fn == nil || ack == nil {
++			return true
++		}
++		wg.Add(1)
++		sem <- struct{}{}
++		go func() {
++			defer func() { <-sem; wg.Done() }()
++			ok, err := (*fn)(*ack, timeout)
++			switch {
++			case err != nil:
++				failed.Add(1)
++				logger.Warnf("%s", err)
++			case ok:
++				sent.Add(1)
++			}
++		}()
++		return true
++	})
++	wg.Wait()
++	if n := sent.Load() + failed.Load(); n > 0 {
++		logger.Infof("sent the last acknowledgement to %d targets exposing increments in %.3f seconds; %d failed", n, time.Since(startTime).Seconds(), failed.Load())
++	}
++}
++
+ // deltaAckState returns the acknowledgement state of the target sw scrapes.
+ func (sw *scrapeWork) deltaAckState() *deltaAckState {
+ 	if sw.deltaAck == nil {
+-- 
+2.50.1 (Apple Git-155)
+
