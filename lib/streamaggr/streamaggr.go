@@ -426,8 +426,22 @@ func (a *Aggregators) MustStop() {
 	metrics.UnregisterSet(a.ms, true)
 	a.ms = nil
 
+	// The last flush of every rule is capped at one time, taken once their
+	// regular flushes have all stopped: under sample_timestamps a round whose
+	// samples are in rules of their own, tokens in one and cost in another, is
+	// otherwise written at as many timestamps as the milliseconds the rules took
+	// to stop, and a query at any one of them sees part of it.
 	for _, aggr := range a.as {
-		aggr.MustStop()
+		close(aggr.stopCh)
+	}
+	stopAt := time.Now().UnixMilli()
+	for _, aggr := range a.as {
+		<-aggr.flushingDone
+		stopAt = max(stopAt, aggr.stWritten.Load())
+	}
+	for _, aggr := range a.as {
+		aggr.lastFlushAt <- stopAt
+		aggr.wg.Wait()
 	}
 	a.as = nil
 }
@@ -707,6 +721,11 @@ type aggregator struct {
 
 	wg     sync.WaitGroup
 	stopCh chan struct{}
+	// flushingDone is closed once the flusher has stopped its regular flushes;
+	// it then waits for lastFlushAt, the time its last flush is capped at.
+	flushingDone chan struct{}
+	lastFlushAt  chan int64
+	stopAt       int64 // as received from lastFlushAt; only the flusher touches it
 
 	flushDuration *metrics.Histogram
 	samplesLag    *metrics.Histogram
@@ -973,7 +992,9 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 
 		suffix: suffix,
 
-		stopCh: make(chan struct{}),
+		stopCh:       make(chan struct{}),
+		flushingDone: make(chan struct{}),
+		lastFlushAt:  make(chan int64, 1),
 
 		flushDuration: ms.NewHistogram(fmt.Sprintf(`vm_streamaggr_flush_duration_seconds{%s}`, metricLabels)),
 		samplesLag:    ms.NewHistogram(fmt.Sprintf(`vm_streamaggr_samples_lag_seconds{%s}`, metricLabels)),
@@ -1231,13 +1252,15 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
 		}
 	}
 
+	close(a.flushingDone)
+	a.stopAt = <-a.lastFlushAt
 	a.dedupFlush(dedupTime, cs)
 	pf := pushFunc
 	if skipIncompleteFlush || ignoreFirstIntervals > 0 {
 		pf = nil
 	}
 	if pf != nil && a.aggrOutputs.resetMarkerOnStale {
-		if now := time.Now(); flushTime.After(now) {
+		if now := time.UnixMilli(a.stopAt); flushTime.After(now) {
 			// Don't stamp the incomplete flush on shutdown with the next flush boundary, which is in the future:
 			// a restarted aggregator emits the leading zero of reset_marker_on_stale at its own start,
 			// and increase() would see X → 0 → X for the same series and count X twice.
@@ -1281,6 +1304,10 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 	ao := a.aggrOutputs
 
 	ctx := getFlushCtx(a, ao, pushFunc, flushTime.UnixMilli(), isLast)
+	if isLast && a.stopAt != 0 {
+		// the time of the stop, the same for every rule, see Aggregators.MustStop
+		ctx.now = a.stopAt
+	}
 	if a.dedupInterval <= 0 {
 		a.minDeadline.Store(cs.maxDeadline)
 		ctx.isGreen = cs.isGreen
@@ -1322,6 +1349,8 @@ var flushConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
 // The aggregator stops pushing the aggregated metrics after this call.
 func (a *aggregator) MustStop() {
 	close(a.stopCh)
+	<-a.flushingDone
+	a.lastFlushAt <- max(time.Now().UnixMilli(), a.stWritten.Load())
 	a.wg.Wait()
 }
 

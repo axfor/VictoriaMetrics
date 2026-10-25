@@ -939,3 +939,73 @@ func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
 		checkMinutes(t, output, got, map[int]float64{2: 3}, 6)
 	}
 }
+
+// On shutdown every rule writes what it holds, capped at the time of the stop:
+// one time for all of them, or a round whose tokens and cost are in rules of
+// their own is written at two timestamps a few milliseconds apart, and a query
+// at either one sees half of it. The tokens rule's last flush is held up for a
+// few milliseconds, as one rule's flush is behind another's on a real stop.
+func TestSampleTimestampsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
+	for _, output := range stOutputs {
+		cfg := ""
+		for _, name := range []string{"tokens", "cost"} {
+			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+				"  staleness_interval: 40m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
+		}
+		got := map[string][]outSample{}
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			var mu sync.Mutex
+			var a *Aggregators
+			var held atomic.Bool
+			flushEntryHook = func(ag *aggregator) {
+				if ag == a.as[0] && time.Since(start) >= 80*time.Second && !held.Swap(true) {
+					time.Sleep(3 * time.Millisecond)
+				}
+			}
+			defer func() { flushEntryHook = nil }()
+			var err error
+			a, err = LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, ts := range tss {
+					for _, l := range ts.Labels {
+						if l.Name == "__name__" {
+							for _, s := range ts.Samples {
+								got[l.Value] = append(got[l.Value], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+							}
+						}
+					}
+				}
+			}, nil, "test")
+			if err != nil {
+				t.Fatalf("cannot load config: %s", err)
+			}
+			time.Sleep(10 * time.Second)
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(1), start.Add(5*time.Second).UnixMilli()), nil)
+			// in the interval ending 2m, which has not ended when vmagent stops
+			time.Sleep(70*time.Second - time.Since(start))
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(5), start.Add(65*time.Second).UnixMilli()), nil)
+			time.Sleep(80*time.Second - time.Since(start))
+			a.MustStop()
+			if !held.Load() {
+				t.Fatalf("the tokens rule's last flush was not held")
+			}
+		})
+		for k := range got {
+			sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
+		}
+		if len(got["tokens"]) == 0 || len(got["tokens"]) != len(got["cost"]) {
+			t.Fatalf("%s: tokens %v, cost %v", output, got["tokens"], got["cost"])
+		}
+		for i, tok := range got["tokens"] {
+			if c := got["cost"][i]; c.at != tok.at || c.value != 3*tok.value {
+				t.Errorf("%s: tokens %v at %v, cost %v at %v: the round was written at two times; tokens %v, cost %v",
+					output, tok.value, tok.at, c.value, c.at, got["tokens"], got["cost"])
+			}
+		}
+		if last := got["tokens"][len(got["tokens"])-1]; last.at > 80*time.Second+3*time.Millisecond {
+			t.Errorf("%s: the last round was written at %v, after the stop", output, last.at)
+		}
+	}
+}
