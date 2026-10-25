@@ -110,6 +110,8 @@ resources:
 
 规模不同时，`limits.memory` 按“单 pod 实例数 × 1.7 KiB”算。单 pod 当前实例数看 `usage.Tracked()`。
 
+v1.24.1024 每个实例比 v1.24.1023 多 32 字节，230 万实例约多 75MB，上面的 requests、limits 不用改。
+
 ## 4. 上线顺序
 
 1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vm-select / vm-storage、新 vmagent，vmagent 要是 `v1.126.1030-cluster`）。

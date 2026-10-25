@@ -79,7 +79,7 @@ curl -s -o /dev/null -D - -H 'Accept-Encoding: zstd, gzip;q=0.5' \
 
 这一步只换 vmagent。用 fork `github.com/axfor/VictoriaMetrics` 的 tag `v1.126.1030-cluster` 源码构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。vm-insert 的镜像不换，vm-select、vm-storage 按第 1 步换。
 
-这个版本要打开 `remoteWrite.streamAggr.sampleTimestamps`（见下面的 `extraArgs`）：用量按 vmagent 抓取的那一分钟统计，一次抓取的 token、费用等永远记在同一分钟、同一小时，不会出现相邻两分钟一正一负。它依赖第 1 步的 `-dedup.minScrapeInterval=1ms`，两步都要做。
+这个版本要打开 `remoteWrite.streamAggr.sampleTimestamps`（见下面的 `extraArgs`）：用量按 vmagent 抓取的那一分钟统计，一次抓取的 token、费用等记在同一分钟、同一小时，不会出现相邻两分钟一正一负。唯一的例外是 vmagent 严重积压、处理一次抓取就超过一分钟，这时用量记到处理时的分钟，合计仍然准确。它依赖第 1 步的 `-dedup.minScrapeInterval=1ms`，两步都要做。
 
 ### values.yaml
 
@@ -227,14 +227,15 @@ resources:
 
 发布：`helm upgrade` vmagent。
 
-**确认：**
+**确认**（`<vmagent>` 是 vmagent 的 pod IP）：
 
 ```sh
 kubectl -n acg-system logs deploy/victoria-metrics-agent --tail=100 | grep -iE 'fatal|not defined|cannot parse'   # 无输出
 kubectl -n acg-system get pod | grep victoria-metrics-agent                                                    # Running
+curl -s http://<vmagent>:8429/flags | grep sampleTimestamps                                                    # -remoteWrite.streamAggr.sampleTimestamps="true"
 ```
 
-跑满一小时后看 vmagent 是否跟得上（`<vmagent>` 是 pod IP）：
+跑满一小时后看 vmagent 是否跟得上：
 
 ```sh
 curl -s http://<vmagent>:8429/metrics | grep '^vm_streamaggr_flush_timeouts_total' | awk '{s+=$2} END {print s}'   # 隔几分钟看两次，不再增长
