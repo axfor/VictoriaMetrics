@@ -1,6 +1,6 @@
 # API Key 用量统计 · vmagent / VM / ruler 上线手册
 
-版本：vmagent `v1.126.1033-cluster`、vm-select / vm-storage `v1.126.1027-cluster`（fork `github.com/axfor/VictoriaMetrics`）· ruler `v0.1.11`（Helm chart 0.1.14，仓库 `github.com/axfor/ruler`）
+版本：vmagent `v1.126.1034-cluster`、vm-select / vm-storage `v1.126.1027-cluster`（fork `github.com/axfor/VictoriaMetrics`）· ruler `v0.1.11`（Helm chart 0.1.14，仓库 `github.com/axfor/ruler`）
 
 按顺序做。每一步做完先跑“确认”，通过了再做下一步。边车那侧见 [`app-side.md`](app-side.md)。
 
@@ -77,7 +77,7 @@ curl -s -o /dev/null -D - -H 'Accept-Encoding: zstd, gzip;q=0.5' \
 
 ### 镜像
 
-这一步只换 vmagent。用 fork `github.com/axfor/VictoriaMetrics` 的 tag `v1.126.1033-cluster` 源码构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。vm-insert 的镜像不换，vm-select、vm-storage 按第 1 步换。
+这一步只换 vmagent。用 fork `github.com/axfor/VictoriaMetrics` 的 tag `v1.126.1034-cluster` 源码构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。vm-insert 的镜像不换，vm-select、vm-storage 按第 1 步换。
 
 这个版本默认打开 `remoteWrite.streamAggr.sampleTimestamps`，下面的 `extraArgs` 里也写明了（换回旧镜像时不至于悄悄关掉）：用量按 vmagent 抓取的那一分钟统计，一次抓取的 token、费用等记在同一分钟、同一小时，不会出现相邻两分钟一正一负。唯一的例外是 vmagent 严重积压、处理一次抓取就超过一分钟，这时用量记到处理时的分钟，合计仍然准确。它依赖第 1 步的 `-dedup.minScrapeInterval=1ms`，两步都要做。
 
@@ -384,7 +384,7 @@ kubectl apply -f old-rules.yaml
 
 ## 日常操作
 
-- **看边车交给 vmagent 的内容**：在 vmagent 的 `/targets` 页面点对应边车的 `response` 链接。用 `v1.126.1033-cluster` 的 vmagent 和 `v1.24.1026` 的边车时，这样看不影响用量。不要直接 `curl` 边车的 `/metrics/usage`，要看就按 [`app-side.md`](app-side.md) 第 2 步带上 `peek` 请求头。
+- **看边车交给 vmagent 的内容**：在 vmagent 的 `/targets` 页面点对应边车的 `response` 链接。用 `v1.126.1034-cluster` 的 vmagent 和 `v1.24.1026` 的边车时，这样看不影响用量。不要直接 `curl` 边车的 `/metrics/usage`，要看就按 [`app-side.md`](app-side.md) 第 2 步带上 `peek` 请求头。
 - **改规则或 RetentionFilter**：改配置仓库里的文件，`kubectl apply`。几秒内生效，不用重启 ruler。日志里会出现 `the rules changed; going on with them`。改 cron 和偏移也一样，不用挑时间。
 - **补没写出的窗口**：读写失败按规则里 cron 的 `retry` 重试（现在是 10 次、隔 3 分钟），用完就跳过，记进 `failures`，进度照常往前，重启 ruler 也不会再算它，只能按下面的办法补。只补 `failures` 里列出的窗口（跳过的、不完整的），补成后会从列表里消失。每个副本的 `/api/v1/progress` 只列自己负责的规则。在哪个副本的 `failures` 里看到，就对那个副本调用；也可以在 `/api/v1/assignment?units=1` 里按记录名找到它所在副本的地址（下面以 `ruler-0` 为例）：
 
@@ -411,13 +411,13 @@ kubectl apply -f old-rules.yaml
 
 | 现象 | 怎么办 |
 |---|---|
-| vmagent 启动即退出，日志 `cannot parse stream aggregation config` 或 `sum_samples_total`、`output_heartbeat_interval` 不认识 | vmagent 镜像不是 `v1.126.1033-cluster` 构建的，按第 2 步换镜像 |
+| vmagent 启动即退出，日志 `cannot parse stream aggregation config` 或 `sum_samples_total`、`output_heartbeat_interval` 不认识 | vmagent 镜像不是 `v1.126.1034-cluster` 构建的，按第 2 步换镜像 |
 | vmagent 启动即退出，日志 `flag provided but not defined` | `extraArgs` 里有多余参数（如 `zstd.encoderConcurrency`），按第 2 步整段替换 |
 | 用量数字翻倍 | `usage.yaml` 第一条的 `_metric_type!=""` 漏了，按第 2 步整个文件替换 |
 | 查到带 `pod` 标签的 `acg_*` 序列 | relabel 里新加了按 pod 区分的标签。把它同时加进 `usage.yaml` 第一条的 `drop_input_labels` 和第二条的 `without` |
 | gauge 的值只有实际的约 1/3 | 第二条规则把 `pod` 写进了 `drop_input_labels`，按第 2 步改回 `without` |
 | vmagent 内存远高于 7Gi | 少了 `no_stale_markers: true`，或加了 `sample_limit`、`series_limit`，按第 2 步改 |
-| vmagent 抓边车偶尔超时（`up` 偶尔为 0），担心丢用量 | vmagent 是 `v1.126.1033-cluster`、边车是 `v1.24.1026` 时不会丢，超时那一轮下一分钟补上。任一边还是旧版本时会丢，按第 2 步和 [`app-side.md`](app-side.md) 换版本 |
+| vmagent 抓边车偶尔超时（`up` 偶尔为 0），担心丢用量 | vmagent 是 `v1.126.1034-cluster`、边车是 `v1.24.1026` 时不会丢，超时那一轮下一分钟补上。任一边还是旧版本时会丢，按第 2 步和 [`app-side.md`](app-side.md) 换版本 |
 | VM 里突然没有新用量数据，但 `up` 是 1 | `vm_promscrape_max_scrape_size_exceeded_errors_total` 非零。`promscrape.maxScrapeSize` 设成 500MiB 并 `helm upgrade` vmagent，它不会自己恢复 |
 | vm-storage 被 OOMKilled | 第 1 步的 8Gi 和 `-memory.allowedPercent=35` 没生效，重新核对 |
 | vm-storage 启动即退出，日志 `flag provided but not defined: -search.maxMetricIDsForDirectTSDBStatus` | 镜像不是 `v1.126.1027-cluster` 构建的。按第 1 步换镜像，或者先去掉这一行 |
@@ -432,7 +432,7 @@ kubectl apply -f old-rules.yaml
 | 每次 vmagent 重启后，看板原始档比原始累计数据略低 | `_1m_by_*` 规则缺 `flush_on_shutdown: true`，按第 2 步补上 |
 | vmagent 日志 `exceeds sample_limit` 或 `exceeding label_limit` | 有 job 加了 `sample_limit` / `label_limit`，按第 2 步去掉。被拒的那一轮不会丢也不会重复，去掉后下一分钟补上 |
 | vmagent 被 OOMKilled | 内存 limit 按第 2 步给 7Gi。7Gi 仍被杀：先在 `extraArgs` 里去掉 `remoteWrite.streamAggr.sampleTimestamps` 应急（合计不受影响，只是分钟归属回到按处理时刻），并把被杀前的内存曲线发回来 |
-| 每次 vmagent 重启或发版后，用量比边车实际少一分钟左右 | vmagent 不是 `v1.126.1033-cluster` 或边车不是 `v1.24.1026`，两边都换到这两个版本 |
+| 每次 vmagent 重启或发版后，用量比边车实际少一分钟左右 | vmagent 不是 `v1.126.1034-cluster` 或边车不是 `v1.24.1026`，两边都换到这两个版本 |
 | vmagent 积压时，某几分钟某些 Key 的用量是 0、下一分钟翻倍 | vmagent 跟不上，看第 2 步的确认、按需加 CPU。用量没丢：按小时、按天的合计不受影响 |
 | vmagent 启动即退出，日志 `cannot be combined with ignore_old_samples` | 某条规则配了 `ignore_old_samples`，它会丢掉晚到的用量，删掉这一行 |
 

@@ -114,7 +114,7 @@ v1.24.1026 每个实例约 530 字节（v1.24.1025 是 568），上面的 reques
 
 ## 4. 上线顺序
 
-1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vm-select / vm-storage、新 vmagent，vmagent 要是 `v1.126.1033-cluster`）。
+1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vm-select / vm-storage、新 vmagent，vmagent 要是 `v1.126.1034-cluster`）。
 2. 紧接着发这个版本的边车。两步之间 vmagent 从旧边车抓不到用量，这段时间的用量不统计，所以两步要连着做。
 3. 发完后检查：
 
