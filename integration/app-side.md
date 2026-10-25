@@ -1,6 +1,6 @@
 # API Key 用量统计 · model-router 边车接入
 
-SDK：`github.com/axfor/client_golang v1.24.1026`
+SDK：`github.com/axfor/client_golang v1.24.1027`
 
 指标定义、`Inc()`、`Observe()` 都不用改，只改注册和端点。采集侧见 [`vm-side.md`](vm-side.md)，上线顺序见第 4 步。
 
@@ -9,10 +9,10 @@ SDK：`github.com/axfor/client_golang v1.24.1026`
 ## 1. go.mod
 
 ```
-replace github.com/prometheus/client_golang => github.com/axfor/client_golang v1.24.1026
+replace github.com/prometheus/client_golang => github.com/axfor/client_golang v1.24.1027
 ```
 
-已经在用 v1.24.1023 ~ v1.24.1025 的：只改这里的版本，重新发版，代码不用动。
+已经在用 v1.24.1023 ~ v1.24.1026 的：只改这里的版本，重新发版，代码不用动。
 
 ## 2. 代码
 
@@ -97,7 +97,7 @@ resources:
 
 ## 4. 上线顺序
 
-1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vmagent 要是 `v1.126.1034-cluster`）。
+1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vmagent 要是 `v1.126.1035-cluster`）。
 2. 紧接着发这个版本的边车，两步连着做。
 3. 发完后检查：
 
@@ -110,9 +110,47 @@ curl -s -o /dev/null -D - -H 'X-Prometheus-Delta-Ack: peek' http://<pod>:9090/me
 #   X-Prometheus-Delta-Round: ...          两行都要有
 ```
 
-再跑一遍 [`verify-deploy.sh`](verify-deploy.sh)（`./verify-deploy.sh`，退出码 0 为通过），它读出的 client_golang 版本应为 v1.24.1026。
+再跑一遍 [`verify-deploy.sh`](verify-deploy.sh)（`./verify-deploy.sh`，退出码 0 为通过），它读出的 client_golang 版本应为 v1.24.1027。
 
-## 5. 回退
+## 5. 网络策略
+
+只让 vmagent 访问边车的 9090 端口。在 `acg-system` 里 apply 下面这个 NetworkPolicy（集群的网络插件要支持 NetworkPolicy，如 Calico）：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-router-metrics
+  namespace: acg-system
+spec:
+  podSelector:
+    matchLabels:
+      app: model-router                  # 换成 model-router pod 的标签
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: victoria-metrics-agent   # 换成 vmagent pod 的标签
+      ports:
+        - port: 9090
+    - ports:                             # model-router 的业务端口，全部列上，来源不限
+        - port: <业务端口>
+```
+
+- vmagent 不在 `acg-system` 时，`podSelector` 外面再加一层 `namespaceSelector`。
+- 还有别的程序要抓 `/metrics`（不是 `/metrics/usage`）时，把它的 pod 也加进第一条的 `from`。
+
+**确认：**
+
+```sh
+kubectl -n acg-system get networkpolicy model-router-metrics
+# 从任一非 vmagent 的 pod 上：
+curl -s -m 5 -o /dev/null -w "%{http_code}\n" -H 'X-Prometheus-Delta-Ack: peek' http://<pod>:9090/metrics/usage   # 超时，输出 000
+# 业务请求照常；vmagent 的 /targets 里边车都是 up
+```
+
+## 6. 回退
 
 边车不用重新发版。采集侧按 [`vm-side.md`](vm-side.md) 的“回退”把抓取路径改回 `/metrics/cumulative`。
 
@@ -126,10 +164,10 @@ curl -s -o /dev/null -D - -H 'X-Prometheus-Delta-Ack: peek' http://<pod>:9090/me
 | 边车启动就 panic | 手写了 `delta.Options`，改回 `delta.Increments()` |
 | 指标完全没被跟踪 | `EnableChangeTracking()` 挪到任何指标创建之前 |
 | VM 里的数字比预期少一截 | 找出 vmagent 以外抓 `/metrics/usage` 的程序，停掉；手工看要带 `X-Prometheus-Delta-Ack: peek` |
-| 某个 Key 停了一阵后再来的用量没进 VM | 把存起来复用的 per-API-key 指标对象改成每次 `WithLabelValues(...)` 现取 |
 | 框架指标停了半小时后消失、或从 0 重新开始；`/metrics/usage` 里出现框架指标 | 补上 `opts.Scope = usageReg` |
 | 边车内存比第 3 步高很多 | 删掉改 `IdleScrapes` 的那一行 |
-| 检查时没有 `X-Prometheus-Delta-Features: final` | `go.mod` 里的版本改成 v1.24.1026 重新发版 |
+| 检查时没有 `X-Prometheus-Delta-Features: final` | `go.mod` 里的版本改成 v1.24.1027 重新发版 |
+| 加了第 5 步的网络策略后，vmagent 抓边车 `up=0` 或业务请求失败 | 核对网络策略里两个 pod 标签和业务端口，改对后重新 apply |
 | VM 里突然没有新数据，但 `up` 是 1 | 采集侧按 vm-side 第 2 步把 `promscrape.maxScrapeSize` 设成 500MiB，reload vmagent |
 
 参考实现：client_golang 仓库的 `examples/delta`（`go run ./examples/delta`）。
