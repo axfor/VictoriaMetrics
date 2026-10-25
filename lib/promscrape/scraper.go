@@ -204,6 +204,9 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompb.Writ
 			startTime := time.Now()
 			scs.stop()
 			logger.Infof("stopped Prometheus scrapers in %.3f seconds", time.Since(startTime).Seconds())
+			if *deltaAck {
+				sendFinalDeltaAcks(deltaFinalAckTimeout)
+			}
 			return
 		}
 	}
@@ -466,6 +469,7 @@ func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *
 	sc.sw.ReadData = c.ReadData
 	if *deltaAck {
 		sc.sw.ReadDeltaData = c.ReadDeltaData
+		sc.sw.FinalDeltaAck = c.FinalDeltaAck
 	}
 	sc.sw.PushData = pushData
 	return sc, nil

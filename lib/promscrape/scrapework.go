@@ -212,6 +212,10 @@ type scrapeWork struct {
 	// scrapeWork of the same scrape URL; see deltaAckOf.
 	deltaAck *deltaAckState
 
+	// FinalDeltaAck sends a target exposing increments its last
+	// acknowledgement, see sendFinalDeltaAcks; nil without -promscrape.deltaAck.
+	FinalDeltaAck func(ack string, timeout time.Duration) (bool, error)
+
 	// PushData is called for pushing collected data.
 	//
 	// The PushData must be safe for calling from multiple concurrent goroutines.
@@ -480,9 +484,13 @@ func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEn
 		return contentEncoding, "", err
 	}
 	if ack == "" {
+		st := sw.deltaAckState()
 		ack = deltaAckNew
-		if p := sw.deltaAckState().ack.Load(); p != nil {
+		if p := st.ack.Load(); p != nil {
 			ack = *p
+		}
+		if sw.FinalDeltaAck != nil {
+			st.final.Store(&sw.FinalDeltaAck)
 		}
 	}
 	return sw.ReadDeltaData(dst, ack)
@@ -496,6 +504,9 @@ func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEn
 type deltaAckState struct {
 	ack  atomic.Pointer[string]
 	used atomic.Uint64 // last use, in Unix seconds
+	// final sends the last acknowledgement, see sendFinalDeltaAcks: the client of
+	// the scrapeWork that last scraped the target.
+	final atomic.Pointer[func(ack string, timeout time.Duration) (bool, error)]
 }
 
 // deltaAcks keeps a deltaAckState per scrape URL rather than per scrapeWork. A
@@ -510,6 +521,47 @@ var (
 )
 
 const deltaAckIdle = 3600 // seconds
+
+// deltaFinalAckTimeout bounds how long a target's last acknowledgement may take.
+const deltaFinalAckTimeout = 5 * time.Second
+
+// sendFinalDeltaAcks sends every target exposing increments that takes one its
+// last acknowledgement, once the scrapers have stopped: the last round processed
+// in full. The target settles the round it holds by it and takes nothing, so the
+// vmagent started after this one, which starts with AckNew, finds no round held
+// for it to commit: a round fetched and not processed -- the scrape cancelled
+// with the response written -- is reported again rather than lost.
+func sendFinalDeltaAcks(timeout time.Duration) {
+	startTime := time.Now()
+	sem := make(chan struct{}, 64)
+	var wg sync.WaitGroup
+	var sent, failed atomic.Int64
+	deltaAcks.Range(func(_, v any) bool {
+		st := v.(*deltaAckState)
+		fn, ack := st.final.Load(), st.ack.Load()
+		if fn == nil || ack == nil {
+			return true
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			ok, err := (*fn)(*ack, timeout)
+			switch {
+			case err != nil:
+				failed.Add(1)
+				logger.Warnf("%s", err)
+			case ok:
+				sent.Add(1)
+			}
+		}()
+		return true
+	})
+	wg.Wait()
+	if n := sent.Load() + failed.Load(); n > 0 {
+		logger.Infof("sent the last acknowledgement to %d targets exposing increments in %.3f seconds; %d failed", n, time.Since(startTime).Seconds(), failed.Load())
+	}
+}
 
 // deltaAckState returns the acknowledgement state of the target sw scrapes.
 func (sw *scrapeWork) deltaAckState() *deltaAckState {

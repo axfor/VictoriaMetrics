@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -48,6 +49,10 @@ type client struct {
 	setProxyHeaders         func(req *http.Request) error
 	maxScrapeSize           int64
 	disableCompression      bool
+
+	// deltaFinal is whether the target said it takes a last acknowledgement,
+	// see FinalDeltaAck.
+	deltaFinal atomic.Bool
 }
 
 func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
@@ -130,10 +135,12 @@ func (c *client) ReadData(dst *chunkedbuffer.Buffer) (string, error) {
 // The headers of acknowledged delivery with targets exposing increments through
 // client_golang's promhttp/delta; see its ack.go.
 const (
-	deltaRoundHeader = "X-Prometheus-Delta-Round"
-	deltaAckHeader   = "X-Prometheus-Delta-Ack"
-	deltaAckNew      = "new"  // no round of this target was had yet
-	deltaAckPeek     = "peek" // the response is looked at, not processed
+	deltaRoundHeader    = "X-Prometheus-Delta-Round"
+	deltaAckHeader      = "X-Prometheus-Delta-Ack"
+	deltaFinalHeader    = "X-Prometheus-Delta-Final"    // a last acknowledgement, see sendFinalDeltaAcks
+	deltaFeaturesHeader = "X-Prometheus-Delta-Features" // "final": the target takes one
+	deltaAckNew         = "new"                         // no round of this target was had yet
+	deltaAckPeek        = "peek"                        // the response is looked at, not processed
 )
 
 // ReadDeltaData is ReadData that also sends ack, when not empty, as the
@@ -215,6 +222,9 @@ func (c *client) ReadDeltaData(dst *chunkedbuffer.Buffer, ack string) (string, s
 	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
 	// Any other Content-Encoding is treated as uncompressed data, like before.
 	round := resp.Header.Get(deltaRoundHeader)
+	if round != "" && strings.Contains(resp.Header.Get(deltaFeaturesHeader), "final") {
+		c.deltaFinal.Store(true)
+	}
 	switch ce := resp.Header.Get("Content-Encoding"); ce {
 	case "gzip", "zstd":
 		return ce, round, nil
@@ -229,3 +239,39 @@ var (
 	scrapesOK             = metrics.NewCounter(`vm_promscrape_scrapes_total{status_code="200"}`)
 	scrapeRequests        = metrics.NewCounter(`vm_promscrape_scrape_requests_total`)
 )
+
+// FinalDeltaAck sends ack to the target as its last acknowledgement, see
+// sendFinalDeltaAcks, and reports whether it was sent: only to a target that
+// said it takes one, as one that does not would take the request for a scrape
+// and hold a round nobody processes. It does not use the scrape's context, which
+// is done by the time it is sent.
+func (c *client) FinalDeltaAck(ack string, timeout time.Duration) (bool, error) {
+	if !c.deltaFinal.Load() {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
+	if err != nil {
+		return true, fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
+	}
+	req.Header.Set(deltaAckHeader, ack)
+	req.Header.Set(deltaFinalHeader, "1")
+	req.Header.Set("User-Agent", "vm_promscrape")
+	if err := c.setHeaders(req); err != nil {
+		return true, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+	}
+	if err := c.setProxyHeaders(req); err != nil {
+		return true, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+	}
+	resp, err := c.c.Do(req)
+	if err != nil {
+		return true, fmt.Errorf("cannot send the last acknowledgement to %q: %w", c.scrapeURL, err)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return true, fmt.Errorf("unexpected status code for the last acknowledgement to %q: %d; expecting %d", c.scrapeURL, resp.StatusCode, http.StatusNoContent)
+	}
+	return true, nil
+}
