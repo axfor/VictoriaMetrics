@@ -1,6 +1,6 @@
 # API Key 用量统计 · model-router 边车接入
 
-SDK：`github.com/axfor/client_golang v1.24.1025`
+SDK：`github.com/axfor/client_golang v1.24.1026`
 
 照下面做即可。指标定义、`Inc()`、`Observe()` 都不用改，只改注册和端点。采集侧见 [`vm-side.md`](vm-side.md)，上线顺序见第 4 步。
 
@@ -9,7 +9,7 @@ SDK：`github.com/axfor/client_golang v1.24.1025`
 ## 1. go.mod
 
 ```
-replace github.com/prometheus/client_golang => github.com/axfor/client_golang v1.24.1025
+replace github.com/prometheus/client_golang => github.com/axfor/client_golang v1.24.1026
 ```
 
 ## 2. 代码
@@ -92,9 +92,9 @@ prometheus.Atomically(func() {
 
 包在里面的只能是写指标的几行，不要放网络调用、查库、`sleep`，也不要在里面再调 `prometheus.Atomically`。
 
-### 已经在用 v1.24.1023、v1.24.1024 的
+### 已经在用 v1.24.1023 ~ v1.24.1025 的
 
-`go.mod` 里的版本改成 v1.24.1025 重新发版即可，代码不用动。和 vmagent 换版本的先后无关，任一边先换都不会丢用量。
+`go.mod` 里的版本改成 v1.24.1026 重新发版即可，代码不用动。和 vmagent 换版本的先后无关，任一边先换都不会丢用量。
 
 ## 3. 内存
 
@@ -110,11 +110,11 @@ resources:
 
 规模不同时，`limits.memory` 按“单 pod 实例数 × 1.7 KiB”算。单 pod 当前实例数看 `usage.Tracked()`。
 
-v1.24.1025 每个实例比 v1.24.1023 多 32 字节，230 万实例约多 75MB，上面的 requests、limits 不用改。
+v1.24.1026 每个实例约 530 字节（v1.24.1025 是 568），上面的 requests、limits 不用改。
 
 ## 4. 上线顺序
 
-1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vm-select / vm-storage、新 vmagent，vmagent 要是 `v1.126.1032-cluster`）。
+1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vm-select / vm-storage、新 vmagent，vmagent 要是 `v1.126.1033-cluster`）。
 2. 紧接着发这个版本的边车。两步之间 vmagent 从旧边车抓不到用量，这段时间的用量不统计，所以两步要连着做。
 3. 发完后检查：
 
@@ -126,7 +126,7 @@ curl -s -o /dev/null -D - -H 'X-Prometheus-Delta-Ack: peek' http://<pod>:9090/me
 #   X-Prometheus-Delta-Round: ...          有这一行，说明边车是 v1.24.1023 或更新
 ```
 
-再跑一遍 [`verify-deploy.sh`](verify-deploy.sh)（直接 `./verify-deploy.sh`，退出码 0 为通过）。它会读出每个 pod 实际链进去的 client_golang 版本，应为 v1.24.1025。
+再跑一遍 [`verify-deploy.sh`](verify-deploy.sh)（直接 `./verify-deploy.sh`，退出码 0 为通过）。它会读出每个 pod 实际链进去的 client_golang 版本，应为 v1.24.1026。
 
 ## 5. 回退
 
