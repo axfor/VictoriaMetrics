@@ -14,6 +14,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
 )
@@ -298,6 +299,10 @@ func TestSendFinalDeltaAcks(t *testing.T) {
 	noRound.final.Store(&f2)
 	noClient := deltaAckOf("http://delta-final-3/metrics")
 	noClient.ack.Store(&ack)
+	for _, st := range []*deltaAckState{processed, noRound, noClient} {
+		st.interval.Store(60)
+		st.used.Store(fasttime.UnixTimestamp())
+	}
 	sendFinalDeltaAcks(time.Second)
 	if fmt.Sprint(got) != "map[1:s1:3]" {
 		t.Fatalf("last acknowledgements sent %v; want only s1:3 to the target that had rounds", got)
@@ -328,5 +333,116 @@ func TestScrapeWorkRegistersFinalDeltaAck(t *testing.T) {
 	}
 	if _, err := (*fn)("s1:1", time.Second); err != nil || sentAck != "s1:1" {
 		t.Fatalf("the registered client sent %q, error %v", sentAck, err)
+	}
+}
+
+// Stopping, the last acknowledgement goes only to the targets still scraped,
+// not to the ones gone within the hour their state is kept, such as the pods
+// of a rollout: an address nothing answers on would hold the stop for the
+// timeout, and the stream aggregation's last flush with it.
+func TestSendFinalDeltaAcksSkipsGoneTargets(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]bool{}
+	now := fasttime.UnixTimestamp()
+	var urls []string
+	add := func(url string, usedAgo uint64) {
+		st := deltaAckOf(url)
+		ack := "s1:1"
+		st.ack.Store(&ack)
+		st.interval.Store(60)
+		st.used.Store(now - usedAgo)
+		fn := func(string, time.Duration) (bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			got[url] = true
+			return true, nil
+		}
+		st.final.Store(&fn)
+		urls = append(urls, url)
+	}
+	for i := 0; i < 130; i++ {
+		add(fmt.Sprintf("http://delta-gone-%d/metrics", i), 600) // gone 10 minutes ago
+	}
+	add("http://delta-live-1/metrics", 0)
+	add("http://delta-live-2/metrics", 60)  // a scrape interval ago
+	add("http://delta-late-3/metrics", 130) // two intervals and more ago: gone
+	defer func() {
+		for _, u := range urls {
+			deltaAcks.Delete(u)
+		}
+	}()
+	sendFinalDeltaAcks(time.Second)
+	if len(got) != 2 || !got["http://delta-live-1/metrics"] || !got["http://delta-live-2/metrics"] {
+		t.Fatalf("last acknowledgements went to %d targets: %v; want only the two still scraped", len(got), got)
+	}
+}
+
+// However many targets do not answer, the last acknowledgements take no longer
+// than the timeout all together, not the timeout for every 64 of them.
+func TestSendFinalDeltaAcksTakeNoLongerThanTheTimeout(t *testing.T) {
+	now := fasttime.UnixTimestamp()
+	var urls []string
+	var calls atomic.Int64
+	for i := 0; i < 200; i++ {
+		url := fmt.Sprintf("http://delta-silent-%d/metrics", i)
+		st := deltaAckOf(url)
+		ack := "s1:1"
+		st.ack.Store(&ack)
+		st.interval.Store(60)
+		st.used.Store(now)
+		fn := func(_ string, timeout time.Duration) (bool, error) {
+			calls.Add(1)
+			time.Sleep(timeout) // nothing answers
+			return true, fmt.Errorf("timeout")
+		}
+		st.final.Store(&fn)
+		urls = append(urls, url)
+	}
+	defer func() {
+		for _, u := range urls {
+			deltaAcks.Delete(u)
+		}
+	}()
+	const timeout = 300 * time.Millisecond
+	start := time.Now()
+	sendFinalDeltaAcks(timeout)
+	if d := time.Since(start); d > timeout+200*time.Millisecond {
+		t.Fatalf("200 targets that do not answer took %s with a %s timeout; %d calls made", d, timeout, calls.Load())
+	}
+}
+
+// The janitor reads the time before the states, and a scrape may store a later
+// second in between: that state is in use, not an hour old.
+func TestPruneDeltaAcksKeepsAStateUsedAfterNow(t *testing.T) {
+	const url = "http://delta-prune-now/metrics"
+	defer deltaAcks.Delete(url)
+	st := deltaAckOf(url)
+	st.used.Store(1000)
+	pruneDeltaAcks(999)
+	if _, ok := deltaAcks.Load(url); !ok {
+		t.Fatalf("a state used a second after the janitor's now was dropped")
+	}
+	pruneDeltaAcks(1000 + deltaAckIdle + 1)
+	if _, ok := deltaAcks.Load(url); ok {
+		t.Fatalf("a state not used for longer than an hour was kept")
+	}
+}
+
+func TestHasDeltaFeature(t *testing.T) {
+	for _, c := range []struct {
+		features string
+		want     bool
+	}{
+		{"final", true},
+		{" final ", true},
+		{"other, final", true},
+		{"", false},
+		{"nonfinal", false},
+		{"finally", false},
+		{"final-v2", false},
+	} {
+		if got := hasDeltaFeature(c.features, "final"); got != c.want {
+			t.Errorf("hasDeltaFeature(%q, final) = %v; want %v", c.features, got, c.want)
+		}
 	}
 }

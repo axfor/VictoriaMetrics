@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
@@ -38,9 +39,10 @@ var (
 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
-	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", true, "Whether the global aggregators write sum_samples and sum_samples_total "+
+	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
 		"at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape stay in one interval in every aggregation. "+
-		"Applies to the aggregations it can apply to and skips the others. Needs -dedup.minScrapeInterval=1ms on the storage. "+
+		"Not set, it is true when there is a single -remoteWrite.url and false with several. "+
+		"Applies to the aggregations it can apply to and skips the others. Needs -dedup.minScrapeInterval=1ms on every storage written to. "+
 		"Can be overridden per aggregation via sample_timestamps option")
 
 	// Per URL config
@@ -71,7 +73,8 @@ var (
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
 	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
 		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape "+
-		"stay in one interval in every aggregation. True when not set; applies to the aggregations it can apply to and skips the others. "+
+		"stay in one interval in every aggregation. Not set, it is true when there is a single -remoteWrite.url and false with several; "+
+		"applies to the aggregations it can apply to and skips the others. "+
 		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via sample_timestamps option")
 )
 
@@ -222,7 +225,7 @@ func newStreamAggrConfigGlobal() (*streamaggr.Aggregators, error) {
 		IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
 		KeepInput:            *streamAggrGlobalKeepInput,
 		EnableWindows:        *streamAggrGlobalEnableWindows,
-		SampleTimestamps:     *streamAggrGlobalSampleTimestamps,
+		SampleTimestamps:     globalSampleTimestamps(),
 	}
 
 	sas, err := streamaggr.LoadFromFile(path, pushTimeSeriesToRemoteStoragesTrackDropped, opts, "global")
@@ -267,11 +270,56 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
 	return sas, nil
 }
 
+// sampleTimestampsByDefault is whether sample_timestamps is on where its flags
+// are not set: with a single -remoteWrite.url, whose storage the deployment runs
+// with -dedup.minScrapeInterval=1ms. sample_timestamps writes an interval again
+// at the same timestamp, and a storage without it keeps both samples and counts
+// the interval twice; with several urls, it is turned on explicitly.
+func sampleTimestampsByDefault() bool {
+	return len(*remoteWriteURLs) == 1
+}
+
 // sampleTimestampsFor returns -remoteWrite.streamAggr.sampleTimestamps for the
-// -remoteWrite.url at idx: true when the flag is not set at all.
+// -remoteWrite.url at idx, see sampleTimestampsByDefault when it is not set.
 func sampleTimestampsFor(idx int) bool {
 	if len(*streamAggrSampleTimestamps) == 0 {
-		return true
+		return sampleTimestampsByDefault()
 	}
 	return streamAggrSampleTimestamps.GetOptionalArg(idx)
+}
+
+// globalSampleTimestamps returns -streamAggr.sampleTimestamps, see
+// sampleTimestampsByDefault when it is not set.
+func globalSampleTimestamps() bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "streamAggr.sampleTimestamps" {
+			set = true
+		}
+	})
+	if set {
+		return *streamAggrGlobalSampleTimestamps
+	}
+	return sampleTimestampsByDefault()
+}
+
+// pushToStreamAggr pushes tss to sas, the aggregators loaded from p, and
+// reports whether any aggregation was configured to take them. A config reload
+// puts the new aggregators in p before it stops the old ones: a push that loaded
+// the old ones goes to the new ones instead, so none of its samples land in
+// aggregators after their last flush.
+func pushToStreamAggr(p *atomic.Pointer[streamaggr.Aggregators], sas *streamaggr.Aggregators, tss []prompb.TimeSeries, matchIdxs []byte) ([]byte, bool) {
+	for {
+		var enabled, pushed bool
+		matchIdxs, enabled, pushed = sas.TryPush(tss, matchIdxs)
+		if pushed {
+			return matchIdxs, enabled
+		}
+		next := p.Load()
+		if next == sas {
+			// stopped with nothing in its place: vmagent is stopping
+			return matchIdxs, false
+		}
+		sas = next
+	}
 }

@@ -435,8 +435,6 @@ func tryPush(at *auth.Token, wr *prompb.WriteRequest, forceDropSamplesOnFailure 
 	// Allow up to 10x of labels per each block on average.
 	maxLabelsPerBlock := 10 * maxSamplesPerBlock
 
-	sas := sasGlobal.Load()
-
 	for len(tss) > 0 {
 		// Process big tss in smaller blocks in order to reduce the maximum memory usage
 		samplesCount := 0
@@ -480,10 +478,11 @@ func tryPush(at *auth.Token, wr *prompb.WriteRequest, forceDropSamplesOnFailure 
 		}
 		sortLabelsIfNeeded(tssBlock)
 		tssBlock = limitSeriesCardinality(tssBlock)
-		if sas.IsEnabled() {
+		if sas := sasGlobal.Load(); sas != nil {
 			matchIdxs := matchIdxsPool.Get()
-			matchIdxs.B = sas.Push(tssBlock, matchIdxs.B)
-			if !*streamAggrGlobalKeepInput {
+			var enabled bool
+			matchIdxs.B, enabled = pushToStreamAggr(&sasGlobal, sas, tssBlock, matchIdxs.B)
+			if enabled && !*streamAggrGlobalKeepInput {
 				tssBlock = dropAggregatedSeries(tssBlock, matchIdxs.B, *streamAggrGlobalDropInput)
 			}
 			matchIdxsPool.Put(matchIdxs)
@@ -976,11 +975,11 @@ func (rwctx *remoteWriteCtx) TryPushTimeSeries(tss []prompb.TimeSeries, forceDro
 	rwctx.rowsPushedAfterRelabel.Add(rowsCount)
 
 	// Apply stream aggregation or deduplication if they are configured
-	sas := rwctx.sas.Load()
-	if sas.IsEnabled() {
+	if sas := rwctx.sas.Load(); sas != nil {
 		matchIdxs := matchIdxsPool.Get()
-		matchIdxs.B = sas.Push(tss, matchIdxs.B)
-		if !rwctx.streamAggrKeepInput {
+		var enabled bool
+		matchIdxs.B, enabled = pushToStreamAggr(&rwctx.sas, sas, tss, matchIdxs.B)
+		if enabled && !rwctx.streamAggrKeepInput {
 			if rctx == nil {
 				rctx = getRelabelCtx()
 				// Make a copy of tss before dropping aggregated series

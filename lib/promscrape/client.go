@@ -222,7 +222,7 @@ func (c *client) ReadDeltaData(dst *chunkedbuffer.Buffer, ack string) (string, s
 	// Only the encodings, which can be requested via Accept-Encoding above, are decompressed.
 	// Any other Content-Encoding is treated as uncompressed data, like before.
 	round := resp.Header.Get(deltaRoundHeader)
-	if round != "" && strings.Contains(resp.Header.Get(deltaFeaturesHeader), "final") {
+	if round != "" && hasDeltaFeature(resp.Header.Get(deltaFeaturesHeader), "final") {
 		c.deltaFinal.Store(true)
 	}
 	switch ce := resp.Header.Get("Content-Encoding"); ce {
@@ -239,6 +239,16 @@ var (
 	scrapesOK             = metrics.NewCounter(`vm_promscrape_scrapes_total{status_code="200"}`)
 	scrapeRequests        = metrics.NewCounter(`vm_promscrape_scrape_requests_total`)
 )
+
+// hasDeltaFeature reports whether features, a comma-separated list, names feature.
+func hasDeltaFeature(features, feature string) bool {
+	for f := range strings.SplitSeq(features, ",") {
+		if strings.TrimSpace(f) == feature {
+			return true
+		}
+	}
+	return false
+}
 
 // FinalDeltaAck sends ack to the target as its last acknowledgement, see
 // sendFinalDeltaAcks, and reports whether it was sent: only to a target that

@@ -322,6 +322,12 @@ type Aggregators struct {
 
 	// ms contains metrics associated with the Aggregators.
 	ms *metrics.Set
+
+	// stopping is set by MustStop, which then waits for the pushes in progress,
+	// counted in pushing by the parity of pushEpoch; see TryPush.
+	stopping  atomic.Bool
+	pushEpoch atomic.Uint64
+	pushing   [2]atomic.Int64
 }
 
 // FilePath returns path to file with the configuration used for creating the given Aggregators.
@@ -423,6 +429,15 @@ func (a *Aggregators) MustStop() {
 		return
 	}
 
+	// No push gets to the aggregators after their last flush: the pushes in
+	// progress go in before it, and the ones after are told to go to the
+	// Aggregators put in place of these, see TryPush.
+	a.stopping.Store(true)
+	e := a.pushEpoch.Add(1) - 1
+	for a.pushing[e&1].Load() != 0 {
+		time.Sleep(time.Millisecond)
+	}
+
 	metrics.UnregisterSet(a.ms, true)
 	a.ms = nil
 
@@ -463,21 +478,59 @@ func (a *Aggregators) Equal(b *Aggregators) bool {
 // It reuses the matchIdxs if it has enough capacity to hold len(tss) items.
 // Otherwise it allocates new matchIdxs.
 func (a *Aggregators) Push(tss []prompb.TimeSeries, matchIdxs []byte) []byte {
+	matchIdxs, _, _ = a.TryPush(tss, matchIdxs)
+	return matchIdxs
+}
+
+// TryPush is Push that also reports whether any aggregation was configured to
+// take tss, enabled, and whether a was still running, pushed. A config reload
+// stops a after putting the Aggregators of the new config in its place: a push
+// that has a by then gets pushed false, nothing taken, and goes to the new one.
+// Pushed to the stopped aggregators, its samples would be lost, or, matching
+// nothing, kept as input.
+func (a *Aggregators) TryPush(tss []prompb.TimeSeries, matchIdxs []byte) (_ []byte, enabled, pushed bool) {
 	matchIdxs = bytesutil.ResizeNoCopyMayOverallocate(matchIdxs, len(tss))
 	for i := range matchIdxs {
 		matchIdxs[i] = 0
 	}
 	if a == nil {
-		return matchIdxs
+		return matchIdxs, false, true
+	}
+	in := a.enterPush()
+	defer in.Add(-1)
+	if a.stopping.Load() {
+		return matchIdxs, false, false
+	}
+	if tryPushHook != nil {
+		tryPushHook()
 	}
 
-	// MustStop sets a.as to nil, possibly while a push is in flight on a config
-	// reload: read it once, and push nothing to stopped aggregators.
 	as := a.as
 	if len(as) == 0 {
-		return matchIdxs
+		return matchIdxs, false, true
 	}
+	return a.push(as, tss, matchIdxs), true, true
+}
 
+// tryPushHook, when set, is called by a push that has been let through to the
+// aggregators, before it gets to them: for the tests of MustStop only.
+var tryPushHook func()
+
+// enterPush registers a push for MustStop to wait for; the push ends it with
+// Add(-1) on what it returns. It never waits.
+func (a *Aggregators) enterPush() *atomic.Int64 {
+	for {
+		e := a.pushEpoch.Load()
+		in := &a.pushing[e&1]
+		in.Add(1)
+		if a.pushEpoch.Load() == e {
+			return in
+		}
+		in.Add(-1)
+	}
+}
+
+func (a *Aggregators) push(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) []byte {
 	// One reading of the clock for every rule: under sample_timestamps where a
 	// round goes depends on when it is processed, and a boundary passing while
 	// the push goes from one rule to the next must not send it two ways.

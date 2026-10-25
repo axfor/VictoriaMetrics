@@ -504,6 +504,9 @@ func (sw *scrapeWork) readData(dst *chunkedbuffer.Buffer, ack string) (contentEn
 type deltaAckState struct {
 	ack  atomic.Pointer[string]
 	used atomic.Uint64 // last use, in Unix seconds
+	// interval is the scrape interval of the scrapeWork that last used it, in
+	// seconds: a target not scraped for two of them is gone, see sendFinalDeltaAcks.
+	interval atomic.Uint64
 	// final sends the last acknowledgement, see sendFinalDeltaAcks: the client of
 	// the scrapeWork that last scraped the target.
 	final atomic.Pointer[func(ack string, timeout time.Duration) (bool, error)]
@@ -531,22 +534,34 @@ const deltaFinalAckTimeout = 5 * time.Second
 // vmagent started after this one, which starts with AckNew, finds no round held
 // for it to commit: a round fetched and not processed -- the scrape cancelled
 // with the response written -- is reported again rather than lost.
+//
+// It goes only to the targets still scraped: the states of targets gone, such
+// as the pods of a rollout, stay for an hour, and a request to an address
+// nothing answers on waits for the timeout. And all of it takes no longer than
+// timeout, as the stream aggregation's last flush comes after it.
 func sendFinalDeltaAcks(timeout time.Duration) {
 	startTime := time.Now()
+	deadline := startTime.Add(timeout)
+	now := fasttime.UnixTimestamp()
 	sem := make(chan struct{}, 64)
 	var wg sync.WaitGroup
 	var sent, failed atomic.Int64
 	deltaAcks.Range(func(_, v any) bool {
 		st := v.(*deltaAckState)
 		fn, ack := st.final.Load(), st.ack.Load()
-		if fn == nil || ack == nil {
+		if fn == nil || ack == nil || !st.scrapedSince(now) {
 			return true
 		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			ok, err := (*fn)(*ack, timeout)
+			left := time.Until(deadline)
+			if left <= 0 {
+				failed.Add(1)
+				return
+			}
+			ok, err := (*fn)(*ack, left)
 			switch {
 			case err != nil:
 				failed.Add(1)
@@ -563,11 +578,19 @@ func sendFinalDeltaAcks(timeout time.Duration) {
 	}
 }
 
+// scrapedSince reports whether the target was scraped within two of its scrape
+// intervals before now, in Unix seconds.
+func (st *deltaAckState) scrapedSince(now uint64) bool {
+	used := st.used.Load()
+	return used >= now || now-used <= 2*max(st.interval.Load(), 1)
+}
+
 // deltaAckState returns the acknowledgement state of the target sw scrapes.
 func (sw *scrapeWork) deltaAckState() *deltaAckState {
 	if sw.deltaAck == nil {
 		sw.deltaAck = deltaAckOf(sw.Config.ScrapeURL)
 	}
+	sw.deltaAck.interval.Store(uint64(sw.Config.ScrapeInterval.Seconds()))
 	sw.deltaAck.used.Store(fasttime.UnixTimestamp())
 	return sw.deltaAck
 }
@@ -594,7 +617,8 @@ func deltaAckOf(scrapeURL string) *deltaAckState {
 // is replaced by a scrapeWork that has not used it for an hour.
 func pruneDeltaAcks(now uint64) {
 	deltaAcks.Range(func(k, v any) bool {
-		if now-v.(*deltaAckState).used.Load() > deltaAckIdle {
+		// used is read after now, and a scrape may have stored a later second
+		if used := v.(*deltaAckState).used.Load(); now > used && now-used > deltaAckIdle {
 			deltaAcks.Delete(k)
 		}
 		return true

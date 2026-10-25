@@ -1,28 +1,53 @@
 package remotewrite
 
-import "testing"
+import (
+	"flag"
+	"testing"
+)
 
-// sample_timestamps is on unless turned off: not set, the flag is true for every
-// -remoteWrite.url; set once, it applies to all of them; set per url, to each.
-func TestSampleTimestampsOnByDefault(t *testing.T) {
-	saved := *streamAggrSampleTimestamps
-	defer func() { *streamAggrSampleTimestamps = saved }()
+// Not set, sample_timestamps is on with a single -remoteWrite.url and off with
+// several, whose storages may not deduplicate; set once, the flag applies to
+// every url; set per url, to each.
+func TestSampleTimestampsByDefault(t *testing.T) {
+	savedURLs, saved := *remoteWriteURLs, *streamAggrSampleTimestamps
+	defer func() { *remoteWriteURLs, *streamAggrSampleTimestamps = savedURLs, saved }()
+
 	*streamAggrSampleTimestamps = nil
-	if !sampleTimestampsFor(0) || !sampleTimestampsFor(3) {
-		t.Fatal("not set: want true")
+	*remoteWriteURLs = []string{"http://vm-insert/write"}
+	if !sampleTimestampsFor(0) || !globalSampleTimestamps() {
+		t.Fatal("not set, one url: want true")
 	}
-	if err := streamAggrSampleTimestamps.Set("false"); err != nil {
+	*remoteWriteURLs = []string{"http://vm-insert/write", "http://other/write"}
+	if sampleTimestampsFor(0) || sampleTimestampsFor(1) || globalSampleTimestamps() {
+		t.Fatal("not set, two urls: want false")
+	}
+	if err := streamAggrSampleTimestamps.Set("true"); err != nil {
 		t.Fatal(err)
 	}
-	if sampleTimestampsFor(0) || sampleTimestampsFor(2) {
-		t.Fatal("set once to false: want false for every url")
+	if !sampleTimestampsFor(0) || !sampleTimestampsFor(1) {
+		t.Fatal("set once to true, two urls: want true for every url")
 	}
 	*streamAggrSampleTimestamps = nil
 	_ = streamAggrSampleTimestamps.Set("true,false")
 	if !sampleTimestampsFor(0) || sampleTimestampsFor(1) {
 		t.Fatal("per url: want true, false")
 	}
-	if !*streamAggrGlobalSampleTimestamps {
-		t.Fatal("-streamAggr.sampleTimestamps: want true by default")
+	*remoteWriteURLs = []string{"http://vm-insert/write"}
+	*streamAggrSampleTimestamps = nil
+	_ = streamAggrSampleTimestamps.Set("false")
+	if sampleTimestampsFor(0) {
+		t.Fatal("set to false, one url: want false")
+	}
+
+	savedGlobal := *streamAggrGlobalSampleTimestamps
+	defer func() {
+		_ = flag.Set("streamAggr.sampleTimestamps", "false")
+		*streamAggrGlobalSampleTimestamps = savedGlobal
+	}()
+	if err := flag.Set("streamAggr.sampleTimestamps", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if globalSampleTimestamps() {
+		t.Fatal("-streamAggr.sampleTimestamps=false, one url: want false")
 	}
 }

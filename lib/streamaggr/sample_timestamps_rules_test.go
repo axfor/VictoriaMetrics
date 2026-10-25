@@ -1009,3 +1009,54 @@ func TestSampleTimestampsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
 		}
 	}
 }
+
+// MustStop waits for a push already let through to the aggregators and not at
+// them yet, and its samples are in the last flush; a push after that is told
+// the aggregators stopped, and takes nothing.
+func TestMustStopWaitsForThePushesInProgress(t *testing.T) {
+	cfg := "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n  flush_on_shutdown: true\n"
+	var mu sync.Mutex
+	var got []float64
+	a, err := LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, ts := range tss {
+			for _, s := range ts.Samples {
+				got = append(got, s.Value)
+			}
+		}
+	}, nil, "test")
+	if err != nil {
+		t.Fatalf("cannot load config: %s", err)
+	}
+	reached, release := make(chan struct{}), make(chan struct{})
+	tryPushHook = func() { close(reached); <-release }
+	defer func() { tryPushHook = nil }()
+	pushed := make(chan bool)
+	go func() {
+		_, _, ok := a.TryPush(prometheus.MustParsePromMetrics("tokens 5", 1000), nil)
+		pushed <- ok
+	}()
+	<-reached
+	tryPushHook = nil
+	stopped := make(chan struct{})
+	go func() { a.MustStop(); close(stopped) }()
+	select {
+	case <-stopped:
+		t.Fatalf("MustStop returned with a push in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if !<-pushed {
+		t.Fatalf("the push in progress was refused")
+	}
+	<-stopped
+	if _, _, ok := a.TryPush(prometheus.MustParsePromMetrics("tokens 7", 1000), nil); ok {
+		t.Fatalf("a push after MustStop was taken")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != 5 {
+		t.Fatalf("written %v; want the push in progress, 5, in the last flush", got)
+	}
+}
