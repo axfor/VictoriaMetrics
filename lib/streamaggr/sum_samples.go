@@ -343,9 +343,7 @@ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
 	if c.sampleTimestamps {
 		// sample_timestamps is refused together with enable_windows, the only
 		// source of shared state.
-		o := &sumSamplesTotalAtOwned{}
-		o.v.shared = &o.shared
-		return &o.v
+		return &sumSamplesTotalAtValue{}
 	}
 	if shared, ok := s.(*sumSamplesTotalShared); ok {
 		return &sumSamplesTotalAggrValue{shared: shared}
@@ -363,14 +361,20 @@ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
 // at the same timestamp, with the bigger total, which VM's deduplication keeps;
 // anything for an interval before that goes to the first interval not written,
 // as a total written before one written already would look like a reset.
+//
+// It holds its state inline, 64 bytes in all: it is never shared, and written is
+// a lastWrittenAt other than 0, as no total is written at the Unix epoch. One of
+// these is kept for every output series, millions of them.
 type sumSamplesTotalAtValue struct {
-	shared  *sumSamplesTotalShared
 	pending bySampleTime
+	sh      stTotal
 }
 
-type sumSamplesTotalAtOwned struct {
-	v      sumSamplesTotalAtValue
-	shared sumSamplesTotalShared
+// stTotal is what sumSamplesTotalAtValue keeps of what it wrote.
+type stTotal struct {
+	total         float64
+	lastWritten   float64
+	lastWrittenAt int64 // 0: nothing written yet
 }
 
 func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
@@ -378,7 +382,7 @@ func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _
 }
 
 func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
-	sh := av.shared
+	sh := &av.sh
 	st := &ctx.st
 	labelsLen, samplesLen, started := 0, 0, false
 	wrote := false
@@ -389,7 +393,7 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
 			started = true
 		}
 		ctx.appendSample(at, v)
-		sh.lastWritten, sh.lastWrittenAt, sh.written = v, at, true
+		sh.lastWritten, sh.lastWrittenAt = v, at
 		wrote = true
 	}
 	slots := av.pending.take(ctx.slots[:0])
@@ -399,7 +403,7 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
 	for i := range slots {
 		x := &slots[i]
 		switch {
-		case x.ts == st.written && st.tailOK && x.sum >= 0 && (!sh.written || sh.lastWrittenAt <= x.ts && sh.total+x.sum >= sh.lastWritten):
+		case x.ts == st.written && st.tailOK && x.sum >= 0 && (sh.lastWrittenAt == 0 || sh.lastWrittenAt <= x.ts && sh.total+x.sum >= sh.lastWritten):
 			// the tail of the interval written last: write it again, with it
 			sh.total += x.sum
 			write(x.ts, sh.total)
@@ -419,12 +423,12 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
 			continue
 		}
 		sh.total += x.sum
-		if sh.written && sh.total == sh.lastWritten {
+		if (sh.lastWrittenAt != 0) && sh.total == sh.lastWritten {
 			continue
 		}
 		write(x.ts, sh.total)
 	}
-	if !wrote && sh.written {
+	if !wrote && (sh.lastWrittenAt != 0) {
 		at := min(st.closing, ctx.now)
 		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
 		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
@@ -444,7 +448,8 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
 	}
 }
 
-func (av *sumSamplesTotalAtValue) state() any { return av.shared }
+// state is nil: sample_timestamps is refused with enable_windows, the only user of shared state.
+func (av *sumSamplesTotalAtValue) state() any { return nil }
 
 func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }
 

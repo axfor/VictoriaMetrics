@@ -1,6 +1,7 @@
 package streamaggr
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/cespare/xxhash/v2"
@@ -97,7 +98,12 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
 		if av == nil {
 			// The entry is missing in the map. Try creating it.
 			nv = ao.newAggrValues()
-			key := bytesutil.InternString(outputKey)
+			// A copy of the key, not an interned one: the map holds it as long as
+			// the entry lives, and the intern map would hold a second reference to
+			// it, in a map of its own about four times the size of the strings, for
+			// a sharing that rules with the same output labels can only make use of
+			// for some of their keys.
+			key := strings.Clone(outputKey)
 			sh.mu.Lock()
 			if sh.m == nil {
 				sh.m = make(map[string]*aggrValues)

@@ -1684,6 +1684,15 @@ func putFlushCtx(ctx *flushCtx) {
 
 var flushCtxPool sync.Pool
 
+// flushBatchSeries is how many output series a flush hands to its push function
+// at a time. Every rule flushes at the same moment, each with a context of its
+// own, and the contexts are kept in flushCtxPool between flushes: what one holds
+// is what a batch needs, labels and samples for every series of it, and with 102
+// rules at 10_000 series each that was 290 MiB, held from one minute to the
+// next. Remote write packs the batches into blocks of its own, so a smaller
+// batch only means more calls.
+const flushBatchSeries = 1_000
+
 type flushCtx struct {
 	a              *aggregator
 	ao             *aggrOutputs
@@ -1789,7 +1798,7 @@ func (ctx *flushCtx) appendSeriesAt(key, suffix string, timestamp int64, value f
 	})
 
 	// Limit the maximum length of ctx.tss in order to limit memory usage.
-	if len(ctx.tss) >= 10_000 {
+	if len(ctx.tss) >= flushBatchSeries {
 		ctx.flushSeries()
 	}
 }
@@ -1837,7 +1846,7 @@ func (ctx *flushCtx) endSeries(labelsLen, samplesLen int) {
 		Labels:  ctx.labels[labelsLen:],
 		Samples: ctx.samples[samplesLen:],
 	})
-	if len(ctx.tss) >= 10_000 {
+	if len(ctx.tss) >= flushBatchSeries {
 		ctx.flushSeries()
 	}
 }
@@ -1863,7 +1872,7 @@ func (ctx *flushCtx) appendSeriesWithExtraLabel(key, suffix string, value float6
 	})
 
 	// Limit the maximum length of ctx.tss in order to limit memory usage.
-	if len(ctx.tss) >= 10_000 {
+	if len(ctx.tss) >= flushBatchSeries {
 		ctx.flushSeries()
 	}
 }
