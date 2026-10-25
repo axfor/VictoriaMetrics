@@ -154,10 +154,10 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 		}
 		sh.mu.RUnlock()
 		for _, e := range entries {
-			ao.flushEntry(ctx, sh, e.key, e.av)
 			if flushEntryHook != nil {
-				flushEntryHook()
+				flushEntryHook(ctx.a)
 			}
+			ao.flushEntry(ctx, sh, e.key, e.av)
 		}
 		clear(entries)
 		entries = entries[:0]
@@ -165,9 +165,10 @@ func (ao *aggrOutputs) flushState(ctx *flushCtx) {
 	flushEntriesPool.Put(&entries)
 }
 
-// flushEntryHook, when set, is called after each entry a flush writes: for the
-// tests of samples pushed while a flush is under way only.
-var flushEntryHook func()
+// flushEntryHook, when set, is called before each entry a flush writes, with
+// the aggregator flushing: for the tests of samples pushed while a flush is
+// under way only.
+var flushEntryHook func(a *aggregator)
 
 // removeEntry drops key from sh if it still maps to av.
 func (sh *aggrOutputShard) removeEntry(key string, av *aggrValues) {

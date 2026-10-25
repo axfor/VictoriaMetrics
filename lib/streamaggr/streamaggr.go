@@ -344,8 +344,9 @@ func loadFromData(data []byte, filePath string, pushFunc PushFunc, opts *Options
 
 	ms := metrics.NewSet()
 	as := make([]*aggregator, len(cfgs))
+	late := &stRoundTable{m: map[stRoundKey]int64{}} // shared by the rules of this config, see stPlace
 	for i, cfg := range cfgs {
-		a, err := newAggregator(cfg, filePath, pushFunc, ms, opts, alias, i+1)
+		a, err := newAggregator(cfg, filePath, pushFunc, ms, opts, alias, i+1, late)
 		if err != nil {
 			// Stop already initialized aggregators before returning the error.
 			for _, a := range as[:i] {
@@ -463,24 +464,28 @@ func (a *Aggregators) Push(tss []prompb.TimeSeries, matchIdxs []byte) []byte {
 		return matchIdxs
 	}
 
+	// One reading of the clock for every rule: under sample_timestamps where a
+	// round goes depends on when it is processed, and a boundary passing while
+	// the push goes from one rule to the next must not send it two ways.
+	now := time.Now()
 	if a.byName == nil {
 		for _, aggr := range as {
-			aggr.Push(tss, matchIdxs)
+			aggr.pushAt(tss, matchIdxs, now)
 		}
 		return matchIdxs
 	}
 
 	for _, aggr := range a.unindexed {
-		aggr.Push(tss, matchIdxs)
+		aggr.pushAt(tss, matchIdxs, now)
 	}
-	a.pushByName(as, tss, matchIdxs)
+	a.pushByName(as, tss, matchIdxs, now)
 
 	return matchIdxs
 }
 
 // pushByName pushes every series in tss to the indexed aggregators listed for its
 // name only. The other indexed aggregators could not match it.
-func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) {
+func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte, now time.Time) {
 	ctx := getNameIndexCtx(len(as))
 	defer putNameIndexCtx(ctx)
 
@@ -509,7 +514,7 @@ func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matc
 		}
 		if len(runs) == 1 {
 			r := runs[0]
-			as[aggrIdx].Push(tss[r.start:r.end], matchIdxs[r.start:r.end])
+			as[aggrIdx].pushAt(tss[r.start:r.end], matchIdxs[r.start:r.end], now)
 			continue
 		}
 		tssSub := ctx.tss[:0]
@@ -518,7 +523,7 @@ func (a *Aggregators) pushByName(as []*aggregator, tss []prompb.TimeSeries, matc
 		}
 		matchIdxsSub := bytesutil.ResizeNoCopyMayOverallocate(ctx.matchIdxs, len(tssSub))
 		clear(matchIdxsSub)
-		as[aggrIdx].Push(tssSub, matchIdxsSub)
+		as[aggrIdx].pushAt(tssSub, matchIdxsSub, now)
 		j := 0
 		for _, r := range runs {
 			for i := r.start; i < r.end; i++ {
@@ -653,12 +658,12 @@ type aggregator struct {
 	// sample_timestamps, and stTailOK whether this process wrote it; see stState.
 	stWritten atomic.Int64
 	stTailOK  atomic.Bool
-	// stLate is where the rounds processed after their interval was written go,
-	// by scrape timestamp, which all samples of a round share: decided at the
-	// first of a round's samples, so that its later ones go there too, whatever
-	// the flushes did in between. See stLateInterval.
-	stLateMu sync.Mutex
-	stLate   map[int64]int64
+	// stRounds is where rounds went, shared with the other rules of the config,
+	// see stPlace; stEpoch and stInflight are for the cut a flush takes, see
+	// stCut.
+	stRounds   *stRoundTable
+	stEpoch    atomic.Uint64
+	stInflight [2]atomic.Int64
 
 	by                  []string
 	without             []string
@@ -723,7 +728,7 @@ type aggrPushFunc func([]pushSample, int64, bool)
 // opts can contain additional options. If opts is nil, then default options are used.
 //
 // The returned aggregator must be stopped when no longer needed by calling MustStop().
-func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set, opts *Options, alias string, aggrID int) (*aggregator, error) {
+func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set, opts *Options, alias string, aggrID int, late *stRoundTable) (*aggregator, error) {
 	// check cfg.Interval
 	if cfg.Interval == "" {
 		return nil, fmt.Errorf("missing `interval` option")
@@ -951,6 +956,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		ignoreOldSamples:  ignoreOldSamples,
 		enableWindows:     enableWindows,
 		sampleTimestamps:  sampleTimestamps,
+		stRounds:          late,
 		stalenessInterval: stalenessInterval,
 
 		outputHeartbeatInterval: outputHeartbeatInterval,
@@ -1280,11 +1286,14 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 		ctx.isGreen = cs.isGreen
 	}
 	if a.sampleTimestamps {
+		a.stCut()
 		ctx.st = stState{written: a.stWritten.Load(), tailOK: a.stTailOK.Load(), closing: math.MaxInt64}
 		if !isLast {
-			// the intervals that have ended by the flush's time; with flushes not
-			// aligned to the interval, the last one ending before it
-			ctx.st.closing = max(a.intervalFloor(ctx.flushTimestamp), ctx.st.written)
+			// the intervals that have ended by the flush's time -- with flushes not
+			// aligned to the interval, the last one ending before it -- and never
+			// one the clock has not got to: where rounds go relies on no rule having
+			// written an interval before it ended
+			ctx.st.closing = max(min(a.intervalFloor(ctx.flushTimestamp), a.intervalFloor(ctx.now)), ctx.st.written)
 		}
 	}
 	ao.flushState(ctx)
@@ -1292,15 +1301,7 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 	if a.sampleTimestamps && !isLast && ctx.st.closing > ctx.st.written {
 		a.stWritten.Store(ctx.st.closing)
 		a.stTailOK.Store(true)
-		// A late round's interval is of use while it can still be written again
-		// as the tail, that is while it is the one written last or not written.
-		a.stLateMu.Lock()
-		for ts, at := range a.stLate {
-			if at < ctx.st.closing {
-				delete(a.stLate, ts)
-			}
-		}
-		a.stLateMu.Unlock()
+		a.stPruneRounds(ctx.now)
 	}
 	putFlushCtx(ctx)
 
@@ -1326,6 +1327,11 @@ func (a *aggregator) MustStop() {
 
 // Push pushes tss to a.
 func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
+	a.pushAt(tss, matchIdxs, time.Now())
+}
+
+// pushAt is Push, with now the time the push is processed.
+func (a *aggregator) pushAt(tss []prompb.TimeSeries, matchIdxs []byte, now time.Time) {
 	ctx := getPushCtx()
 	defer putPushCtx(ctx)
 
@@ -1333,7 +1339,6 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	labels := &ctx.labels
 	inputLabels := &ctx.inputLabels
 	outputLabels := &ctx.outputLabels
-	now := time.Now()
 	nowMsec := now.UnixMilli()
 	deleteDeadline := now.Add(a.stalenessInterval)
 	deleteDeadlineMsec := deleteDeadline.UnixMilli()
@@ -1345,17 +1350,17 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	enableWindows := a.enableWindows
 	cs := a.cs.Load()
 
-	// Under sample_timestamps a sample is kept under the end of the interval it
-	// falls in, not under its own timestamp. Every target is scraped at an
-	// offset of its own, so the exact timestamps would give an output fed by N
-	// targets N sums to keep and N samples to write per interval. A sample for an
-	// interval before the one written last goes to the first interval not
-	// written, decided here, when its round is processed, so that it is the same
-	// interval in every output, however far the flush has got with them; and
-	// however far behind the aggregator is, an output holds only so many sums.
+	// Under sample_timestamps a sample is kept under the end of the interval its
+	// round goes to, see stPlace, not under its own timestamp. Every target is
+	// scraped at an offset of its own, so the exact timestamps would give an
+	// output fed by N targets N sums to keep and N samples to write per interval;
+	// and however far behind the aggregator is, an output holds only so many sums.
 	sampleTimestamps := a.sampleTimestamps
-	stWritten := a.stWritten.Load()
-	lateTs, lateAt := int64(0), int64(0) // the round of the last late sample: a push is mostly one round
+	if sampleTimestamps {
+		in := a.stEnter()
+		defer in.Add(-1)
+	}
+	stTs, stAt := int64(0), int64(0) // the round of the last sample: a push is mostly one round
 
 	var maxLagMsec int64
 	for idx, ts := range tss {
@@ -1406,15 +1411,10 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 			}
 			timestamp := s.Timestamp
 			if sampleTimestamps {
-				// a timestamp ahead of the clock is taken as now: its interval
-				// would otherwise be held until the clock got there
-				timestamp = a.intervalEnd(min(timestamp, nowMsec))
-				if timestamp < stWritten {
-					if lateAt == 0 || lateTs != s.Timestamp {
-						lateTs, lateAt = s.Timestamp, a.stLateInterval(s.Timestamp, stWritten)
-					}
-					timestamp = lateAt
+				if stAt == 0 || stTs != s.Timestamp {
+					stTs, stAt = s.Timestamp, a.stPlace(s.Timestamp, nowMsec)
 				}
+				timestamp = stAt
 			}
 			if enableWindows && s.Timestamp <= cs.maxDeadline == cs.isGreen {
 				ctx.green = append(ctx.green, pushSample{
@@ -1439,6 +1439,9 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	a.samplesLag.Update(float64(maxLagMsec) / 1_000)
 
 	ctx.buf = buf
+	if pushHook != nil {
+		pushHook(a)
+	}
 
 	pushSamples := a.aggrOutputs.pushSamples
 	if a.da != nil {
@@ -1456,25 +1459,103 @@ func (a *aggregator) Push(tss []prompb.TimeSeries, matchIdxs []byte) {
 	}
 }
 
-// stLateInterval returns the interval the round scraped at ts goes to, now that
-// written, the end of the interval written last, is after its own: the first
-// interval not written when its first sample was processed. The flush writes it
-// with the interval or, for the outputs it had already written by the time the
-// sample got to them, the next flush writes it again with the sample, as the
-// tail of the interval written last. Only a round whose processing goes on
-// after that, past a whole interval more, has its later samples go further.
-func (a *aggregator) stLateInterval(ts, written int64) int64 {
-	a.stLateMu.Lock()
-	defer a.stLateMu.Unlock()
-	at, ok := a.stLate[ts]
-	if !ok {
-		at = written + a.interval.Milliseconds()
-		if a.stLate == nil {
-			a.stLate = make(map[int64]int64)
-		}
-		a.stLate[ts] = at
+// pushHook, when set, is called by a push between placing its samples and
+// adding them to the outputs: for the tests of stCut only.
+var pushHook func(a *aggregator)
+
+// stPlace returns the end of the interval the round scraped at ts goes to, its
+// sample being processed at now. A round goes to the interval it was scraped
+// in, if that has not ended by the boundary before now, and otherwise to the
+// interval it is processed in, which no aggregator can have written yet: a
+// timestamp ahead of the clock counts as now.
+//
+// The interval is decided at the first of the round's samples any rule of the
+// config processes, and kept, by the interval's grid and the scrape timestamp
+// all samples of a round share, for the rest of the round in every rule: a
+// round comes in blocks, and its tokens and its cost may be in different ones,
+// processed seconds apart, a boundary between them. A flush writes the interval
+// with the round or, for the outputs it had already written by the time a block
+// got to them, writes it again with the block at the next flush, as the tail of
+// the interval written last. Only a round still being processed after the
+// interval it was put in is more than a boundary behind has its later blocks go
+// further, to the interval they are processed in.
+//
+// Nothing here depends on how far a rule's flush has got: rules flush at their
+// own pace, and that would send the tokens of a round to one minute and its cost
+// to another. See stCut for why a flush cannot take a block decided before it
+// for one decided after.
+func (a *aggregator) stPlace(ts, now int64) int64 {
+	iv := a.interval.Milliseconds()
+	floor := a.intervalFloor(now)
+	k := stRoundKey{iv, a.intervalPhaseMsec, ts}
+	t := a.stRounds
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if at, ok := t.m[k]; ok && at >= floor {
+		return at
+	}
+	at := max(a.intervalEnd(min(ts, now)), floor+iv)
+	if _, ok := t.m[k]; ok || len(t.m) < stRoundsMax {
+		t.m[k] = at
 	}
 	return at
+}
+
+// stRoundTable holds where the rounds of a config's rules went, see stPlace.
+// It holds the rounds of the last couple of intervals: one per scrape of every
+// target. Pushes of samples each with a timestamp of its own could fill it, so
+// past stRoundsMax a round is placed by the same rule without being kept, and
+// its blocks are not held together.
+type stRoundTable struct {
+	mu sync.Mutex
+	m  map[stRoundKey]int64
+}
+
+type stRoundKey struct{ interval, phase, ts int64 }
+
+const stRoundsMax = 1 << 17
+
+// stPruneRounds drops the rounds of the grid of a that are of no more use: the
+// interval they were put in ended more than an interval before now.
+func (a *aggregator) stPruneRounds(now int64) {
+	iv, phase := a.interval.Milliseconds(), a.intervalPhaseMsec
+	before := a.intervalFloor(now) - iv
+	t := a.stRounds
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for k, at := range t.m {
+		if k.interval == iv && k.phase == phase && at < before {
+			delete(t.m, k)
+		}
+	}
+}
+
+// stEnter registers a push for the cut a flush takes, see stCut; the push ends
+// it with Add(-1) on what it returns. It never waits.
+func (a *aggregator) stEnter() *atomic.Int64 {
+	for {
+		e := a.stEpoch.Load()
+		in := &a.stInflight[e&1]
+		in.Add(1)
+		if a.stEpoch.Load() == e {
+			return in
+		}
+		in.Add(-1)
+	}
+}
+
+// stCut waits for the pushes in progress when the flush begins, which take no
+// longer than a push does: where their blocks go was decided at a time before
+// the flush, and a block landing in an output after the flush has written it
+// would be taken for one decided after, as a block of an interval before the
+// one written last. Pushes begun meanwhile go ahead without waiting.
+func (a *aggregator) stCut() {
+	e := a.stEpoch.Add(1) - 1
+	for a.stInflight[e&1].Load() != 0 {
+		// a push takes milliseconds; sleep rather than spin, which would take a
+		// CPU from the pushes it waits for when vmagent is short of them
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // intervalEnd returns the end of the interval ts falls in, on the grid the

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -133,9 +134,9 @@ func TestSampleTimestampsNegativeTailGoesToTheNextInterval(t *testing.T) {
 	}
 }
 
-// Rounds processed after a later interval was written go to the first interval
-// not written, all of them together; the round of the interval written last is
-// its tail. Nothing is lost, nothing counted twice.
+// Rounds whose interval has ended by the time they are processed go to the
+// interval they are processed in, all of them together. Nothing is lost,
+// nothing counted twice.
 func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) {
 	for _, output := range stOutputs {
 		got := runLateScenario(t, stConfig(output, ""), []latePush{
@@ -147,7 +148,7 @@ func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) 
 			// another target's, scraped in the minute ending 3m, processed at 6m10s
 			{at: 6*time.Minute + 10*time.Second, sampleAt: 2*time.Minute + 7*time.Second, metrics: tokensCost(20)},
 		}, 8*time.Minute)
-		checkMinutes(t, output, got, map[int]float64{5: 4, 6: 1 + 2 + 3, 7: 20}, 8)
+		checkMinutes(t, output, got, map[int]float64{6: 1 + 2 + 3 + 4, 7: 20}, 8)
 	}
 }
 
@@ -209,8 +210,8 @@ func TestSampleTimestampsTotalStaysACounter(t *testing.T) {
 			t.Fatalf("the counter goes back from %v to %v: %v", tok[i-1], tok[i], tok)
 		}
 	}
-	// the round of the minute ending 12m is its tail; the ten before it are late
-	checkMinutes(t, "sum_samples_total", got, map[int]float64{1: 1, 12: 1, 13: 10}, 14)
+	// the eleven rounds' minutes have all ended: they go to the one they are processed in
+	checkMinutes(t, "sum_samples_total", got, map[int]float64{1: 1, 13: 11}, 14)
 }
 
 // However far behind the aggregator is, an output holds only a few sums: the
@@ -435,20 +436,11 @@ func checkSampleTimestampsRules(t *testing.T, seed int64, output string, iv time
 		return
 	}
 
-	// Where each push goes, from when it was processed: the flushes run at the
-	// boundaries, and at once.
-	first := floor(0) // the interval before the start counts as written, by another process
+	// Where each push goes, from when it was processed: its own interval if
+	// that has not ended by the boundary before, else the one it is processed in.
 	want := map[time.Duration]float64{}
 	for _, p := range pushes {
-		e := end(min(p.sampleAt, p.at))
-		written := floor(p.at)
-		switch {
-		case e > written:
-		case e == written && written > first:
-		default:
-			e = written + iv
-		}
-		want[e] += p.value
+		want[max(end(min(p.sampleAt, p.at)), floor(p.at)+iv)] += p.value
 	}
 	for e := range ends {
 		if g := perInterval(output, got["tokens"], e, iv); g != want[e] {
@@ -491,9 +483,11 @@ func roundDuringTheFlush(t *testing.T, output string, scrapedAt, firstAt time.Du
 		// stops; armed and pushed are shared with it.
 		var a *Aggregators
 		var armed, pushed atomic.Bool
+		var calls atomic.Int64
 		var scraped int64
-		flushEntryHook = func() {
-			if armed.Load() && !pushed.Swap(true) {
+		flushEntryHook = func(*aggregator) {
+			// the second entry of the flush: one output is written, the other not
+			if armed.Load() && calls.Add(1) == 2 && !pushed.Swap(true) {
 				a.Push(prometheus.MustParsePromMetrics(tokensCost(2), scraped), nil)
 			}
 		}
@@ -551,5 +545,397 @@ func TestSampleTimestampsTotalTailAfterRestartOfTheTotal(t *testing.T) {
 	}
 	if v := got[len(got)-1].value; v != 5 {
 		t.Fatalf("want the total started again at 5 after 2m; got %v", got)
+	}
+}
+
+// Tokens and cost in rules of their own, as the _1m_by_* rules have them: each
+// rule is an aggregator flushing on its own, and one of them can be well into
+// the interval before its flush gets going. A round processed late in that
+// time goes to the same interval in both: where a late round goes follows from
+// when it is processed, decided once for every rule of the interval, not from
+// how far each rule's flush has got.
+func TestSampleTimestampsLateRoundSameIntervalAcrossRules(t *testing.T) {
+	for _, output := range stOutputs {
+		cfg := ""
+		for _, name := range []string{"tokens", "cost"} {
+			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+				"  staleness_interval: 40m\n  sample_timestamps: true\n"
+		}
+		got := map[string][]outSample{}
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			var mu sync.Mutex
+			var a *Aggregators
+			var held atomic.Bool
+			// The tokens rule's flush at 3m is held for ten seconds before it
+			// writes anything; the cost rule's goes ahead.
+			flushEntryHook = func(ag *aggregator) {
+				if ag == a.as[0] && time.Since(start) >= 3*time.Minute && !held.Swap(true) {
+					time.Sleep(10 * time.Second)
+				}
+			}
+			defer func() { flushEntryHook = nil }()
+			var err error
+			a, err = LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, ts := range tss {
+					for _, l := range ts.Labels {
+						if l.Name == "__name__" {
+							for _, s := range ts.Samples {
+								got[l.Value] = append(got[l.Value], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+							}
+						}
+					}
+				}
+			}, nil, "test")
+			if err != nil {
+				t.Fatalf("cannot load config: %s", err)
+			}
+			// an ordinary round first, so that both rules have an output to flush
+			time.Sleep(10 * time.Second)
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(1), start.Add(5*time.Second).UnixMilli()), nil)
+			time.Sleep(3*time.Minute + 5*time.Second - time.Since(start))
+			if !held.Load() {
+				t.Fatalf("the tokens rule's flush was not held")
+			}
+			// scraped in the minute ending 2m, processed in the one ending 4m
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(5), start.Add(70*time.Second).UnixMilli()), nil)
+			time.Sleep(6 * time.Minute)
+			a.MustStop()
+		})
+		for k := range got {
+			sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
+		}
+		checkMinutes(t, output, got, map[int]float64{1: 1, 4: 5}, 8)
+	}
+}
+
+// The tokens and the cost of every round in rules of their own, each flushing
+// at its own pace -- a flush held up for a while before some of its outputs, in
+// one rule and not the other -- and rounds processed up to two and a half
+// minutes late, some while a flush walks the outputs: in every key and interval
+// the cost is three times the tokens, across the two rules, and everything is
+// counted once.
+func TestSampleTimestampsRulesAcrossRules(t *testing.T) {
+	for seed := int64(1); seed <= 20; seed++ {
+		for _, output := range stOutputs {
+			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
+				checkAcrossRules(t, seed, output, iv)
+			}
+		}
+	}
+}
+
+func checkAcrossRules(t *testing.T, seed int64, output string, iv time.Duration) {
+	t.Helper()
+	name := fmt.Sprintf("seed=%d output=%s interval=%s", seed, output, iv)
+	cfg := ""
+	for _, m := range []string{"tokens", "cost"} {
+		cfg += fmt.Sprintf("- match: %s\n  interval: %s\n  by: [key]\n  outputs: [%s]\n  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", m, iv, output)
+	}
+	rnd := rand.New(rand.NewSource(seed))
+	type push struct {
+		at, sampleAt time.Duration
+		key          int
+		value        float64
+		split        time.Duration // the cost pushed this much after the tokens, 0 for one block
+	}
+	const minutes = 40
+	var pushes []push
+	offsets := []time.Duration{0, time.Millisecond, 13 * time.Second, 37 * time.Second, 59*time.Second + 999*time.Millisecond}
+	for m := 1; m < minutes; m++ {
+		for _, off := range offsets {
+			sampleAt := time.Duration(m)*time.Minute + off
+			delay := time.Duration(1+rnd.Intn(2000)) * time.Millisecond
+			if rnd.Intn(4) == 0 {
+				delay = time.Duration(rnd.Intn(150))*time.Second + time.Duration(1+rnd.Intn(999))*time.Millisecond
+			}
+			// A round is pushed in blocks: often its tokens in one and its cost in
+			// another, seconds later, which a boundary can fall between.
+			split := time.Duration(0)
+			if rnd.Intn(2) == 0 {
+				split = time.Duration(1+rnd.Intn(8000)) * time.Millisecond
+			}
+			pushes = append(pushes, push{at: sampleAt + delay, sampleAt: sampleAt, key: rnd.Intn(3), value: float64(1 + rnd.Intn(9)), split: split})
+		}
+	}
+	sort.SliceStable(pushes, func(i, j int) bool { return pushes[i].at < pushes[j].at })
+	holds := make([]time.Duration, 512) // what each entry flush in turn is held for, by rule
+	for i := range holds {
+		if rnd.Intn(5) == 0 {
+			holds[i] = time.Duration(1+rnd.Intn(30)) * time.Second
+		}
+	}
+
+	got := map[string][]outSample{} // by metric and key
+	var start time.Time
+	synctest.Test(t, func(t *testing.T) {
+		start = time.Now()
+		var mu sync.Mutex
+		var a *Aggregators
+		var calls [2]atomic.Int64
+		flushEntryHook = func(ag *aggregator) {
+			for i := range calls {
+				if ag == a.as[i] {
+					n := calls[i].Add(1)
+					time.Sleep(holds[(int(n)*2+i)%len(holds)])
+				}
+			}
+		}
+		defer func() { flushEntryHook = nil }()
+		var err error
+		a, err = LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, ts := range tss {
+				var metric, key string
+				for _, l := range ts.Labels {
+					switch l.Name {
+					case "__name__":
+						metric = l.Value
+					case "key":
+						key = l.Value
+					}
+				}
+				if i := strings.IndexByte(metric, ':'); i > 0 {
+					metric = metric[:i]
+				}
+				for _, s := range ts.Samples {
+					got[metric+"/"+key] = append(got[metric+"/"+key], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+				}
+			}
+		}, nil, "test")
+		if err != nil {
+			t.Fatalf("cannot load config: %s", err)
+		}
+		// the pushes in the order they are made, a split round's two blocks apart
+		type block struct {
+			at, sampleAt time.Duration
+			text         string
+		}
+		var blocks []block
+		for _, p := range pushes {
+			tok := fmt.Sprintf("tokens{key=\"k%d\"} %v", p.key, p.value)
+			cost := fmt.Sprintf("cost{key=\"k%d\"} %v", p.key, 3*p.value)
+			if p.split == 0 {
+				blocks = append(blocks, block{p.at, p.sampleAt, tok + "\n" + cost})
+			} else {
+				blocks = append(blocks, block{p.at, p.sampleAt, tok}, block{p.at + p.split, p.sampleAt, cost})
+			}
+		}
+		sort.SliceStable(blocks, func(i, j int) bool { return blocks[i].at < blocks[j].at })
+		for _, b := range blocks {
+			time.Sleep(start.Add(b.at).Sub(time.Now()))
+			a.Push(prometheus.MustParsePromMetrics(b.text, start.Add(b.sampleAt).UnixMilli()), nil)
+		}
+		time.Sleep(start.Add(minutes*time.Minute + 5*time.Minute).Sub(time.Now()))
+		a.MustStop()
+	})
+	for k := range got {
+		sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
+	}
+	all := map[int]float64{}
+	for _, p := range pushes {
+		all[p.key] += p.value
+	}
+	ends := map[time.Duration]bool{}
+	for k := range got {
+		for _, s := range got[k] {
+			ends[s.at.Truncate(time.Second)] = true
+		}
+	}
+	total := func(samples []outSample) float64 {
+		if output == "sum_samples" {
+			return sumIn(samples, -time.Hour, 2*time.Hour)
+		}
+		return increaseIn(samples, -time.Hour, 2*time.Hour)
+	}
+	for key := 0; key < 3; key++ {
+		tok, cost := got[fmt.Sprintf("tokens/k%d", key)], got[fmt.Sprintf("cost/k%d", key)]
+		if tt, cc := total(tok), total(cost); tt != all[key] || cc != 3*all[key] {
+			t.Errorf("%s: key k%d: tokens %v, cost %v; want %v and %v", name, key, tt, cc, all[key], 3*all[key])
+		}
+		for e := range ends {
+			a, b := perInterval(output, tok, e, iv), perInterval(output, cost, e, iv)
+			if b != 3*a {
+				t.Errorf("%s: key k%d: interval ending %s has tokens %v but cost %v: a round was split between the rules", name, key, e, a, b)
+			}
+		}
+		if output == "sum_samples_total" {
+			for _, s := range [][]outSample{tok, cost} {
+				for i := 1; i < len(s); i++ {
+					if s[i].value < s[i-1].value {
+						t.Fatalf("%s: key k%d: the counter goes back from %v to %v", name, key, s[i-1], s[i])
+					}
+				}
+			}
+		}
+	}
+}
+
+// A flush that runs over its interval leaves the next tick waiting, and the
+// flusher goes on with the next boundary right away -- before it is reached. A
+// rule must not take an interval for written before it has ended: a round
+// processed then would be the tail of the interval written last in the other
+// rules and late in this one, two intervals apart.
+func TestSampleTimestampsEarlyFlushStaysBehindTheClock(t *testing.T) {
+	// Aligned to the interval, the flusher drops the tick that waited; not
+	// aligned, it takes it and flushes at once, for a boundary not yet reached.
+	for _, align := range []string{"", "  no_align_flush_to_interval: true\n"} {
+		for _, output := range stOutputs {
+			earlyFlush(t, output, align)
+		}
+	}
+}
+
+func earlyFlush(t *testing.T, output, align string) {
+	t.Helper()
+	{
+		cfg := ""
+		for _, name := range []string{"tokens", "cost"} {
+			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+				"  staleness_interval: 40m\n  sample_timestamps: true\n" + align
+		}
+		got := map[string][]outSample{}
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			var mu sync.Mutex
+			var a *Aggregators
+			var held atomic.Bool
+			// The tokens rule's flush at 1m takes 90 seconds; the one at 2m then
+			// runs as soon as it is done, at 2m30s, for the boundary at 3m.
+			flushEntryHook = func(ag *aggregator) {
+				if ag == a.as[0] && !held.Swap(true) {
+					time.Sleep(90 * time.Second)
+				}
+			}
+			defer func() { flushEntryHook = nil }()
+			var err error
+			a, err = LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, ts := range tss {
+					for _, l := range ts.Labels {
+						if l.Name == "__name__" {
+							for _, s := range ts.Samples {
+								got[l.Value] = append(got[l.Value], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+							}
+						}
+					}
+				}
+			}, nil, "test")
+			if err != nil {
+				t.Fatalf("cannot load config: %s", err)
+			}
+			time.Sleep(10 * time.Second)
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(1), start.Add(5*time.Second).UnixMilli()), nil)
+			// a round of the minute ending 3m, before the early flush
+			time.Sleep(140*time.Second - time.Since(start))
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(2), start.Add(135*time.Second).UnixMilli()), nil)
+			// a round scraped in the minute ending 2m, processed at 2m40s, after its
+			// minute ended: the minute it is processed in, in every rule
+			time.Sleep(160*time.Second - time.Since(start))
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(5), start.Add(110*time.Second).UnixMilli()), nil)
+			time.Sleep(7*time.Minute - time.Since(start))
+			a.MustStop()
+		})
+		for k := range got {
+			sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
+		}
+		checkMinutes(t, output, got, map[int]float64{1: 1, 3: 2 + 5}, 7)
+		for _, s := range got["tokens"] {
+			if s.at%time.Minute != 0 {
+				t.Errorf("%s %q: %v written inside an interval, before it ended", output, align, s)
+			}
+		}
+	}
+}
+
+// A round whose interval has ended by the time it is processed, its tokens in
+// one block before a boundary and its cost in another after it, in rules of
+// their own: the round goes whole to one interval. Its interval is decided at
+// its first block and kept for the rest, rather than the first block being the
+// tail of its own interval and the second, a boundary later, late.
+func TestSampleTimestampsRoundInBlocksAcrossABoundary(t *testing.T) {
+	for _, output := range stOutputs {
+		cfg := ""
+		for _, name := range []string{"tokens", "cost"} {
+			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+				"  staleness_interval: 40m\n  sample_timestamps: true\n"
+		}
+		scraped := 70 * time.Second // in the minute ending 2m
+		got := runLateScenario(t, cfg, []latePush{
+			{at: 10 * time.Second, sampleAt: 5 * time.Second, metrics: tokensCost(1)},
+			{at: 150 * time.Second, sampleAt: scraped, metrics: `tokens 5`},
+			{at: 185 * time.Second, sampleAt: scraped, metrics: `cost 15`},
+		}, 6*time.Minute)
+		checkMinutes(t, output, got, map[int]float64{1: 1, 3: 5}, 6)
+	}
+}
+
+// A push decided before a flush and adding to an output after the flush has
+// written it -- a boundary between the two -- is taken for one decided after:
+// the flush waits for the pushes in progress. And every rule places a push by
+// the same reading of the clock, however long the push takes to go from one
+// rule to the next.
+func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
+	for _, output := range stOutputs {
+		cfg := ""
+		for _, name := range []string{"tokens", "cost"} {
+			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+				"  staleness_interval: 40m\n  sample_timestamps: true\n"
+		}
+		got := map[string][]outSample{}
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			var mu sync.Mutex
+			var a *Aggregators
+			var holdPush, holdFlush atomic.Bool
+			// The push is held for five seconds in the tokens rule, after it has
+			// been placed, from just before the boundary at 3m to after it; the
+			// cost rule's flush at 3m is held for ten.
+			pushHook = func(ag *aggregator) {
+				if ag == a.as[0] && holdPush.Load() && holdPush.CompareAndSwap(true, false) {
+					time.Sleep(5 * time.Second)
+				}
+			}
+			flushEntryHook = func(ag *aggregator) {
+				if ag == a.as[1] && time.Since(start) >= 3*time.Minute && !holdFlush.Swap(true) {
+					time.Sleep(10 * time.Second)
+				}
+			}
+			defer func() { pushHook, flushEntryHook = nil, nil }()
+			var err error
+			a, err = LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, ts := range tss {
+					for _, l := range ts.Labels {
+						if l.Name == "__name__" {
+							for _, s := range ts.Samples {
+								got[l.Value] = append(got[l.Value], outSample{time.UnixMilli(s.Timestamp).Sub(start), s.Value})
+							}
+						}
+					}
+				}
+			}, nil, "test")
+			if err != nil {
+				t.Fatalf("cannot load config: %s", err)
+			}
+			scraped := start.Add(100 * time.Second).UnixMilli() // in the minute ending 2m
+			time.Sleep(110 * time.Second)
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(1), scraped), nil)
+			// the rest of the round, a millisecond before the boundary at 3m
+			time.Sleep(3*time.Minute - time.Millisecond - time.Since(start))
+			holdPush.Store(true)
+			a.Push(prometheus.MustParsePromMetrics(tokensCost(2), scraped), nil)
+			time.Sleep(6*time.Minute - time.Since(start))
+			a.MustStop()
+		})
+		for k := range got {
+			sort.SliceStable(got[k], func(i, j int) bool { return got[k][i].at < got[k][j].at })
+		}
+		checkMinutes(t, output, got, map[int]float64{2: 3}, 6)
 	}
 }
