@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-三十六个补丁,**按编号顺序打**。004~027、030~033、035~039 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+三十七个补丁,**按编号顺序打**。004~027、030~033、035~040 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -44,13 +44,14 @@
 | `037-acg_streamaggr-sample-timestamps-across-rules` | 036 之后仍有的 ±:token 和费用分在不同规则(`_1m_by_*` 就是这样)时,vmagent 积压下一轮在两条规则里可能进不同分钟。一轮的去向改为在它第一块被任一规则处理时定下,本配置的所有规则共用;每次推送各规则用同一个时刻;刷出先等进行中的推送;刷出不会提前写一个还没结束的区间(第十七部分) | **必须**,036 之后打 |
 | `038-acg_vmagent-sample-timestamps-default-on` | `-remoteWrite.streamAggr.sampleTimestamps`、`-streamAggr.sampleTimestamps` 默认改为打开(第十八部分) | **必须**,要求 `-dedup.minScrapeInterval=1ms` |
 | `039-acg_promscrape-delta-final-ack` | vmagent 停止时给报增量的目标发最后一次确认:正在路上的那轮(边车已写出、vmagent 还没处理)回滚重报,而不是被下一个 vmagent 的 `new` 提交掉。此前每次重启、滚动发布赶上抓取都丢一轮(第十九部分) | **必须**,配合 client_golang v1.24.1025;对旧边车无影响 |
+| `040-acg_streamaggr-memory` | 流式聚合省内存:刷出每批 1000 条而不是 1 万条(102 条规则同时刷出,每条规则的缓冲在两次刷出之间一直留着);输出键不再进全局 intern 表;`sum_samples_total` 每条输出 80 → 64 字节。ACG 102 条规则下堆 1251 → 752 MiB(−40%),每条规则刷出 80 → 36 毫秒,输出逐字节不变(第二十部分) | 建议,纯内存与性能 |
 
 只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(14 个补丁碰它)和 `output.go`(10 个)。
+冲突热点是 `streamaggr.go`(15 个补丁碰它)和 `output.go`(11 个)。
 
 ## 基线:为什么是集群版
 
@@ -203,7 +204,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~十九节是 `030`~`039`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十节是 `030`~`040`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -828,3 +829,35 @@ vmagent 停止时,正在进行的抓取被取消。如果边车已经把响应�
 
 - 不用改配置;边车升级到 client_golang v1.24.1025 才生效。
 - 只覆盖正常停止(SIGTERM,含滚动发布)。崩溃、OOM、`kill -9` 时发不出最后一次确认,且 vmagent 内存里还没刷出的那一分钟也会丢,见「部署检查」。
+
+## 二十、流式聚合省内存(040)
+
+### 解决什么
+
+在实验集群真实边车响应 37% 的回放上(102 条生产规则,约 230 万条输出序列)取 vmagent 的堆,1128 MiB 里:
+刷出的缓冲约 290 MiB,全局 intern 表 205 MiB,`sum_samples_total` 每条输出的状态 186 MiB。
+
+### 改了什么
+
+- 刷出每 1000 条输出序列交给 push 一次,原来是 1 万条。102 条规则在同一时刻刷出,每条一个刷出上下文,放在池里留到下一分钟,
+  里面是一整批的标签和样本:原来合计约 290 MiB,常驻且每分钟再满一次。远程写自己再打成块,批小只是调用多。
+- 新输出条目的键改为复制一份,不再进全局 intern 表。键只在本规则的表里用,intern 表又为每个键多存一份引用,表本身约是字符串的四倍。
+- `sample_timestamps` 下 `sum_samples_total` 的状态内联、不再经指针,"写过"用上次写出的时间戳是否为 0 表示:每条输出 80 → 64 字节。
+
+### 已做的验证
+
+- 本机回放(真实响应 37%,3 个目标,102 条规则,各跑 6 分钟):
+
+  | | 堆 | 每条规则平均刷出 |
+  |---|---|---|
+  | 039 | 1251 MiB | 80 毫秒 |
+  | + 批 1000 条 | 978 MiB | 97 毫秒 |
+  | + 键不进 intern 表 | 759 MiB | 35 毫秒 |
+  | + 状态 64 字节 | **752 MiB** | 36 毫秒 |
+
+- 同样的轮次、同样的假时钟时刻,经 102 条规则,040 前后输出都是 2,887,061 个样本,逐字节相同(SHA-256 一致)。
+- 全部单测与随机测试通过,`-race` 通过。
+
+### 用法与约束
+
+- 不用改配置。vmagent 的内存 limit 暂按 `vm-side.md` 不变,生产灰度确认后再下调。

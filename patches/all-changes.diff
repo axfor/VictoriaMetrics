@@ -4580,11 +4580,14 @@ index 000000000..df96d560f
 +	}
 +}
 diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
-index 3fcb9f6a3..822d1d000 100644
+index 3fcb9f6a3..0252cbd89 100644
 --- a/lib/streamaggr/output.go
 +++ b/lib/streamaggr/output.go
-@@ -3,18 +3,66 @@ package streamaggr
+@@ -1,20 +1,69 @@
+ package streamaggr
+ 
  import (
++	"strings"
  	"sync"
  
 +	"github.com/cespare/xxhash/v2"
@@ -4653,7 +4656,7 @@ index 3fcb9f6a3..822d1d000 100644
  }
  
  func (ao *aggrOutputs) getInputOutputKey(key string) (string, string) {
-@@ -41,39 +89,30 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+@@ -41,39 +90,35 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
  		sample = &samples[i]
  		inputKey, outputKey = ao.getInputOutputKey(sample.key)
  
@@ -4672,7 +4675,12 @@ index 3fcb9f6a3..822d1d000 100644
 -			if ao.useSharedState {
 -				nv.green = make([]aggrValue, len(ao.configs))
 +			nv = ao.newAggrValues()
-+			key := bytesutil.InternString(outputKey)
++			// A copy of the key, not an interned one: the map holds it as long as
++			// the entry lives, and the intern map would hold a second reference to
++			// it, in a map of its own about four times the size of the strings, for
++			// a sharing that rules with the same output labels can only make use of
++			// for some of their keys.
++			key := strings.Clone(outputKey)
 +			sh.mu.Lock()
 +			if sh.m == nil {
 +				sh.m = make(map[string]*aggrValues)
@@ -4709,7 +4717,7 @@ index 3fcb9f6a3..822d1d000 100644
  			for idx, o := range outputs {
  				o.pushSample(ao.configs[idx], sample, inputKey, deleteDeadline)
  			}
-@@ -88,49 +127,204 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
+@@ -88,49 +133,204 @@ func (ao *aggrOutputs) pushSamples(samples []pushSample, deleteDeadline int64, i
  	}
  }
  
@@ -7039,7 +7047,7 @@ index af259b8c0..2128494f6 100644
 +// costs a hash and two string compares per label per sample, for nothing.
 +func (*stdAggrConfig) needsInputKey() bool { return false }
 diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
-index 2c9ccc38d..049e89325 100644
+index 2c9ccc38d..c11a6b77e 100644
 --- a/lib/streamaggr/streamaggr.go
 +++ b/lib/streamaggr/streamaggr.go
 @@ -47,6 +47,7 @@ var supportedOutputs = []string{
@@ -7889,7 +7897,23 @@ index 2c9ccc38d..049e89325 100644
  	return ctx
  }
  
-@@ -1162,6 +1692,13 @@ type flushCtx struct {
+@@ -1154,6 +1684,15 @@ func putFlushCtx(ctx *flushCtx) {
+ 
+ var flushCtxPool sync.Pool
+ 
++// flushBatchSeries is how many output series a flush hands to its push function
++// at a time. Every rule flushes at the same moment, each with a context of its
++// own, and the contexts are kept in flushCtxPool between flushes: what one holds
++// is what a batch needs, labels and samples for every series of it, and with 102
++// rules at 10_000 series each that was 290 MiB, held from one minute to the
++// next. Remote write packs the batches into blocks of its own, so a smaller
++// batch only means more calls.
++const flushBatchSeries = 1_000
++
+ type flushCtx struct {
+ 	a              *aggregator
+ 	ao             *aggrOutputs
+@@ -1162,6 +1701,13 @@ type flushCtx struct {
  	isGreen        bool
  	isLast         bool
  
@@ -7903,7 +7927,7 @@ index 2c9ccc38d..049e89325 100644
  	tss     []prompb.TimeSeries
  	labels  []prompb.Label
  	samples []prompb.Sample
-@@ -1174,6 +1711,8 @@ func (ctx *flushCtx) reset() {
+@@ -1174,6 +1720,8 @@ func (ctx *flushCtx) reset() {
  	ctx.isGreen = false
  	ctx.isLast = false
  	ctx.flushTimestamp = 0
@@ -7912,7 +7936,7 @@ index 2c9ccc38d..049e89325 100644
  	ctx.resetSeries()
  }
  
-@@ -1201,7 +1740,7 @@ func (ctx *flushCtx) flushSeries() {
+@@ -1201,7 +1749,7 @@ func (ctx *flushCtx) flushSeries() {
  		// Fast path - push the output metrics.
  		if ctx.pushFunc != nil {
  			ctx.pushFunc(tss)
@@ -7921,7 +7945,7 @@ index 2c9ccc38d..049e89325 100644
  		}
  		return
  	}
-@@ -1223,13 +1762,17 @@ func (ctx *flushCtx) flushSeries() {
+@@ -1223,13 +1771,17 @@ func (ctx *flushCtx) flushSeries() {
  	}
  	if ctx.pushFunc != nil {
  		ctx.pushFunc(dst)
@@ -7940,7 +7964,7 @@ index 2c9ccc38d..049e89325 100644
  	labelsLen := len(ctx.labels)
  	samplesLen := len(ctx.samples)
  	ctx.labels = decompressLabels(ctx.labels, key)
-@@ -1237,7 +1780,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+@@ -1237,7 +1789,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
  		ctx.labels = addMetricSuffix(ctx.labels, labelsLen, ctx.a.suffix, suffix)
  	}
  	ctx.samples = append(ctx.samples, prompb.Sample{
@@ -7949,10 +7973,16 @@ index 2c9ccc38d..049e89325 100644
  		Value:     value,
  	})
  	ctx.tss = append(ctx.tss, prompb.TimeSeries{
-@@ -1251,6 +1794,54 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
- 	}
- }
+@@ -1246,7 +1798,55 @@ func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {
+ 	})
  
+ 	// Limit the maximum length of ctx.tss in order to limit memory usage.
+-	if len(ctx.tss) >= 10_000 {
++	if len(ctx.tss) >= flushBatchSeries {
++		ctx.flushSeries()
++	}
++}
++
 +// samplesCount counts the samples in tss: a series carries several under
 +// sample_timestamps, one per pending interval, see beginSeries.
 +func samplesCount(tss []prompb.TimeSeries) int {
@@ -7996,14 +8026,19 @@ index 2c9ccc38d..049e89325 100644
 +		Labels:  ctx.labels[labelsLen:],
 +		Samples: ctx.samples[samplesLen:],
 +	})
-+	if len(ctx.tss) >= 10_000 {
-+		ctx.flushSeries()
-+	}
-+}
-+
- func (ctx *flushCtx) appendSeriesWithExtraLabel(key, suffix string, value float64, extraName, extraValue string) {
- 	labelsLen := len(ctx.labels)
- 	samplesLen := len(ctx.samples)
++	if len(ctx.tss) >= flushBatchSeries {
+ 		ctx.flushSeries()
+ 	}
+ }
+@@ -1272,7 +1872,7 @@ func (ctx *flushCtx) appendSeriesWithExtraLabel(key, suffix string, value float6
+ 	})
+ 
+ 	// Limit the maximum length of ctx.tss in order to limit memory usage.
+-	if len(ctx.tss) >= 10_000 {
++	if len(ctx.tss) >= flushBatchSeries {
+ 		ctx.flushSeries()
+ 	}
+ }
 diff --git a/lib/streamaggr/streamaggr_timing_test.go b/lib/streamaggr/streamaggr_timing_test.go
 index 01a4f5423..0fe01bcf7 100644
 --- a/lib/streamaggr/streamaggr_timing_test.go
@@ -8017,7 +8052,7 @@ index 01a4f5423..0fe01bcf7 100644
  	"total_prometheus",
  	"unique_samples",
 diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
-index 8ec63e679..4cb7af8b8 100644
+index 8ec63e679..0be3038c6 100644
 --- a/lib/streamaggr/sum_samples.go
 +++ b/lib/streamaggr/sum_samples.go
 @@ -1,5 +1,12 @@
@@ -8033,7 +8068,7 @@ index 8ec63e679..4cb7af8b8 100644
  type sumSamplesAggrValue struct {
  	sum float64
  }
-@@ -17,12 +24,436 @@ func (*sumSamplesAggrValue) state() any {
+@@ -17,12 +24,441 @@ func (*sumSamplesAggrValue) state() any {
  	return nil
  }
  
@@ -8360,9 +8395,7 @@ index 8ec63e679..4cb7af8b8 100644
 +	if c.sampleTimestamps {
 +		// sample_timestamps is refused together with enable_windows, the only
 +		// source of shared state.
-+		o := &sumSamplesTotalAtOwned{}
-+		o.v.shared = &o.shared
-+		return &o.v
++		return &sumSamplesTotalAtValue{}
 +	}
 +	if shared, ok := s.(*sumSamplesTotalShared); ok {
 +		return &sumSamplesTotalAggrValue{shared: shared}
@@ -8380,14 +8413,20 @@ index 8ec63e679..4cb7af8b8 100644
 +// at the same timestamp, with the bigger total, which VM's deduplication keeps;
 +// anything for an interval before that goes to the first interval not written,
 +// as a total written before one written already would look like a reset.
++//
++// It holds its state inline, 64 bytes in all: it is never shared, and written is
++// a lastWrittenAt other than 0, as no total is written at the Unix epoch. One of
++// these is kept for every output series, millions of them.
 +type sumSamplesTotalAtValue struct {
-+	shared  *sumSamplesTotalShared
 +	pending bySampleTime
++	sh      stTotal
 +}
 +
-+type sumSamplesTotalAtOwned struct {
-+	v      sumSamplesTotalAtValue
-+	shared sumSamplesTotalShared
++// stTotal is what sumSamplesTotalAtValue keeps of what it wrote.
++type stTotal struct {
++	total         float64
++	lastWritten   float64
++	lastWrittenAt int64 // 0: nothing written yet
 +}
 +
 +func (av *sumSamplesTotalAtValue) pushSample(_ aggrConfig, sample *pushSample, _ string, _ int64) {
@@ -8395,7 +8434,7 @@ index 8ec63e679..4cb7af8b8 100644
 +}
 +
 +func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string, _ bool) {
-+	sh := av.shared
++	sh := &av.sh
 +	st := &ctx.st
 +	labelsLen, samplesLen, started := 0, 0, false
 +	wrote := false
@@ -8406,7 +8445,7 @@ index 8ec63e679..4cb7af8b8 100644
 +			started = true
 +		}
 +		ctx.appendSample(at, v)
-+		sh.lastWritten, sh.lastWrittenAt, sh.written = v, at, true
++		sh.lastWritten, sh.lastWrittenAt = v, at
 +		wrote = true
 +	}
 +	slots := av.pending.take(ctx.slots[:0])
@@ -8416,7 +8455,7 @@ index 8ec63e679..4cb7af8b8 100644
 +	for i := range slots {
 +		x := &slots[i]
 +		switch {
-+		case x.ts == st.written && st.tailOK && x.sum >= 0 && (!sh.written || sh.lastWrittenAt <= x.ts && sh.total+x.sum >= sh.lastWritten):
++		case x.ts == st.written && st.tailOK && x.sum >= 0 && (sh.lastWrittenAt == 0 || sh.lastWrittenAt <= x.ts && sh.total+x.sum >= sh.lastWritten):
 +			// the tail of the interval written last: write it again, with it
 +			sh.total += x.sum
 +			write(x.ts, sh.total)
@@ -8436,12 +8475,12 @@ index 8ec63e679..4cb7af8b8 100644
 +			continue
 +		}
 +		sh.total += x.sum
-+		if sh.written && sh.total == sh.lastWritten {
++		if (sh.lastWrittenAt != 0) && sh.total == sh.lastWritten {
 +			continue
 +		}
 +		write(x.ts, sh.total)
 +	}
-+	if !wrote && sh.written {
++	if !wrote && (sh.lastWrittenAt != 0) {
 +		at := min(st.closing, ctx.now)
 +		hb := ctx.a.outputHeartbeatInterval.Milliseconds()
 +		if at > sh.lastWrittenAt && (hb <= 0 || at-sh.lastWrittenAt >= hb) {
@@ -8461,7 +8500,8 @@ index 8ec63e679..4cb7af8b8 100644
 +	}
 +}
 +
-+func (av *sumSamplesTotalAtValue) state() any { return av.shared }
++// state is nil: sample_timestamps is refused with enable_windows, the only user of shared state.
++func (av *sumSamplesTotalAtValue) state() any { return nil }
 +
 +func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }
 +
