@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-三十八个补丁,**按编号顺序打**。004~027、030~033、035~041 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+三十九个补丁,**按编号顺序打**。004~027、030~033、035~042 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -46,13 +46,14 @@
 | `039-acg_promscrape-delta-final-ack` | vmagent 停止时给报增量的目标发最后一次确认:正在路上的那轮(边车已写出、vmagent 还没处理)回滚重报,而不是被下一个 vmagent 的 `new` 提交掉。此前每次重启、滚动发布赶上抓取都丢一轮(第十九部分) | **必须**,配合 client_golang v1.24.1025;对旧边车无影响 |
 | `040-acg_streamaggr-memory` | 流式聚合省内存:刷出每批 1000 条而不是 1 万条(102 条规则同时刷出,每条规则的缓冲在两次刷出之间一直留着);输出键不再进全局 intern 表;`sum_samples_total` 每条输出 80 → 64 字节。ACG 102 条规则下堆 1251 → 752 MiB(−40%),每条规则刷出 80 → 36 毫秒,输出逐字节不变(第二十部分) | 建议,纯内存与性能 |
 | `041-acg_streamaggr-stop-one-time` | vmagent 停止(重启、发版)时,所有规则最后一次刷出用同一个时刻:原来每条规则各取各的时钟,tokens 和 cost 在不同规则里时,进行中的那一轮会写在相差几毫秒的两个时间戳上,查其中一个时刻只看到半轮(第二十一部分) | **必须**,配合 039 |
+| `042-acg_review-fixes` | 代码评审发现的问题:停止时最后一次确认只发给仍在抓取的目标、整体不超过超时(原来发给一小时内消失的 pod,拖住流式聚合的最后一次刷出);确认状态清理的无符号回绕;聚合配置重载时在途 push 不再落进已停止的聚合器或被当作原始数据写出;多个 `-remoteWrite.url` 时 `sample_timestamps` 默认关(无 1ms 去重的存储会重复计数);`final` 特性按整词匹配(第二十二部分) | **必须**,配合 client_golang v1.24.1027 |
 
 只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(16 个补丁碰它)和 `output.go`(11 个)。
+冲突热点是 `streamaggr.go`(17 个补丁碰它)和 `output.go`(11 个)。
 
 ## 基线:为什么是集群版
 
@@ -205,7 +206,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十一节是 `030`~`041`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十二节是 `030`~`042`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -887,3 +888,31 @@ vmagent 停止时,正在进行的抓取被取消。如果边车已经把响应�
 ### 用法与约束
 
 - 不用改配置。
+
+## 二十二、代码评审的修复(042,配合 client_golang v1.24.1027)
+
+### 解决什么
+
+对 v1.126.1029 ~ v1.126.1034 与 client_golang v1.24.1023 ~ v1.24.1026 做多角度评审,每个问题先复核确实存在,再修复,修复用"在旧代码上失败、在新代码上通过"的测试验证。
+
+| 问题 | 修复 | 验证 |
+|---|---|---|
+| 停止时最后一次确认发给一小时内所有出现过的目标,包括已消失的 pod,64 个一批、每个最多 5 秒,排在流式聚合最后一次刷出之前 | 只发给两个抓取间隔内抓过的目标,全部在超时内完成 | 130 个已消失目标:旧代码发了 133 个、新代码只发 2 个;200 个不应答目标、超时 0.3 秒:旧代码 1.22 秒,新代码 0.5 秒内 |
+| 确认状态的清理用无符号减法,抓取刚写入的时间比清理读到的"现在"晚一秒时会回绕,把在用的状态删掉 | 先比较再相减 | 旧代码删掉、新代码保留 |
+| 聚合配置重载先换上新聚合器再停旧的,已拿到旧聚合器的 push 会落进刷出完的旧聚合器(丢失),或在旧的被清空后什么都不匹配、被当作原始数据写出 | `Aggregators.TryPush`:停止时先等在途 push,之后的 push 被告知已停止,远程写改推给新聚合器 | 旧代码:被当作未聚合、原样写出;新代码:聚合一次 |
+| `sample_timestamps` 在同一时间戳重写一个区间,没有 `-dedup.minScrapeInterval=1ms` 的存储会保留两个点 | 不设置时:单个 `-remoteWrite.url` 默认开,多个默认关(全局聚合同样) | 本机集群:一个区间 150,无去重时算成 250 |
+| `final` 特性按子串匹配 | 按逗号分隔的整词匹配 | `nonfinal`、`finally` 不再匹配 |
+
+client_golang v1.24.1027 同时修复了评审中复核出的边车丢数:空闲清理删掉一个实例的同一时刻,刚取到它的调用方写入,这次写入原来会丢(并发测试在 v1.24.1026 上 60 次失败 8 次)。现在删掉的实例仍记录写入,下一次抓取时放回原处,或把未交付的部分按同一切点并入新实例。
+
+没有改的:增量响应解压两次。第二次解压保证一轮数据要么全部推送、要么一点不推,换成一次解压只能把整个解压后的响应(每个目标 0.6 ~ 1.7 GB)留在内存里;实测每 626 MB 多 0.15 秒(cgo)/ 0.27 秒(纯 Go)。
+
+### 已做的验证
+
+- 上表每一项都有新测试,在 v1.126.1034 上失败、在 042 上通过。
+- 同样的轮次经 102 条规则,输出 2,887,061 个样本,与 v1.126.1034 逐字节相同。
+- 全部单测通过,`-race` 通过。
+
+### 用法与约束
+
+- 单个 `-remoteWrite.url` 时不用改配置。写往多个存储且要 `sample_timestamps` 的,显式设置 `-remoteWrite.streamAggr.sampleTimestamps`,并确认每个存储都有 `-dedup.minScrapeInterval=1ms`。
