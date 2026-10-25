@@ -1,0 +1,106 @@
+From 5bfa727f76e5ff0d68df39a3f98a0851e7c8927d Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 25 Oct 2026 01:59:54 -0700
+Subject: [PATCH 35/35] app/vmagent/remotewrite: turn sample_timestamps on by
+ default
+
+-streamAggr.sampleTimestamps and -remoteWrite.streamAggr.sampleTimestamps are
+true unless set: the samples of one scrape stay in one interval in every
+aggregation, the tokens and the cost of a round in the same minute. As before
+the flags apply to the aggregations they can apply to -- sum_samples and
+sum_samples_total without dedup_interval or enable_windows -- and skip the
+others; an aggregation can turn it off with sample_timestamps: false, and the
+flags can be set to false. The storage needs -dedup.minScrapeInterval=1ms.
+---
+ .../sample_timestamps_default_test.go         | 28 +++++++++++++++++++
+ app/vmagent/remotewrite/streamaggr.go         | 21 ++++++++++----
+ 2 files changed, 44 insertions(+), 5 deletions(-)
+ create mode 100644 app/vmagent/remotewrite/sample_timestamps_default_test.go
+
+diff --git a/app/vmagent/remotewrite/sample_timestamps_default_test.go b/app/vmagent/remotewrite/sample_timestamps_default_test.go
+new file mode 100644
+index 000000000..970086fb8
+--- /dev/null
++++ b/app/vmagent/remotewrite/sample_timestamps_default_test.go
+@@ -0,0 +1,28 @@
++package remotewrite
++
++import "testing"
++
++// sample_timestamps is on unless turned off: not set, the flag is true for every
++// -remoteWrite.url; set once, it applies to all of them; set per url, to each.
++func TestSampleTimestampsOnByDefault(t *testing.T) {
++	saved := *streamAggrSampleTimestamps
++	defer func() { *streamAggrSampleTimestamps = saved }()
++	*streamAggrSampleTimestamps = nil
++	if !sampleTimestampsFor(0) || !sampleTimestampsFor(3) {
++		t.Fatal("not set: want true")
++	}
++	if err := streamAggrSampleTimestamps.Set("false"); err != nil {
++		t.Fatal(err)
++	}
++	if sampleTimestampsFor(0) || sampleTimestampsFor(2) {
++		t.Fatal("set once to false: want false for every url")
++	}
++	*streamAggrSampleTimestamps = nil
++	_ = streamAggrSampleTimestamps.Set("true,false")
++	if !sampleTimestampsFor(0) || sampleTimestampsFor(1) {
++		t.Fatal("per url: want true, false")
++	}
++	if !*streamAggrGlobalSampleTimestamps {
++		t.Fatal("-streamAggr.sampleTimestamps: want true by default")
++	}
++}
+diff --git a/app/vmagent/remotewrite/streamaggr.go b/app/vmagent/remotewrite/streamaggr.go
+index 6c66b18f2..0aeb97ff3 100644
+--- a/app/vmagent/remotewrite/streamaggr.go
++++ b/app/vmagent/remotewrite/streamaggr.go
+@@ -38,8 +38,9 @@ var (
+ 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
+-	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
+-		"at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
++	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", true, "Whether the global aggregators write sum_samples and sum_samples_total "+
++		"at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape stay in one interval in every aggregation. "+
++		"Applies to the aggregations it can apply to and skips the others. Needs -dedup.minScrapeInterval=1ms on the storage. "+
+ 		"Can be overridden per aggregation via sample_timestamps option")
+ 
+ 	// Per URL config
+@@ -69,8 +70,9 @@ var (
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
+ 	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
+-		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late "+
+-		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
++		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape "+
++		"stay in one interval in every aggregation. True when not set; applies to the aggregations it can apply to and skips the others. "+
++		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via sample_timestamps option")
+ )
+ 
+ // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
+@@ -255,7 +257,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
+ 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
+ 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
+ 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
+-		SampleTimestamps:     streamAggrSampleTimestamps.GetOptionalArg(idx),
++		SampleTimestamps:     sampleTimestampsFor(idx),
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)
+@@ -264,3 +266,12 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
+ 	}
+ 	return sas, nil
+ }
++
++// sampleTimestampsFor returns -remoteWrite.streamAggr.sampleTimestamps for the
++// -remoteWrite.url at idx: true when the flag is not set at all.
++func sampleTimestampsFor(idx int) bool {
++	if len(*streamAggrSampleTimestamps) == 0 {
++		return true
++	}
++	return streamAggrSampleTimestamps.GetOptionalArg(idx)
++}
+-- 
+2.50.1 (Apple Git-155)
+

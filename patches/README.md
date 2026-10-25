@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-三十三个补丁,**按编号顺序打**。004~027、030~033、035、036 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+三十五个补丁,**按编号顺序打**。004~027、030~033、035~038 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -41,13 +41,15 @@
 | `034-acg_httpserver-zstd-unwrap` | 028 的 zstd 响应包装补上 `Unwrap()`,`http.NewResponseController` 能像穿过 gzip 包装一样穿过它(第十四部分) | 建议,目前没有调用方依赖 |
 | `035-acg_promscrape-delta-ack-reload-whole-round` | 033 的两处漏洞:改了抓取配置(如 `sample_limit`)后新的抓取任务从 `new` 重新确认,边车把没处理的那轮提交掉;流式解析推了几块后才失败的增量轮次(超 `sample_limit`/`label_limit`、压缩数据中途损坏)被重报,已推的那几块算两次。现在确认状态按抓取地址保存,增量轮次先整份读一遍、能整份推才推(第十五部分) | **必须**,配合 033 |
 | `036-acg_streamaggr-sample-timestamps-rounds` | 重做 `sample_timestamps` 的归属:一轮的去向只由这一轮决定,每个输出、每条规则都一样;刚过边界的尾巴把那一分钟按同一时间戳重写完整,更晚的归到第一个还没写的分钟、每轮只定一次;每个区间只写一次且完整。修掉 032 里一轮跨刷出时 token 和费用分到两分钟的 ±、提前毫秒撞车丢数、边界抖动、与 `ignore_old_samples` 同用时静默丢数(第十六部分) | **必须**,打开 `sample_timestamps` 前打;打开后要求 vmselect、vmstorage 的 `-dedup.minScrapeInterval=1ms` |
+| `037-acg_streamaggr-sample-timestamps-across-rules` | 036 之后仍有的 ±:token 和费用分在不同规则(`_1m_by_*` 就是这样)时,vmagent 积压下一轮在两条规则里可能进不同分钟。一轮的去向改为在它第一块被任一规则处理时定下,本配置的所有规则共用;每次推送各规则用同一个时刻;刷出先等进行中的推送;刷出不会提前写一个还没结束的区间(第十七部分) | **必须**,036 之后打 |
+| `038-acg_vmagent-sample-timestamps-default-on` | `-remoteWrite.streamAggr.sampleTimestamps`、`-streamAggr.sampleTimestamps` 默认改为打开(第十八部分) | **必须**,要求 `-dedup.minScrapeInterval=1ms` |
 
 只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(13 个补丁碰它)和 `output.go`(9 个)。
+冲突热点是 `streamaggr.go`(14 个补丁碰它)和 `output.go`(10 个)。
 
 ## 基线:为什么是集群版
 
@@ -200,7 +202,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~十六节是 `030`~`036`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~十八节是 `030`~`038`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -745,4 +747,50 @@ stream aggregation 的 `total` 输出,某个输出 series 的输入全部停报�
 - vmagent 的 `extraArgs` 加 `remoteWrite.streamAggr.sampleTimestamps: "true"`;内存 limit 比不开时多给 1Gi。
 - vmselect、vmstorage 必须是 `-dedup.minScrapeInterval=1ms`:尾巴的重写靠它留下最大值。
 - 规则里不能有 `ignore_old_samples`。
-- 一轮的 token 和费用要么在同一条规则里,要么在间隔相同的规则里;间隔不同的规则本来就是不同的桶。
+- **更正**:036 只保证一轮在**同一条规则**的各个输出里落在同一个区间。token 和费用分在不同规则时(`_1m_by_*` 就是这样),
+  vmagent 积压下仍可能一条规则一分钟、另一条规则另一分钟——实验集群限 300m CPU 的回放里两条规则 400 个业务组·分钟有 200 个对不上。
+  由 `037` 修掉,必须一起打。
+
+## 十七、一轮在所有规则里落在同一个区间(037)
+
+### 解决什么
+
+036 之后,token 和费用分在不同规则(`_1m_by_*` 就是这样)时仍会出 ±。实验集群回放、vmagent 限 300m CPU(落后 60–180 秒)时,
+`acg_bg_cost_total_1m_by_bg` 和 `acg_cache_creation_tokens_1m_by_bg` 两条规则 400 个业务组·分钟里有 200 个轮数对不上:
+同一轮在一条规则里进了 05:58,在另一条里进了 06:00。原因有三:
+
+- 晚到的轮次去哪,看的是**这条规则**的刷出写到了哪。各规则按自己的节奏刷出,一轮正好赶上一条写完、另一条还没写,就分两路。
+- 一轮分块到达,后面的块各自重新判断:第一块被当成本分钟的尾巴,过了下一个边界才到的第二块被当成晚到,差了两分钟。
+- 一次推送从一条规则到下一条时各自读时钟;刷出也可能把刷出前就定好去向、刷出后才落进输出的块当成刷出后的。
+
+### 改了什么
+
+- 一轮去哪只看它自己:它抓取的那个区间在处理它之前的那个边界还没结束,就进那个区间;否则进处理它时所在的区间(这个区间还没有任何规则写过)。
+- 在这一轮**第一块被本配置任一规则处理时**定下,按抓取时间戳记在本配置所有规则共用的表里,这一轮后面的块、在每条规则里都去同一个区间。
+  表最多存 13 万轮,超出时按同样的规则放、但不再记(推送时间戳各不相同的数据才会撑满)。
+- 一次推送,各规则用同一个时刻。
+- 刷出先等正在进行的推送做完(推送从不等待),再写;并且不会把时钟还没走到终点的区间当成已写。
+- 只有一轮处理到它被放进的区间之后还超过一整个区间,后面的块才会再往后。
+
+### 已做的验证
+
+- 每个机制一个确定性测试:一条规则的刷出被卡住时到来的晚到轮次、一轮分两块跨边界落在两条规则里、一次推送跨刷出、
+  `no_align_flush_to_interval` 下的提前刷出;每个都在 037 之前的代码上失败。四个机制逐个故意破坏,各有测试失败。
+- 随机测试:token 和费用各一条规则,一轮常分两块、相隔数秒,各规则的刷出随机被卡住;20 个种子 × 两种输出 × 1m、7m,
+  037 之后 0 个分裂区间,之前 48 个。`-race` 通过。
+- 实验集群:同上的回放、限 300m CPU,落后 70–120 秒,两条规则 500 个业务组·分钟全部一致(037 之前 200 处不一致)。
+- 本机端到端:token、费用各一条规则,前两分钟每轮都被 `sample_limit` 拒掉、热加载解除、中途重启 vmagent、四成抓取晚答最多 40 秒;
+  2.45 亿 token 每个 key 合计准确,3.8 万个 key·分钟里费用 ≠ 3 × token 的为 0。
+- 一轮跨刷出拆开推送(测试 5):开时每分钟准确,不开时 ± 照旧出现。
+
+### 用法与约束
+
+- 和 036 一起打,不用改配置。
+- 积压时,一轮第一块被处理时它的分钟已经结束,就记到处理时的分钟;合计不变。
+
+## 十八、`sample_timestamps` 默认打开(038)
+
+- `-remoteWrite.streamAggr.sampleTimestamps`、`-streamAggr.sampleTimestamps` 不设时为真,照旧只作用于能用的规则
+  (`sum_samples`、`sum_samples_total`,且没有 `dedup_interval`、`enable_windows`),其余跳过。
+- 关掉:单条规则写 `sample_timestamps: false`,或把参数设为 `false`(只写一次即对所有 `-remoteWrite.url` 生效)。
+- 存储侧必须是 `-dedup.minScrapeInterval=1ms`。换回 036 之前的镜像时它默认是关的,行为随之退回。
