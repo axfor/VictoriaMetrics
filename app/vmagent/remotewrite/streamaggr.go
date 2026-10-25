@@ -38,8 +38,9 @@ var (
 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
-	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
-		"at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late still counts towards the interval it was scraped in. "+
+	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", true, "Whether the global aggregators write sum_samples and sum_samples_total "+
+		"at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape stay in one interval in every aggregation. "+
+		"Applies to the aggregations it can apply to and skips the others. Needs -dedup.minScrapeInterval=1ms on the storage. "+
 		"Can be overridden per aggregation via sample_timestamps option")
 
 	// Per URL config
@@ -69,8 +70,9 @@ var (
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
 	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
-		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so a sample processed late "+
-		"still counts towards the interval it was scraped in. Can be overridden per aggregation via sample_timestamps option")
+		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape "+
+		"stay in one interval in every aggregation. True when not set; applies to the aggregations it can apply to and skips the others. "+
+		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via sample_timestamps option")
 )
 
 // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
@@ -255,7 +257,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
-		SampleTimestamps:     streamAggrSampleTimestamps.GetOptionalArg(idx),
+		SampleTimestamps:     sampleTimestampsFor(idx),
 	}
 
 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)
@@ -263,4 +265,13 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
 		return nil, fmt.Errorf("cannot load -remoteWrite.streamAggr.config=%q: %w", path, err)
 	}
 	return sas, nil
+}
+
+// sampleTimestampsFor returns -remoteWrite.streamAggr.sampleTimestamps for the
+// -remoteWrite.url at idx: true when the flag is not set at all.
+func sampleTimestampsFor(idx int) bool {
+	if len(*streamAggrSampleTimestamps) == 0 {
+		return true
+	}
+	return streamAggrSampleTimestamps.GetOptionalArg(idx)
 }
