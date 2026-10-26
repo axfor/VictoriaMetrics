@@ -154,6 +154,8 @@ curl -s -m 5 -o /dev/null -w "%{http_code}\n" -H 'X-Prometheus-Delta-Ack: peek' 
 
 边车不用重新发版。采集侧按 [`vm-side.md`](vm-side.md) 的“回退”把抓取路径改回 `/metrics/cumulative`。
 
+网络策略：`kubectl -n acg-system delete networkpolicy model-router-metrics`。
+
 ---
 
 ## 出问题时

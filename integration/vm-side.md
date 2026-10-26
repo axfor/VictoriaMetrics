@@ -106,6 +106,7 @@ extraArgs:
 ```
 
 - `remoteWrite.queues` 取 12，不要调小。
+- vmagent 只有一个 `remoteWrite.url`（vm-insert）时照上面写。有多个时，`remoteWrite.streamAggr.sampleTimestamps` 按 `remoteWrite.url` 的顺序逐个写，如 `"true,false"`：只有按第 1 步配了 `-dedup.minScrapeInterval=1ms` 的存储写 `true`。
 - `remoteWrite.streamAggr.config` 如果你们现在写的是列表形式，保持你们的写法。
 
 **`extraScrapeConfigs`**：整段替换成下面这段。两个 job 都是你们现有的，只有标了 `# 改`、`# 新增` 的行不一样，其余照旧。
