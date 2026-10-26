@@ -113,9 +113,9 @@ VER=$(grep -m1 '^vm_app_version' <<<"$M" | sed -n 's/.*short_version="\([^"]*\)"
 if [ -n "$VER" ]; then ok "vm_app_version = $VER"
 else warn "vm_app_version 为空——镜像没走 Makefile 的 -X buildinfo.Version 注入。看下面的功能探针"; fi
 PN=$(sed -n 's/.*v1\.126\.10\([0-9][0-9]\)-cluster.*/\1/p' <<<"$VER")
-if [ -z "$PN" ]; then warn "认不出版本号,是不是 v1.126.1035-cluster 只能问镜像来源"
-elif [ "$PN" -ge 35 ]; then ok "版本 ≥ v1.126.1035-cluster"
-else bad "版本 $VER 低于 v1.126.1035-cluster,按 vm-side.md 第 2 步换镜像"; fi
+if [ -z "$PN" ]; then warn "认不出版本号,是不是 v1.126.1036-cluster 只能问镜像来源"
+elif [ "$PN" -ge 36 ]; then ok "版本 ≥ v1.126.1036-cluster"
+else bad "版本 $VER 低于 v1.126.1036-cluster,按 vm-side.md 第 2 步换镜像"; fi
 
 # 这三个名字上游一个都没有,出现即证明补丁在。
 has 'vm_streamaggr_skipped_unchanged_outputs_total' \
@@ -141,7 +141,7 @@ need() { # need <flag名> <期望值> <ok时的补充说明>
 need promscrape.zstdCompression true "(能带着这个 flag 启动就证明补丁 004 在——上游不认这个 flag,会启动失败)"
 need promscrape.maxScrapeSize   500MiB
 need remoteWrite.queues         12
-need remoteWrite.streamAggr.sampleTimestamps true
+need remoteWrite.streamAggr.scrapeTimeIntervals true
 ZC=$(fval zstd.encoderConcurrency "$F")
 [ -n "$ZC" ] && info "-zstd.encoderConcurrency=$ZC(显式设了)" \
              || info "zstd.encoderConcurrency 没显式设,走默认 1(补丁 024 把默认从 0 改成 1);默认值不会出现在 /flags"

@@ -1,6 +1,6 @@
 # API Key 用量统计 · vmagent / VM / ruler 上线手册
 
-版本：vmagent `v1.126.1035-cluster`、vm-select / vm-storage `v1.126.1027-cluster`（fork `github.com/axfor/VictoriaMetrics`）· ruler `v0.1.11`（Helm chart 0.1.14，仓库 `github.com/axfor/ruler`）
+版本：vmagent `v1.126.1036-cluster`、vm-select / vm-storage `v1.126.1027-cluster`（fork `github.com/axfor/VictoriaMetrics`）· ruler `v0.1.11`（Helm chart 0.1.14，仓库 `github.com/axfor/ruler`）
 
 按顺序做。每一步做完先跑“确认”，通过了再做下一步。边车那侧见 [`app-side.md`](app-side.md)。
 
@@ -77,12 +77,12 @@ curl -s -o /dev/null -D - -H 'Accept-Encoding: zstd, gzip;q=0.5' \
 
 ### 镜像
 
-这一步只换 vmagent。用 fork `github.com/axfor/VictoriaMetrics` 的 tag `v1.126.1035-cluster` 源码构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。vm-insert 的镜像不换。
+这一步只换 vmagent。用 fork `github.com/axfor/VictoriaMetrics` 的 tag `v1.126.1036-cluster` 源码构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。vm-insert 的镜像不换。
 
 **已经在用这个 fork 的 vmagent 的：**
 
-- `v1.126.1030-cluster` ~ `v1.126.1034-cluster`：只换镜像，下面的 values 不用动。
-- `v1.126.1029-cluster`：换镜像，`extraArgs` 里加上 `remoteWrite.streamAggr.sampleTimestamps: "true"`，内存改成下面的 5Gi / 7Gi。
+- `v1.126.1030-cluster` ~ `v1.126.1035-cluster`：换镜像，`extraArgs` 里的 `remoteWrite.streamAggr.sampleTimestamps` 改名为 `remoteWrite.streamAggr.scrapeTimeIntervals`（值不变），`model-router-metrics` 这个 job 加上 `scrape_offset: 55s`，其余 values 不用动。
+- `v1.126.1029-cluster`：换镜像，`extraArgs` 里加上 `remoteWrite.streamAggr.scrapeTimeIntervals: "true"`，内存改成下面的 5Gi / 7Gi。
 
 ### values.yaml
 
@@ -102,11 +102,11 @@ extraArgs:
   promscrape.maxScrapeSize: "500MiB"
   remoteWrite.queues: "12"
   remoteWrite.maxDiskUsagePerURL: "10GB"
-  remoteWrite.streamAggr.sampleTimestamps: "true"
+  remoteWrite.streamAggr.scrapeTimeIntervals: "true"
 ```
 
 - `remoteWrite.queues` 取 12，不要调小。
-- vmagent 只有一个 `remoteWrite.url`（vm-insert）时照上面写。有多个时，`remoteWrite.streamAggr.sampleTimestamps` 按 `remoteWrite.url` 的顺序逐个写，如 `"true,false"`：只有按第 1 步配了 `-dedup.minScrapeInterval=1ms` 的存储写 `true`。
+- vmagent 只有一个 `remoteWrite.url`（vm-insert）时照上面写。有多个时，`remoteWrite.streamAggr.scrapeTimeIntervals` 按 `remoteWrite.url` 的顺序逐个写，如 `"true,false"`：只有按第 1 步配了 `-dedup.minScrapeInterval=1ms` 的存储写 `true`。
 - `remoteWrite.streamAggr.config` 如果你们现在写的是列表形式，保持你们的写法。
 
 **`extraScrapeConfigs`**：整段替换成下面这段。两个 job 都是你们现有的，只有标了 `# 改`、`# 新增` 的行不一样，其余照旧。
@@ -145,6 +145,7 @@ extraScrapeConfigs:
     scrape_interval: 60s
     scrape_timeout: 50s             # 改
     scrape_align_interval: 60s      # 新增
+    scrape_offset: 55s              # 新增
     no_stale_markers: true          # 新增
     metrics_path: /metrics/usage    # 改
     kubernetes_sd_configs:
@@ -233,8 +234,8 @@ resources:
 ```sh
 kubectl -n acg-system logs deploy/victoria-metrics-agent --tail=100 | grep -iE 'fatal|not defined|cannot parse'   # 无输出
 kubectl -n acg-system get pod | grep victoria-metrics-agent                                                    # Running
-curl -s http://<vmagent>:8429/metrics | grep -o 'short_version="[^"]*"'                                        # short_version="v1.126.1035-cluster"
-curl -s http://<vmagent>:8429/flags | grep sampleTimestamps                                                    # -remoteWrite.streamAggr.sampleTimestamps="true"
+curl -s http://<vmagent>:8429/metrics | grep -o 'short_version="[^"]*"'                                        # short_version="v1.126.1036-cluster"
+curl -s http://<vmagent>:8429/flags | grep scrapeTimeIntervals                                                 # -remoteWrite.streamAggr.scrapeTimeIntervals="true"
 ```
 
 跑满一小时后：
@@ -376,7 +377,7 @@ kubectl apply -f old-rules.yaml
 
 然后把现有 ruler 扩回原来的副本数。
 
-**vmagent**：换回原来的镜像。原来的镜像早于 `v1.126.1028-cluster` 时，先在 `extraArgs` 里去掉 `remoteWrite.streamAggr.sampleTimestamps`，内存改回 6Gi。
+**vmagent**：换回原来的镜像，同时改 `extraArgs`：原来的镜像是 `v1.126.1028-cluster` ~ `v1.126.1035-cluster` 时，把 `remoteWrite.streamAggr.scrapeTimeIntervals` 改回 `remoteWrite.streamAggr.sampleTimestamps`（旧镜像不认新名，会启动失败）；早于 `v1.126.1028-cluster` 时，去掉这一行，内存改回 6Gi。
 
 **vm-select、vm-storage**：换回原来的镜像，并去掉 `-search.maxMetricIDsForDirectTSDBStatus` 那一行。vm-storage 一台一台地换。
 
@@ -410,19 +411,20 @@ kubectl apply -f old-rules.yaml
 
 | 现象 | 怎么办 |
 |---|---|
-| vmagent 启动即退出，日志 `cannot parse stream aggregation config` 或 `sum_samples_total`、`output_heartbeat_interval` 不认识 | vmagent 镜像不是 `v1.126.1035-cluster` 构建的，按第 2 步换镜像 |
+| vmagent 启动即退出，日志 `cannot parse stream aggregation config` 或 `sum_samples_total`、`output_heartbeat_interval` 不认识 | vmagent 镜像不是 `v1.126.1036-cluster` 构建的，按第 2 步换镜像 |
+| vmagent 启动即退出，日志 `flag provided but not defined: -remoteWrite.streamAggr.scrapeTimeIntervals` | 镜像早于 `v1.126.1036-cluster`：按第 2 步换镜像，或把这一行改回 `remoteWrite.streamAggr.sampleTimestamps` |
 | vmagent 启动即退出，日志 `flag provided but not defined` | `extraArgs` 里有多余参数（如 `zstd.encoderConcurrency`），按第 2 步整段替换 |
 | vmagent 启动即退出，日志 `cannot be combined with ignore_old_samples` | 删掉那条规则里的 `ignore_old_samples` |
 | 用量数字翻倍 | `usage.yaml` 第一条的 `_metric_type!=""` 漏了，按第 2 步整个文件替换 |
 | 查到带 `pod` 标签的 `acg_*` 序列 | relabel 里新加了按 pod 区分的标签。把它同时加进 `usage.yaml` 第一条的 `drop_input_labels` 和第二条的 `without` |
 | gauge 的值只有实际的约 1/3 | 第二条规则把 `pod` 写进了 `drop_input_labels`，按第 2 步改回 `without` |
 | vmagent 内存远高于 7Gi | 补上 `no_stale_markers: true`，去掉 `sample_limit`、`series_limit`，按第 2 步改 |
-| vmagent 被 OOMKilled | 内存按第 2 步给 7Gi，下调过的先改回 7Gi。7Gi 仍被杀：在 `extraArgs` 里去掉 `remoteWrite.streamAggr.sampleTimestamps` 应急，并把被杀前的内存曲线发回来 |
+| vmagent 被 OOMKilled | 内存按第 2 步给 7Gi，下调过的先改回 7Gi。7Gi 仍被杀：在 `extraArgs` 里去掉 `remoteWrite.streamAggr.scrapeTimeIntervals` 应急，并把被杀前的内存曲线发回来 |
 | vmagent 日志 `exceeds sample_limit` 或 `exceeding label_limit` | 按第 2 步去掉 `sample_limit` / `label_limit` |
 | VM 里突然没有新用量数据，但 `up` 是 1 | `vm_promscrape_max_scrape_size_exceeded_errors_total` 非零：`promscrape.maxScrapeSize` 设成 500MiB 并 `helm upgrade` vmagent |
-| vmagent 抓边车偶尔超时（`up` 偶尔为 0） | 确认 vmagent 是 `v1.126.1035-cluster`、边车是 `v1.24.1027`，不是就换版本 |
-| 每次 vmagent 重启或发版后，用量比边车实际少一分钟左右 | vmagent 换到 `v1.126.1035-cluster`、边车换到 `v1.24.1027`；`_1m_by_*` 规则按第 2 步补上 `flush_on_shutdown: true` |
-| vmagent 重启那一刻，某个时间点上只有费用、没有 token（或反过来） | vmagent 换到 `v1.126.1035-cluster` |
+| vmagent 抓边车偶尔超时（`up` 偶尔为 0） | 确认 vmagent 是 `v1.126.1036-cluster`、边车是 `v1.24.1027`，不是就换版本 |
+| 每次 vmagent 重启或发版后，用量比边车实际少一分钟左右 | vmagent 换到 `v1.126.1036-cluster`、边车换到 `v1.24.1027`；`_1m_by_*` 规则按第 2 步补上 `flush_on_shutdown: true` |
+| vmagent 重启那一刻，某个时间点上只有费用、没有 token（或反过来） | vmagent 换到 `v1.126.1036-cluster` |
 | 看板分钟曲线时有空缺、尖刺，整点前后的小时数对不上；或某几分钟用量是 0、下一分钟翻倍 | vmagent 跟不上：按第 2 步的“确认”看落后和 `flush_timeouts`，CPU 请求给到 2 核，需要时再加 |
 | vm-storage 被 OOMKilled | 核对第 1 步的 8Gi 和 `-memory.allowedPercent=35` |
 | vm-storage 启动即退出，日志 `flag provided but not defined: -search.maxMetricIDsForDirectTSDBStatus` | 按第 1 步换镜像，或者先去掉这一行 |

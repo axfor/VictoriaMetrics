@@ -97,7 +97,7 @@ resources:
 
 ## 4. 上线顺序
 
-1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vmagent 要是 `v1.126.1035-cluster`）。
+1. 先做完 [`vm-side.md`](vm-side.md) 的第 1、2 步（vmagent 要是 `v1.126.1036-cluster`）。
 2. 紧接着发这个版本的边车，两步连着做。
 3. 发完后检查：
 
