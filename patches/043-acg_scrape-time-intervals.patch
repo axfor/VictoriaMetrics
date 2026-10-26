@@ -1,0 +1,1385 @@
+From a22fb52fe5c52613d0d76b303a705868a8dd8063 Mon Sep 17 00:00:00 2001
+From: axfor <aixiaoxiang2009@hotmail.com>
+Date: Sun, 25 Oct 2026 20:12:23 -0700
+Subject: [PATCH 40/40] lib/streamaggr, app/vmagent: flush on the grid, renamed
+ scrape_time_intervals
+
+A hard kill of vmagent in the lab, kill -9 during traffic, lost up to two
+minutes of usage each time: everything aggregated and not yet flushed. With
+flush_on_shutdown, which ACG sets on every rule, the flushes kept the phase of
+the process's start, and an interval that had ended waited up to another one
+for its flush.
+
+- Under sample_timestamps a rule now flushes on the grid of its own interval,
+  whatever its flush_on_shutdown: an interval is written as soon as it ends,
+  and a process killed outright takes the interval in progress with it, not
+  two. A rule without it keeps the phase of its start, as before, its outputs
+  stamped with the flush's time.
+- The flush ticker keeps the monotonic clock, and the wall clock drifts from
+  it and is corrected against it (by 1.1 s every 30 s on a lab node): a tick a
+  moment before the boundary by the wall clock left the interval that had just
+  ended to the next flush, an interval later. The flush waits for the wall
+  clock to get to the boundary.
+- sample_timestamps is renamed scrape_time_intervals, which says what it does:
+  every sample goes to the interval it was scraped in. The flags are
+  -remoteWrite.streamAggr.scrapeTimeIntervals and
+  -streamAggr.scrapeTimeIntervals. The former names still work, with a warning;
+  the two set to different values in a rule are refused.
+
+Each has a test that fails on v1.126.1035-cluster and passes now. In the lab,
+two hard kills during 13 minutes of traffic lost 3,227 of 12,778 requests
+before and none of 12,877 now, the round in progress at each kill having been
+flushed already.
+---
+ .../sample_timestamps_default_test.go         |  53 -----
+ .../scrape_time_intervals_default_test.go     |  99 +++++++++
+ app/vmagent/remotewrite/streamaggr.go         |  85 +++++---
+ .../stream-aggregation/configuration.md       |  18 +-
+ lib/streamaggr/output.go                      |   4 +-
+ ...go => scrape_time_intervals_rules_test.go} | 192 +++++++++++++++---
+ ..._test.go => scrape_time_intervals_test.go} |  38 ++--
+ ...o => scrape_time_intervals_timing_test.go} |   8 +-
+ lib/streamaggr/streamaggr.go                  | 138 +++++++++----
+ lib/streamaggr/sum_samples.go                 |  28 +--
+ 10 files changed, 466 insertions(+), 197 deletions(-)
+ delete mode 100644 app/vmagent/remotewrite/sample_timestamps_default_test.go
+ create mode 100644 app/vmagent/remotewrite/scrape_time_intervals_default_test.go
+ rename lib/streamaggr/{sample_timestamps_rules_test.go => scrape_time_intervals_rules_test.go} (84%)
+ rename lib/streamaggr/{sample_timestamps_test.go => scrape_time_intervals_test.go} (91%)
+ rename lib/streamaggr/{sample_timestamps_timing_test.go => scrape_time_intervals_timing_test.go} (89%)
+
+diff --git a/app/vmagent/remotewrite/sample_timestamps_default_test.go b/app/vmagent/remotewrite/sample_timestamps_default_test.go
+deleted file mode 100644
+index 2d12cd394..000000000
+--- a/app/vmagent/remotewrite/sample_timestamps_default_test.go
++++ /dev/null
+@@ -1,53 +0,0 @@
+-package remotewrite
+-
+-import (
+-	"flag"
+-	"testing"
+-)
+-
+-// Not set, sample_timestamps is on with a single -remoteWrite.url and off with
+-// several, whose storages may not deduplicate; set once, the flag applies to
+-// every url; set per url, to each.
+-func TestSampleTimestampsByDefault(t *testing.T) {
+-	savedURLs, saved := *remoteWriteURLs, *streamAggrSampleTimestamps
+-	defer func() { *remoteWriteURLs, *streamAggrSampleTimestamps = savedURLs, saved }()
+-
+-	*streamAggrSampleTimestamps = nil
+-	*remoteWriteURLs = []string{"http://vm-insert/write"}
+-	if !sampleTimestampsFor(0) || !globalSampleTimestamps() {
+-		t.Fatal("not set, one url: want true")
+-	}
+-	*remoteWriteURLs = []string{"http://vm-insert/write", "http://other/write"}
+-	if sampleTimestampsFor(0) || sampleTimestampsFor(1) || globalSampleTimestamps() {
+-		t.Fatal("not set, two urls: want false")
+-	}
+-	if err := streamAggrSampleTimestamps.Set("true"); err != nil {
+-		t.Fatal(err)
+-	}
+-	if !sampleTimestampsFor(0) || !sampleTimestampsFor(1) {
+-		t.Fatal("set once to true, two urls: want true for every url")
+-	}
+-	*streamAggrSampleTimestamps = nil
+-	_ = streamAggrSampleTimestamps.Set("true,false")
+-	if !sampleTimestampsFor(0) || sampleTimestampsFor(1) {
+-		t.Fatal("per url: want true, false")
+-	}
+-	*remoteWriteURLs = []string{"http://vm-insert/write"}
+-	*streamAggrSampleTimestamps = nil
+-	_ = streamAggrSampleTimestamps.Set("false")
+-	if sampleTimestampsFor(0) {
+-		t.Fatal("set to false, one url: want false")
+-	}
+-
+-	savedGlobal := *streamAggrGlobalSampleTimestamps
+-	defer func() {
+-		_ = flag.Set("streamAggr.sampleTimestamps", "false")
+-		*streamAggrGlobalSampleTimestamps = savedGlobal
+-	}()
+-	if err := flag.Set("streamAggr.sampleTimestamps", "false"); err != nil {
+-		t.Fatal(err)
+-	}
+-	if globalSampleTimestamps() {
+-		t.Fatal("-streamAggr.sampleTimestamps=false, one url: want false")
+-	}
+-}
+diff --git a/app/vmagent/remotewrite/scrape_time_intervals_default_test.go b/app/vmagent/remotewrite/scrape_time_intervals_default_test.go
+new file mode 100644
+index 000000000..1cf062acc
+--- /dev/null
++++ b/app/vmagent/remotewrite/scrape_time_intervals_default_test.go
+@@ -0,0 +1,99 @@
++package remotewrite
++
++import (
++	"flag"
++	"testing"
++)
++
++// Not set, scrape_time_intervals is on with a single -remoteWrite.url and off with
++// several, whose storages may not deduplicate; set once, the flag applies to
++// every url; set per url, to each.
++func TestScrapeTimeIntervalsByDefault(t *testing.T) {
++	savedURLs, saved := *remoteWriteURLs, *streamAggrScrapeTimeIntervals
++	defer func() { *remoteWriteURLs, *streamAggrScrapeTimeIntervals = savedURLs, saved }()
++
++	*streamAggrScrapeTimeIntervals = nil
++	*remoteWriteURLs = []string{"http://vm-insert/write"}
++	if !scrapeTimeIntervalsFor(0) || !globalScrapeTimeIntervals() {
++		t.Fatal("not set, one url: want true")
++	}
++	*remoteWriteURLs = []string{"http://vm-insert/write", "http://other/write"}
++	if scrapeTimeIntervalsFor(0) || scrapeTimeIntervalsFor(1) || globalScrapeTimeIntervals() {
++		t.Fatal("not set, two urls: want false")
++	}
++	if err := streamAggrScrapeTimeIntervals.Set("true"); err != nil {
++		t.Fatal(err)
++	}
++	if !scrapeTimeIntervalsFor(0) || !scrapeTimeIntervalsFor(1) {
++		t.Fatal("set once to true, two urls: want true for every url")
++	}
++	*streamAggrScrapeTimeIntervals = nil
++	_ = streamAggrScrapeTimeIntervals.Set("true,false")
++	if !scrapeTimeIntervalsFor(0) || scrapeTimeIntervalsFor(1) {
++		t.Fatal("per url: want true, false")
++	}
++	*remoteWriteURLs = []string{"http://vm-insert/write"}
++	*streamAggrScrapeTimeIntervals = nil
++	_ = streamAggrScrapeTimeIntervals.Set("false")
++	if scrapeTimeIntervalsFor(0) {
++		t.Fatal("set to false, one url: want false")
++	}
++
++	savedGlobal := *streamAggrGlobalScrapeTimeIntervals
++	defer func() {
++		_ = flag.Set("streamAggr.scrapeTimeIntervals", "false")
++		*streamAggrGlobalScrapeTimeIntervals = savedGlobal
++	}()
++	if err := flag.Set("streamAggr.scrapeTimeIntervals", "false"); err != nil {
++		t.Fatal(err)
++	}
++	if globalScrapeTimeIntervals() {
++		t.Fatal("-streamAggr.scrapeTimeIntervals=false, one url: want false")
++	}
++}
++
++// The former names of the flags, -remoteWrite.streamAggr.sampleTimestamps and
++// -streamAggr.sampleTimestamps, still work; the new ones take precedence.
++func TestScrapeTimeIntervalsFormerFlagNames(t *testing.T) {
++	savedURLs, saved, savedOld := *remoteWriteURLs, *streamAggrScrapeTimeIntervals, *streamAggrSampleTimestamps
++	defer func() {
++		*remoteWriteURLs, *streamAggrScrapeTimeIntervals, *streamAggrSampleTimestamps = savedURLs, saved, savedOld
++	}()
++	*remoteWriteURLs = []string{"http://vm-insert/write"}
++	*streamAggrScrapeTimeIntervals, *streamAggrSampleTimestamps = nil, nil
++	_ = streamAggrSampleTimestamps.Set("false")
++	if scrapeTimeIntervalsFor(0) {
++		t.Fatal("-remoteWrite.streamAggr.sampleTimestamps=false alone: want false")
++	}
++	_ = streamAggrScrapeTimeIntervals.Set("true")
++	if !scrapeTimeIntervalsFor(0) {
++		t.Fatal("both set: want the new name's true")
++	}
++
++	savedGlobal, savedGlobalOld := *streamAggrGlobalScrapeTimeIntervals, *streamAggrGlobalSampleTimestamps
++	defer func() {
++		*streamAggrGlobalScrapeTimeIntervals, *streamAggrGlobalSampleTimestamps = savedGlobal, savedGlobalOld
++		visitSetFlags = flag.Visit
++	}()
++	setOnly := func(names ...string) {
++		visitSetFlags = func(fn func(*flag.Flag)) {
++			for _, n := range names {
++				fn(&flag.Flag{Name: n})
++			}
++		}
++	}
++	*streamAggrGlobalScrapeTimeIntervals, *streamAggrGlobalSampleTimestamps = false, false
++	setOnly()
++	if !globalScrapeTimeIntervals() {
++		t.Fatal("neither set, one url: want true")
++	}
++	setOnly("streamAggr.sampleTimestamps")
++	if globalScrapeTimeIntervals() {
++		t.Fatal("-streamAggr.sampleTimestamps=false alone: want false")
++	}
++	*streamAggrGlobalScrapeTimeIntervals = true
++	setOnly("streamAggr.sampleTimestamps", "streamAggr.scrapeTimeIntervals")
++	if !globalScrapeTimeIntervals() {
++		t.Fatal("both set: want the new name's true")
++	}
++}
+diff --git a/app/vmagent/remotewrite/streamaggr.go b/app/vmagent/remotewrite/streamaggr.go
+index b7919966a..311f0353e 100644
+--- a/app/vmagent/remotewrite/streamaggr.go
++++ b/app/vmagent/remotewrite/streamaggr.go
+@@ -4,6 +4,7 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+@@ -39,11 +40,12 @@ var (
+ 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
+-	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
++	streamAggrGlobalScrapeTimeIntervals = flag.Bool("streamAggr.scrapeTimeIntervals", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
+ 		"at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape stay in one interval in every aggregation. "+
+ 		"Not set, it is true when there is a single -remoteWrite.url and false with several. "+
+ 		"Applies to the aggregations it can apply to and skips the others. Needs -dedup.minScrapeInterval=1ms on every storage written to. "+
+-		"Can be overridden per aggregation via sample_timestamps option")
++		"Can be overridden per aggregation via scrape_time_intervals option")
++	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Deprecated: the former name of -streamAggr.scrapeTimeIntervals, which takes precedence when both are set")
+ 
+ 	// Per URL config
+ 	streamAggrConfig = flagutil.NewArrayString("remoteWrite.streamAggr.config", "Optional path to file with stream aggregation config for the corresponding -remoteWrite.url. "+
+@@ -71,11 +73,13 @@ var (
+ 	streamAggrEnableWindows = flagutil.NewArrayBool("remoteWrite.streamAggr.enableWindows", "Enables aggregation within fixed windows for all remote write's aggregators. "+
+ 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
+ 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
+-	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
++	streamAggrScrapeTimeIntervals = flagutil.NewArrayBool("remoteWrite.streamAggr.scrapeTimeIntervals", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
+ 		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape "+
+ 		"stay in one interval in every aggregation. Not set, it is true when there is a single -remoteWrite.url and false with several; "+
+ 		"applies to the aggregations it can apply to and skips the others. "+
+-		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via sample_timestamps option")
++		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via scrape_time_intervals option")
++	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Deprecated: the former name of -remoteWrite.streamAggr.scrapeTimeIntervals, "+
++		"which takes precedence when both are set")
+ )
+ 
+ // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
+@@ -225,7 +229,7 @@ func newStreamAggrConfigGlobal() (*streamaggr.Aggregators, error) {
+ 		IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
+ 		KeepInput:            *streamAggrGlobalKeepInput,
+ 		EnableWindows:        *streamAggrGlobalEnableWindows,
+-		SampleTimestamps:     globalSampleTimestamps(),
++		ScrapeTimeIntervals:  globalScrapeTimeIntervals(),
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushTimeSeriesToRemoteStoragesTrackDropped, opts, "global")
+@@ -260,7 +264,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
+ 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
+ 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
+ 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
+-		SampleTimestamps:     sampleTimestampsFor(idx),
++		ScrapeTimeIntervals:  scrapeTimeIntervalsFor(idx),
+ 	}
+ 
+ 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)
+@@ -270,39 +274,74 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
+ 	return sas, nil
+ }
+ 
+-// sampleTimestampsByDefault is whether sample_timestamps is on where its flags
++// scrapeTimeIntervalsByDefault is whether scrape_time_intervals is on where its flags
+ // are not set: with a single -remoteWrite.url, whose storage the deployment runs
+-// with -dedup.minScrapeInterval=1ms. sample_timestamps writes an interval again
++// with -dedup.minScrapeInterval=1ms. scrape_time_intervals writes an interval again
+ // at the same timestamp, and a storage without it keeps both samples and counts
+ // the interval twice; with several urls, it is turned on explicitly.
+-func sampleTimestampsByDefault() bool {
++func scrapeTimeIntervalsByDefault() bool {
+ 	return len(*remoteWriteURLs) == 1
+ }
+ 
+-// sampleTimestampsFor returns -remoteWrite.streamAggr.sampleTimestamps for the
+-// -remoteWrite.url at idx, see sampleTimestampsByDefault when it is not set.
+-func sampleTimestampsFor(idx int) bool {
+-	if len(*streamAggrSampleTimestamps) == 0 {
+-		return sampleTimestampsByDefault()
++// scrapeTimeIntervalsFor returns -remoteWrite.streamAggr.scrapeTimeIntervals for the
++// -remoteWrite.url at idx, see scrapeTimeIntervalsByDefault when it is not set.
++func scrapeTimeIntervalsFor(idx int) bool {
++	switch {
++	case len(*streamAggrScrapeTimeIntervals) > 0:
++		if len(*streamAggrSampleTimestamps) > 0 {
++			warnFormerName("-remoteWrite.streamAggr.sampleTimestamps", "-remoteWrite.streamAggr.scrapeTimeIntervals", true)
++		}
++		return streamAggrScrapeTimeIntervals.GetOptionalArg(idx)
++	case len(*streamAggrSampleTimestamps) > 0:
++		warnFormerName("-remoteWrite.streamAggr.sampleTimestamps", "-remoteWrite.streamAggr.scrapeTimeIntervals", false)
++		return streamAggrSampleTimestamps.GetOptionalArg(idx)
+ 	}
+-	return streamAggrSampleTimestamps.GetOptionalArg(idx)
++	return scrapeTimeIntervalsByDefault()
+ }
+ 
+-// globalSampleTimestamps returns -streamAggr.sampleTimestamps, see
+-// sampleTimestampsByDefault when it is not set.
+-func globalSampleTimestamps() bool {
+-	set := false
+-	flag.Visit(func(f *flag.Flag) {
+-		if f.Name == "streamAggr.sampleTimestamps" {
++// globalScrapeTimeIntervals returns -streamAggr.scrapeTimeIntervals, see
++// scrapeTimeIntervalsByDefault when it is not set.
++func globalScrapeTimeIntervals() bool {
++	set, oldSet := false, false
++	visitSetFlags(func(f *flag.Flag) {
++		switch f.Name {
++		case "streamAggr.scrapeTimeIntervals":
+ 			set = true
++		case "streamAggr.sampleTimestamps":
++			oldSet = true
+ 		}
+ 	})
+-	if set {
++	switch {
++	case set:
++		if oldSet {
++			warnFormerName("-streamAggr.sampleTimestamps", "-streamAggr.scrapeTimeIntervals", true)
++		}
++		return *streamAggrGlobalScrapeTimeIntervals
++	case oldSet:
++		warnFormerName("-streamAggr.sampleTimestamps", "-streamAggr.scrapeTimeIntervals", false)
+ 		return *streamAggrGlobalSampleTimestamps
+ 	}
+-	return sampleTimestampsByDefault()
++	return scrapeTimeIntervalsByDefault()
++}
++
++// visitSetFlags is flag.Visit, which tests replace: a flag set once stays set.
++var visitSetFlags = flag.Visit
++
++// warnFormerName logs that a flag was given its former name, once a process
++// for each.
++func warnFormerName(former, name string, both bool) {
++	if _, warned := formerNamesWarned.LoadOrStore(former, true); warned {
++		return
++	}
++	if both {
++		logger.Warnf("%s is the former name of %s, which is set too and takes precedence; drop %s", former, name, former)
++		return
++	}
++	logger.Warnf("%s is the former name of %s; it still works, rename it", former, name)
+ }
+ 
++var formerNamesWarned sync.Map
++
+ // pushToStreamAggr pushes tss to sas, the aggregators loaded from p, and
+ // reports whether any aggregation was configured to take them. A config reload
+ // puts the new aggregators in p before it stops the old ones: a push that loaded
+diff --git a/docs/victoriametrics/stream-aggregation/configuration.md b/docs/victoriametrics/stream-aggregation/configuration.md
+index ace66ea9e..a4d1e7c2f 100644
+--- a/docs/victoriametrics/stream-aggregation/configuration.md
++++ b/docs/victoriametrics/stream-aggregation/configuration.md
+@@ -119,16 +119,18 @@ specified individually per each `-remoteWrite.url`:
+   #
+   # reset_marker_on_stale: false
+ 
+-  # sample_timestamps instructs to write sum_samples and sum_samples_total at the end of the interval
+-  # the input samples' timestamps fall in, instead of at the flush, so samples processed late, when vmagent
+-  # falls behind, still count towards the interval they were scraped in rather than the one they were processed in.
+-  # Samples of all the targets within one interval are summed together and written once.
++  # scrape_time_intervals puts every input sample of sum_samples and sum_samples_total in the interval
++  # it was scraped in and writes it at the end of that interval, instead of in the interval of the flush,
++  # so the samples of one scrape stay together in every aggregation, and samples processed late, when
++  # vmagent falls behind, still count towards the interval they were scraped in. Such an aggregation
++  # flushes on the grid of its interval. It needs -dedup.minScrapeInterval=1ms on the storage.
+   # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
+-  # enable_windows or dedup_interval, which decide timestamps of their own.
+-  # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
+-  # command-line flags are set; the flags enable it for the aggregations it supports and leave the others alone.
++  # enable_windows, dedup_interval or ignore_old_samples.
++  # Not set, it follows -remoteWrite.streamAggr.scrapeTimeIntervals or -streamAggr.scrapeTimeIntervals,
++  # which are on with a single -remoteWrite.url and apply to the aggregations it supports.
++  # sample_timestamps is its former name, still accepted.
+   #
+-  # sample_timestamps: false
++  # scrape_time_intervals: false
+ 
+   # without is an optional list of labels, which must be removed from the output aggregation.
+   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels
+diff --git a/lib/streamaggr/output.go b/lib/streamaggr/output.go
+index 0252cbd89..041952909 100644
+--- a/lib/streamaggr/output.go
++++ b/lib/streamaggr/output.go
+@@ -193,7 +193,7 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey
+ 		// check for stale entries
+ 		deleted := ctx.flushTimestamp > av.deleteDeadline
+ 		if deleted {
+-			// Under sample_timestamps an entry may still hold sums of intervals
++			// Under scrape_time_intervals an entry may still hold sums of intervals
+ 			// after the flush's boundary, which no flush has written yet: keep it
+ 			// until they are. Pushes stopped long ago, so this costs a lookup of
+ 			// the entries about to be dropped, and only of those.
+@@ -217,7 +217,7 @@ func (ao *aggrOutputs) flushEntry(ctx *flushCtx, sh *aggrOutputShard, outputKey
+ 			// The first visible flush of a new output entry: emit a zero one interval earlier.
+ 			at := ctx.flushTimestamp
+ 			if first, ok := av.firstPending(len(ao.configs), ctx.isGreen); ok {
+-				// Under sample_timestamps the first sample may be written well
++				// Under scrape_time_intervals the first sample may be written well
+ 				// before the flush; the zero has to precede it, or increase()
+ 				// would read the zero after it as a reset and count it twice.
+ 				at = min(first, ctx.now)
+diff --git a/lib/streamaggr/sample_timestamps_rules_test.go b/lib/streamaggr/scrape_time_intervals_rules_test.go
+similarity index 84%
+rename from lib/streamaggr/sample_timestamps_rules_test.go
+rename to lib/streamaggr/scrape_time_intervals_rules_test.go
+index 5da02d04d..15f1c6dc3 100644
+--- a/lib/streamaggr/sample_timestamps_rules_test.go
++++ b/lib/streamaggr/scrape_time_intervals_rules_test.go
+@@ -15,7 +15,7 @@ import (
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
+ )
+ 
+-// The rules of sample_timestamps, as these tests check them. A sample belongs
++// The rules of scrape_time_intervals, as these tests check them. A sample belongs
+ // to the interval [end - interval, end) its scrape timestamp falls in, and is
+ // written at the end of it:
+ //
+@@ -33,7 +33,7 @@ func tokensCost(v float64) string { return fmt.Sprintf("tokens %v\ncost %v", v,
+ 
+ func stConfig(output string, extra string) string {
+ 	return "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-		"  staleness_interval: 40m\n  sample_timestamps: true\n" + extra
++		"  staleness_interval: 40m\n  scrape_time_intervals: true\n" + extra
+ }
+ 
+ // perInterval is what an output wrote for the interval ending at to: the sum
+@@ -65,7 +65,7 @@ var stOutputs = []string{"sum_samples", "sum_samples_total"}
+ 
+ // Rounds processed within their interval are written with it, once per
+ // interval however many targets feed it.
+-func TestSampleTimestampsOnTimeRoundsGoToTheirInterval(t *testing.T) {
++func TestScrapeTimeIntervalsOnTimeRoundsGoToTheirInterval(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		var pushes []latePush
+ 		for m := 0; m < 3; m++ {
+@@ -90,7 +90,7 @@ func TestSampleTimestampsOnTimeRoundsGoToTheirInterval(t *testing.T) {
+ // A round scraped right on a boundary, as scrape_align_interval has them,
+ // belongs to the interval that starts there; one scraped a millisecond before
+ // it, to the one that ends there.
+-func TestSampleTimestampsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
++func TestScrapeTimeIntervalsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		got := runLateScenario(t, stConfig(output, ""), []latePush{
+ 			{at: 2*time.Minute - time.Millisecond, sampleAt: 2*time.Minute - time.Millisecond, metrics: tokensCost(1)},
+@@ -103,7 +103,7 @@ func TestSampleTimestampsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
+ // The tail of a round that crossed the boundary -- processed after its interval
+ // was written, before the next one was -- completes that interval: it is written
+ // again at the same timestamp, with the whole round.
+-func TestSampleTimestampsTailCompletesTheIntervalWrittenLast(t *testing.T) {
++func TestScrapeTimeIntervalsTailCompletesTheIntervalWrittenLast(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		got := runLateScenario(t, stConfig(output, ""), []latePush{
+ 			{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: tokensCost(4)},
+@@ -124,7 +124,7 @@ func TestSampleTimestampsTailCompletesTheIntervalWrittenLast(t *testing.T) {
+ 
+ // A tail that would make the interval smaller cannot complete it -- VM keeps the
+ // bigger of two values at one timestamp -- so it goes to the next interval.
+-func TestSampleTimestampsNegativeTailGoesToTheNextInterval(t *testing.T) {
++func TestScrapeTimeIntervalsNegativeTailGoesToTheNextInterval(t *testing.T) {
+ 	got := runLateScenario(t, stConfig("sum_samples", ""), []latePush{
+ 		{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: `tokens 4`},
+ 		{at: 2*time.Minute + 10*time.Second, sampleAt: 80 * time.Second, metrics: `tokens -1`},
+@@ -137,7 +137,7 @@ func TestSampleTimestampsNegativeTailGoesToTheNextInterval(t *testing.T) {
+ // Rounds whose interval has ended by the time they are processed go to the
+ // interval they are processed in, all of them together. Nothing is lost,
+ // nothing counted twice.
+-func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) {
++func TestScrapeTimeIntervalsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		got := runLateScenario(t, stConfig(output, ""), []latePush{
+ 			// scraped in the minutes ending 2m to 5m, all processed at 5m10s
+@@ -155,7 +155,7 @@ func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T)
+ // The rest of a late round processed after the flush of the interval it was
+ // put in goes there too, as that interval's tail: samples sharing a scrape
+ // timestamp are taken as one round, whose interval is decided at the first.
+-func TestSampleTimestampsLateRoundKeepsItsInterval(t *testing.T) {
++func TestScrapeTimeIntervalsLateRoundKeepsItsInterval(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		got := runLateScenario(t, stConfig(output, ""), []latePush{
+ 			{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: tokensCost(2)},
+@@ -167,7 +167,7 @@ func TestSampleTimestampsLateRoundKeepsItsInterval(t *testing.T) {
+ 
+ // Rounds scraped before the aggregator started go to the first interval it
+ // writes: the one before is the previous process's, which may have written it.
+-func TestSampleTimestampsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T) {
++func TestScrapeTimeIntervalsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		got := runLateScenario(t, stConfig(output, ""), []latePush{
+ 			{at: 10 * time.Second, sampleAt: -30 * time.Second, metrics: tokensCost(7)},
+@@ -183,7 +183,7 @@ func TestSampleTimestampsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T)
+ 
+ // A sample stamped ahead of the clock counts as processed now; held until its
+ // time came, it would keep its output from being dropped as stale.
+-func TestSampleTimestampsFutureTimestampCountsNow(t *testing.T) {
++func TestScrapeTimeIntervalsFutureTimestampCountsNow(t *testing.T) {
+ 	got := runLateScenario(t, stConfig("sum_samples", "  flush_on_shutdown: true\n"), []latePush{
+ 		{at: 10 * time.Second, sampleAt: 2*time.Minute + 30*time.Second, metrics: `tokens 5`},
+ 	}, 4*time.Minute)["tokens"]
+@@ -194,7 +194,7 @@ func TestSampleTimestampsFutureTimestampCountsNow(t *testing.T) {
+ 
+ // sum_samples_total never goes back, puts the reset marker before its first
+ // sample, and its heartbeat does not get ahead of the intervals written.
+-func TestSampleTimestampsTotalStaysACounter(t *testing.T) {
++func TestScrapeTimeIntervalsTotalStaysACounter(t *testing.T) {
+ 	cfg := stConfig("sum_samples_total", "  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n")
+ 	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: tokensCost(1)}}
+ 	for i := 1; i <= 11; i++ {
+@@ -218,7 +218,7 @@ func TestSampleTimestampsTotalStaysACounter(t *testing.T) {
+ // samples of intervals before the one written last go to the first one not
+ // written. What is left is that one, the tail of the one written last and, for
+ // sum_samples, what was written for it, and the next one.
+-func TestSampleTimestampsPendingStaysBounded(t *testing.T) {
++func TestScrapeTimeIntervalsPendingStaysBounded(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		synctest.Test(t, func(t *testing.T) {
+ 			a, err := LoadFromData([]byte(stConfig(output, "")), func([]prompb.TimeSeries) {}, nil, "test")
+@@ -263,23 +263,23 @@ func TestSampleTimestampsPendingStaysBounded(t *testing.T) {
+ // With them -- the flush holding up the next one -- it depends on what the flush
+ // had reached, and the intervals are checked for what holds regardless: a round
+ // never split, no sample written before its interval, and everything counted.
+-func TestSampleTimestampsRules(t *testing.T) {
++func TestScrapeTimeIntervalsRules(t *testing.T) {
+ 	for seed := int64(1); seed <= 20; seed++ {
+ 		for _, output := range stOutputs {
+ 			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
+ 				for _, overrun := range []bool{false, true} {
+-					checkSampleTimestampsRules(t, seed, output, iv, overrun)
++					checkScrapeTimeIntervalsRules(t, seed, output, iv, overrun)
+ 				}
+ 			}
+ 		}
+ 	}
+ }
+ 
+-func checkSampleTimestampsRules(t *testing.T, seed int64, output string, iv time.Duration, overrun bool) {
++func checkScrapeTimeIntervalsRules(t *testing.T, seed int64, output string, iv time.Duration, overrun bool) {
+ 	t.Helper()
+ 	name := fmt.Sprintf("seed=%d output=%s interval=%s overrun=%v", seed, output, iv, overrun)
+ 	cfg := fmt.Sprintf("- match: '{__name__=~\"tokens|cost\"}'\n  interval: %s\n  outputs: [%s]\n  keep_metric_names: true\n"+
+-		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", iv, output)
++		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n", iv, output)
+ 	rnd := rand.New(rand.NewSource(seed))
+ 	type push struct {
+ 		at, sampleAt time.Duration
+@@ -455,7 +455,7 @@ func checkSampleTimestampsRules(t *testing.T, seed int64, output string, iv time
+ // last and write that again at the next flush. Either way the round is in the
+ // same interval in every output -- for a round of the interval being written,
+ // and for one processed late, whose interval is decided at its first sample.
+-func TestSampleTimestampsRoundDuringTheFlushStaysTogether(t *testing.T) {
++func TestScrapeTimeIntervalsRoundDuringTheFlushStaysTogether(t *testing.T) {
+ 	for _, c := range []struct {
+ 		name               string
+ 		scrapedAt, firstAt time.Duration
+@@ -528,7 +528,7 @@ func roundDuringTheFlush(t *testing.T, output string, scrapedAt, firstAt time.Du
+ // After sum_samples_total starts its total again, as it does before float64
+ // loses precision, a tail would be smaller than what was written at its
+ // interval and lost to deduplication; it goes to the next interval instead.
+-func TestSampleTimestampsTotalTailAfterRestartOfTheTotal(t *testing.T) {
++func TestScrapeTimeIntervalsTotalTailAfterRestartOfTheTotal(t *testing.T) {
+ 	big := float64(1 << 53)
+ 	got := runLateScenario(t, stConfig("sum_samples_total", ""), []latePush{
+ 		{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: fmt.Sprintf("tokens %v", big)},
+@@ -554,12 +554,12 @@ func TestSampleTimestampsTotalTailAfterRestartOfTheTotal(t *testing.T) {
+ // time goes to the same interval in both: where a late round goes follows from
+ // when it is processed, decided once for every rule of the interval, not from
+ // how far each rule's flush has got.
+-func TestSampleTimestampsLateRoundSameIntervalAcrossRules(t *testing.T) {
++func TestScrapeTimeIntervalsLateRoundSameIntervalAcrossRules(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		cfg := ""
+ 		for _, name := range []string{"tokens", "cost"} {
+ 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-				"  staleness_interval: 40m\n  sample_timestamps: true\n"
++				"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
+ 		}
+ 		got := map[string][]outSample{}
+ 		synctest.Test(t, func(t *testing.T) {
+@@ -617,7 +617,7 @@ func TestSampleTimestampsLateRoundSameIntervalAcrossRules(t *testing.T) {
+ // minutes late, some while a flush walks the outputs: in every key and interval
+ // the cost is three times the tokens, across the two rules, and everything is
+ // counted once.
+-func TestSampleTimestampsRulesAcrossRules(t *testing.T) {
++func TestScrapeTimeIntervalsRulesAcrossRules(t *testing.T) {
+ 	for seed := int64(1); seed <= 20; seed++ {
+ 		for _, output := range stOutputs {
+ 			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
+@@ -632,7 +632,7 @@ func checkAcrossRules(t *testing.T, seed int64, output string, iv time.Duration)
+ 	name := fmt.Sprintf("seed=%d output=%s interval=%s", seed, output, iv)
+ 	cfg := ""
+ 	for _, m := range []string{"tokens", "cost"} {
+-		cfg += fmt.Sprintf("- match: %s\n  interval: %s\n  by: [key]\n  outputs: [%s]\n  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", m, iv, output)
++		cfg += fmt.Sprintf("- match: %s\n  interval: %s\n  by: [key]\n  outputs: [%s]\n  staleness_interval: 2h\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n", m, iv, output)
+ 	}
+ 	rnd := rand.New(rand.NewSource(seed))
+ 	type push struct {
+@@ -779,7 +779,7 @@ func checkAcrossRules(t *testing.T, seed int64, output string, iv time.Duration)
+ // rule must not take an interval for written before it has ended: a round
+ // processed then would be the tail of the interval written last in the other
+ // rules and late in this one, two intervals apart.
+-func TestSampleTimestampsEarlyFlushStaysBehindTheClock(t *testing.T) {
++func TestScrapeTimeIntervalsEarlyFlushStaysBehindTheClock(t *testing.T) {
+ 	// Aligned to the interval, the flusher drops the tick that waited; not
+ 	// aligned, it takes it and flushes at once, for a boundary not yet reached.
+ 	for _, align := range []string{"", "  no_align_flush_to_interval: true\n"} {
+@@ -795,7 +795,7 @@ func earlyFlush(t *testing.T, output, align string) {
+ 		cfg := ""
+ 		for _, name := range []string{"tokens", "cost"} {
+ 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-				"  staleness_interval: 40m\n  sample_timestamps: true\n" + align
++				"  staleness_interval: 40m\n  scrape_time_intervals: true\n" + align
+ 		}
+ 		got := map[string][]outSample{}
+ 		synctest.Test(t, func(t *testing.T) {
+@@ -857,12 +857,12 @@ func earlyFlush(t *testing.T, output, align string) {
+ // their own: the round goes whole to one interval. Its interval is decided at
+ // its first block and kept for the rest, rather than the first block being the
+ // tail of its own interval and the second, a boundary later, late.
+-func TestSampleTimestampsRoundInBlocksAcrossABoundary(t *testing.T) {
++func TestScrapeTimeIntervalsRoundInBlocksAcrossABoundary(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		cfg := ""
+ 		for _, name := range []string{"tokens", "cost"} {
+ 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-				"  staleness_interval: 40m\n  sample_timestamps: true\n"
++				"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
+ 		}
+ 		scraped := 70 * time.Second // in the minute ending 2m
+ 		got := runLateScenario(t, cfg, []latePush{
+@@ -879,12 +879,12 @@ func TestSampleTimestampsRoundInBlocksAcrossABoundary(t *testing.T) {
+ // the flush waits for the pushes in progress. And every rule places a push by
+ // the same reading of the clock, however long the push takes to go from one
+ // rule to the next.
+-func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
++func TestScrapeTimeIntervalsPushAcrossTheFlush(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		cfg := ""
+ 		for _, name := range []string{"tokens", "cost"} {
+ 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-				"  staleness_interval: 40m\n  sample_timestamps: true\n"
++				"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
+ 		}
+ 		got := map[string][]outSample{}
+ 		synctest.Test(t, func(t *testing.T) {
+@@ -945,12 +945,12 @@ func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
+ // their own is written at two timestamps a few milliseconds apart, and a query
+ // at either one sees half of it. The tokens rule's last flush is held up for a
+ // few milliseconds, as one rule's flush is behind another's on a real stop.
+-func TestSampleTimestampsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
++func TestScrapeTimeIntervalsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
+ 	for _, output := range stOutputs {
+ 		cfg := ""
+ 		for _, name := range []string{"tokens", "cost"} {
+ 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-				"  staleness_interval: 40m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
++				"  staleness_interval: 40m\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n"
+ 		}
+ 		got := map[string][]outSample{}
+ 		synctest.Test(t, func(t *testing.T) {
+@@ -1060,3 +1060,135 @@ func TestMustStopWaitsForThePushesInProgress(t *testing.T) {
+ 		t.Fatalf("written %v; want the push in progress, 5, in the last flush", got)
+ 	}
+ }
++
++// Under scrape_time_intervals a rule flushes on the grid of its own interval,
++// whenever the process started and flush_on_shutdown or not: an interval is
++// written as soon as it ends, not up to an interval later at the phase of the
++// start, and a process killed outright takes the interval in progress with it,
++// not two. A rule without scrape_time_intervals keeps the phase of the start.
++func TestScrapeTimeIntervalsFlushOnTheGridOfTheInterval(t *testing.T) {
++	cfg := "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n" +
++		"- match: cost\n  interval: 5m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n" +
++		"- match: reqs\n  interval: 1m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: false\n"
++	flushes := map[string][]time.Duration{} // per input metric, when its outputs were written
++	synctest.Test(t, func(t *testing.T) {
++		epoch := time.Now() // synctest starts on a whole hour
++		time.Sleep(28 * time.Second)
++		var mu sync.Mutex
++		a, err := LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
++			mu.Lock()
++			defer mu.Unlock()
++			at := time.Since(epoch)
++			for _, ts := range tss {
++				for _, l := range ts.Labels {
++					if l.Name == "__name__" {
++						name, _, _ := strings.Cut(l.Value, ":")
++						if s := flushes[name]; len(s) == 0 || s[len(s)-1] != at {
++							flushes[name] = append(s, at)
++						}
++					}
++				}
++			}
++		}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		for i := 0; i < 70; i++ {
++			now := time.Now()
++			a.Push(prometheus.MustParsePromMetrics("tokens 1\ncost 1\nreqs 1", now.Truncate(10*time.Second).UnixMilli()), nil)
++			time.Sleep(10 * time.Second)
++		}
++		a.MustStop()
++	})
++	check := func(name string, every, phase time.Duration) {
++		t.Helper()
++		got := flushes[name]
++		if len(got) < 2 {
++			t.Fatalf("%s: written at %v; want flushes", name, got)
++		}
++		for _, at := range got[:len(got)-1] { // the last is the flush on shutdown
++			if at%every != phase {
++				t.Errorf("%s: written at %v, at %v into its %v interval; want %v; all %v", name, at, at%every, every, phase, got)
++			}
++		}
++	}
++	check("tokens", time.Minute, 0)
++	check("cost", 5*time.Minute, 0)
++	check("reqs", time.Minute, 28*time.Second)
++}
++
++// sample_timestamps, the former name of scrape_time_intervals, still works the
++// same, and the two set to different values are refused.
++func TestScrapeTimeIntervalsFormerName(t *testing.T) {
++	rule := func(extra string) string {
++		return "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n" + extra
++	}
++	for _, c := range []struct {
++		extra  string
++		on, ok bool
++	}{
++		{"  scrape_time_intervals: true\n", true, true},
++		{"  sample_timestamps: true\n", true, true},
++		{"  sample_timestamps: false\n", false, true},
++		{"  scrape_time_intervals: true\n  sample_timestamps: true\n", true, true},
++		{"  scrape_time_intervals: true\n  sample_timestamps: false\n", false, false},
++	} {
++		a, err := LoadFromData([]byte(rule(c.extra)), func([]prompb.TimeSeries) {}, nil, "test")
++		if (err == nil) != c.ok {
++			t.Fatalf("%q: error %v; want ok %v", c.extra, err, c.ok)
++		}
++		if err != nil {
++			continue
++		}
++		if got := a.as[0].scrapeTimeIntervals; got != c.on {
++			t.Errorf("%q: scrape_time_intervals %v; want %v", c.extra, got, c.on)
++		}
++		a.MustStop()
++	}
++}
++
++// The flush ticker keeps the monotonic clock, and the wall clock drifts from it
++// and is corrected against it: here the wall clock is 50 ms behind, so every
++// tick comes before the boundary by the wall clock. An interval is still written
++// at the flush right after it ends, not left to the next one an interval later.
++func TestScrapeTimeIntervalsFlushWaitsForTheWallClock(t *testing.T) {
++	cfg := "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n"
++	type write struct{ at, ts time.Duration }
++	var got []write
++	synctest.Test(t, func(t *testing.T) {
++		epoch := time.Now()
++		stClock = func() time.Time { return time.Now().Add(-50 * time.Millisecond) }
++		defer func() { stClock = time.Now }()
++		time.Sleep(28 * time.Second)
++		var mu sync.Mutex
++		a, err := LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
++			mu.Lock()
++			defer mu.Unlock()
++			for _, ts := range tss {
++				for _, s := range ts.Samples {
++					got = append(got, write{time.Since(epoch), time.UnixMilli(s.Timestamp).Sub(epoch)})
++				}
++			}
++		}, nil, "test")
++		if err != nil {
++			t.Fatalf("cannot load config: %s", err)
++		}
++		for m := 1; m <= 6; m++ {
++			time.Sleep(time.Duration(m)*time.Minute + 3*time.Second - time.Since(epoch))
++			a.Push(prometheus.MustParsePromMetrics("tokens 1", epoch.Add(time.Duration(m)*time.Minute+time.Second).UnixMilli()), nil)
++		}
++		time.Sleep(7*time.Minute + 10*time.Second - time.Since(epoch))
++		a.MustStop()
++	})
++	for _, w := range got {
++		if w.ts == 7*time.Minute+10*time.Second-50*time.Millisecond { // the flush on shutdown
++			continue
++		}
++		if late := w.at - w.ts; late < 0 || late >= time.Second {
++			t.Errorf("the interval ending %v was written at %v, %v after its end; want at the flush right after it; all %v", w.ts, w.at, late, got)
++		}
++	}
++	if len(got) < 5 {
++		t.Fatalf("written %v; want the six intervals", got)
++	}
++}
+diff --git a/lib/streamaggr/sample_timestamps_test.go b/lib/streamaggr/scrape_time_intervals_test.go
+similarity index 91%
+rename from lib/streamaggr/sample_timestamps_test.go
+rename to lib/streamaggr/scrape_time_intervals_test.go
+index e7ea461dc..4bd759a20 100644
+--- a/lib/streamaggr/sample_timestamps_test.go
++++ b/lib/streamaggr/scrape_time_intervals_test.go
+@@ -109,9 +109,9 @@ func increaseIn(samples []outSample, from, to time.Duration) float64 {
+ // One target's round 2 is processed after round 3 was written. It cannot be
+ // written at 2m, after 3m in the series: the counter would go back. It goes to
+ // 3m, off by the gap between the two targets rather than lost or misplaced.
+-func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
++func TestScrapeTimeIntervalsTotalNeverGoesBack(t *testing.T) {
+ 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
+-		"  staleness_interval: 40m\n  sample_timestamps: true\n"
++		"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
+ 	pushes := []latePush{
+ 		{at: 3*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 1`},
+ 		{at: 4*time.Minute + 30*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 1`},
+@@ -127,13 +127,13 @@ func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
++func TestScrapeTimeIntervalsRefusesWhatItCannotDo(t *testing.T) {
+ 	for _, cfg := range []string{
+-		"- match: foo\n  interval: 1m\n  outputs: [total]\n  sample_timestamps: true\n",
+-		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  sample_timestamps: true\n",
+-		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
+-		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
+-		"- match: foo\n  interval: 1m\n  ignore_old_samples: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
++		"- match: foo\n  interval: 1m\n  outputs: [total]\n  scrape_time_intervals: true\n",
++		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  scrape_time_intervals: true\n",
++		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  scrape_time_intervals: true\n",
++		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  scrape_time_intervals: true\n",
++		"- match: foo\n  interval: 1m\n  ignore_old_samples: true\n  outputs: [sum_samples]\n  scrape_time_intervals: true\n",
+ 	} {
+ 		a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, nil, "test")
+ 		if err == nil {
+@@ -146,17 +146,17 @@ func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
+ // The global option is one flag over a whole config: it leaves alone the
+ // aggregations it cannot apply to, such as a gauge de-duplicated per interval,
+ // and takes the rest.
+-func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
++func TestScrapeTimeIntervalsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
+ 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n" +
+ 		"- match: bar\n  interval: 1m\n  dedup_interval: 60s\n  outputs: [sum_samples]\n" +
+ 		"- match: baz\n  interval: 1m\n  outputs: [max]\n"
+-	a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, &Options{SampleTimestamps: true}, "test")
++	a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, &Options{ScrapeTimeIntervals: true}, "test")
+ 	if err != nil {
+ 		t.Fatalf("the global option refused the config: %s", err)
+ 	}
+ 	defer a.MustStop()
+ 	for i, want := range []bool{true, false, false} {
+-		if got := a.as[i].sampleTimestamps; got != want {
++		if got := a.as[i].scrapeTimeIntervals; got != want {
+ 			t.Errorf("aggregation %d: sample timestamps %v, want %v", i, got, want)
+ 		}
+ 	}
+@@ -165,10 +165,10 @@ func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
+ // A flush that runs a little after its boundary finds samples scraped after the
+ // boundary, of the interval still open. They must not be written into the
+ // interval that just closed, and not twice.
+-func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
++func TestScrapeTimeIntervalsOpenIntervalStaysOpen(t *testing.T) {
+ 	for _, output := range []string{"sum_samples", "sum_samples_total"} {
+ 		cfg := "- match: foo\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-			"  staleness_interval: 40m\n  sample_timestamps: true\n"
++			"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
+ 		var got []outSample
+ 		synctest.Test(t, func(t *testing.T) {
+ 			start := time.Now()
+@@ -219,9 +219,9 @@ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
+ // The flush on shutdown writes the interval still open, before it ends, at the
+ // time of the shutdown. Right after a boundary that is still in the open
+ // interval, not in the one just closed.
+-func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
++func TestScrapeTimeIntervalsShutdownRightAfterBoundary(t *testing.T) {
+ 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
+-		"  flush_on_shutdown: true\n  sample_timestamps: true\n"
++		"  flush_on_shutdown: true\n  scrape_time_intervals: true\n"
+ 	var got []outSample
+ 	synctest.Test(t, func(t *testing.T) {
+ 		start := time.Now()
+@@ -254,10 +254,10 @@ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
+ // interval right after the boundary and of the one after that. Neither may be
+ // written ahead of the other, or sum_samples_total, which never writes a
+ // timestamp before one it has written, would move the first into the second.
+-func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
++func TestScrapeTimeIntervalsFlushLongerThanInterval(t *testing.T) {
+ 	for _, output := range []string{"sum_samples", "sum_samples_total"} {
+ 		cfg := "- match: '{__name__=~\"foo|bar\"}'\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
+-			"  staleness_interval: 40m\n  sample_timestamps: true\n"
++			"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
+ 		var got []outSample
+ 		synctest.Test(t, func(t *testing.T) {
+ 			start := time.Now()
+@@ -322,9 +322,9 @@ func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
+ // whose heartbeat is not due, so by its own latest point the cost of minute 1's
+ // late round would go back into minute 1 while its tokens went to minute 3: the
+ // two would be over in one minute and short in the other, and so in their hours.
+-func TestSampleTimestampsTotalLateRoundLandsTogether(t *testing.T) {
++func TestScrapeTimeIntervalsTotalLateRoundLandsTogether(t *testing.T) {
+ 	cfg := "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
+-		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  sample_timestamps: true\n"
++		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  scrape_time_intervals: true\n"
+ 	pushes := []latePush{
+ 		{at: 30 * time.Second, sampleAt: 30 * time.Second, metrics: "tokens 10\ncost 30"},
+ 		{at: 150 * time.Second, sampleAt: 150 * time.Second, metrics: "tokens 5\ncost 0"}, // a free request
+diff --git a/lib/streamaggr/sample_timestamps_timing_test.go b/lib/streamaggr/scrape_time_intervals_timing_test.go
+similarity index 89%
+rename from lib/streamaggr/sample_timestamps_timing_test.go
+rename to lib/streamaggr/scrape_time_intervals_timing_test.go
+index 7b957c272..d7a70d5ea 100644
+--- a/lib/streamaggr/sample_timestamps_timing_test.go
++++ b/lib/streamaggr/scrape_time_intervals_timing_test.go
+@@ -9,19 +9,19 @@ import (
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+ )
+ 
+-// The ACG shape under sample_timestamps: every output is fed by many targets,
++// The ACG shape under scrape_time_intervals: every output is fed by many targets,
+ // and vmagent scrapes each target at an offset of its own, so the rounds of one
+ // minute reach an output with as many distinct timestamps as there are targets.
+ // lag is how many minutes of rounds pile up between two flushes, as while
+ // vmagent is behind.
+-func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
++func BenchmarkScrapeTimeIntervalsManyTargets(b *testing.B) {
+ 	const (
+ 		targets = 20
+ 		keys    = 2000
+ 	)
+ 	for _, lag := range []int{1, 4} {
+ 		for _, mode := range []string{"off", "on"} {
+-			b.Run(fmt.Sprintf("lag=%dm/sample_timestamps=%s", lag, mode), func(b *testing.B) {
++			b.Run(fmt.Sprintf("lag=%dm/scrape_time_intervals=%s", lag, mode), func(b *testing.B) {
+ 				config := `
+ - match: acg_cost_total
+   interval: 1m
+@@ -29,7 +29,7 @@ func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
+   outputs: [sum_samples]
+ `
+ 				if mode == "on" {
+-					config += "  sample_timestamps: true\n"
++					config += "  scrape_time_intervals: true\n"
+ 				}
+ 				var outSamples atomic.Int64
+ 				pushFunc := func(tss []prompb.TimeSeries) {
+diff --git a/lib/streamaggr/streamaggr.go b/lib/streamaggr/streamaggr.go
+index 4516dc887..815315f23 100644
+--- a/lib/streamaggr/streamaggr.go
++++ b/lib/streamaggr/streamaggr.go
+@@ -147,12 +147,12 @@ type Options struct {
+ 	// EnableWindows enables aggregation in windows
+ 	EnableWindows bool
+ 
+-	// SampleTimestamps writes sum_samples and sum_samples_total at the end of the
++	// ScrapeTimeIntervals writes sum_samples and sum_samples_total at the end of the
+ 	// interval the input samples' timestamps fall in instead of at the flush, so
+ 	// an input processed late still counts towards the interval it was scraped in.
+ 	//
+-	// This option can be overridden individually per each aggregation via sample_timestamps option.
+-	SampleTimestamps bool
++	// This option can be overridden individually per each aggregation via scrape_time_intervals option.
++	ScrapeTimeIntervals bool
+ }
+ 
+ // Config is a configuration for a single stream aggregation.
+@@ -297,7 +297,12 @@ type Config struct {
+ 	// EnableWindows enables aggregation in windows
+ 	EnableWindows *bool `yaml:"enable_windows,omitempty"`
+ 
+-	// SampleTimestamps writes the outputs at the timestamps of the input samples instead of at the flush.
++	// ScrapeTimeIntervals puts every input sample in the interval it was scraped in and writes it at the
++	// end of that interval, instead of in the interval of the flush, so the samples of one scrape stay
++	// together in every aggregation.
++	ScrapeTimeIntervals *bool `yaml:"scrape_time_intervals,omitempty"`
++
++	// SampleTimestamps is the former name of ScrapeTimeIntervals, still accepted.
+ 	SampleTimestamps *bool `yaml:"sample_timestamps,omitempty"`
+ }
+ 
+@@ -442,7 +447,7 @@ func (a *Aggregators) MustStop() {
+ 	a.ms = nil
+ 
+ 	// The last flush of every rule is capped at one time, taken once their
+-	// regular flushes have all stopped: under sample_timestamps a round whose
++	// regular flushes have all stopped: under scrape_time_intervals a round whose
+ 	// samples are in rules of their own, tokens in one and cost in another, is
+ 	// otherwise written at as many timestamps as the milliseconds the rules took
+ 	// to stop, and a query at any one of them sees part of it.
+@@ -531,7 +536,7 @@ func (a *Aggregators) enterPush() *atomic.Int64 {
+ }
+ 
+ func (a *Aggregators) push(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) []byte {
+-	// One reading of the clock for every rule: under sample_timestamps where a
++	// One reading of the clock for every rule: under scrape_time_intervals where a
+ 	// round goes depends on when it is processed, and a boundary passing while
+ 	// the push goes from one rule to the next must not send it two ways.
+ 	now := time.Now()
+@@ -716,13 +721,13 @@ type aggregator struct {
+ 	stalenessInterval       time.Duration
+ 	outputHeartbeatInterval time.Duration
+ 
+-	keepMetricNames  bool
+-	ignoreOldSamples bool
+-	enableWindows    bool
+-	sampleTimestamps bool
++	keepMetricNames     bool
++	ignoreOldSamples    bool
++	enableWindows       bool
++	scrapeTimeIntervals bool
+ 
+ 	// stWritten is the end of the interval written last under
+-	// sample_timestamps, and stTailOK whether this process wrote it; see stState.
++	// scrape_time_intervals, and stTailOK whether this process wrote it; see stState.
+ 	stWritten atomic.Int64
+ 	stTailOK  atomic.Bool
+ 	// stRounds is where rounds went, shared with the other rules of the config,
+@@ -742,7 +747,7 @@ type aggregator struct {
+ 	// intervalPhaseMsec is a Unix timestamp on the grid the flushes are aligned
+ 	// to. time.Truncate counts intervals from the zero time, January 1 of year 1,
+ 	// not from the Unix epoch, and the two grids differ for an interval that does
+-	// not divide a day, such as 7m. sample_timestamps puts samples into intervals
++	// not divide a day, such as 7m. scrape_time_intervals puts samples into intervals
+ 	// on the flushes' grid.
+ 	intervalPhaseMsec int64
+ 
+@@ -938,11 +943,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+ 	// The global option applies where it can, so one flag covers a config that
+ 	// also has aggregations it cannot apply to; set on an aggregation, it has to.
+-	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples) == nil
+-	if v := cfg.SampleTimestamps; v != nil {
+-		sampleTimestamps = *v
+-		if sampleTimestamps {
+-			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples); err != nil {
++	scrapeTimeIntervals := opts.ScrapeTimeIntervals && scrapeTimeIntervalsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples) == nil
++	setting := cfg.ScrapeTimeIntervals
++	if old := cfg.SampleTimestamps; old != nil {
++		if setting != nil && *setting != *old {
++			return nil, fmt.Errorf("`scrape_time_intervals: %v` and `sample_timestamps: %v` disagree; `sample_timestamps` is the former name of `scrape_time_intervals`: keep only `scrape_time_intervals`", *setting, *old)
++		}
++		setting = old
++	}
++	if v := setting; v != nil {
++		scrapeTimeIntervals = *v
++		if scrapeTimeIntervals {
++			if err := scrapeTimeIntervalsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples); err != nil {
+ 				return nil, err
+ 			}
+ 		}
+@@ -970,7 +982,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 	}
+ 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
+ 	for i, output := range cfg.Outputs {
+-		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, sampleTimestamps)
++		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, scrapeTimeIntervals)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -1024,12 +1036,12 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		inputRelabeling:  inputRelabeling,
+ 		outputRelabeling: outputRelabeling,
+ 
+-		keepMetricNames:   keepMetricNames,
+-		ignoreOldSamples:  ignoreOldSamples,
+-		enableWindows:     enableWindows,
+-		sampleTimestamps:  sampleTimestamps,
+-		stRounds:          late,
+-		stalenessInterval: stalenessInterval,
++		keepMetricNames:     keepMetricNames,
++		ignoreOldSamples:    ignoreOldSamples,
++		enableWindows:       enableWindows,
++		scrapeTimeIntervals: scrapeTimeIntervals,
++		stRounds:            late,
++		stalenessInterval:   stalenessInterval,
+ 
+ 		outputHeartbeatInterval: outputHeartbeatInterval,
+ 
+@@ -1086,7 +1098,14 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 
+ 	startTime := time.Now()
+ 	minTime := startTime
+-	if skipIncompleteFlush && alignFlushToInterval {
++	// Under scrape_time_intervals a flush writes the intervals that have ended by
++	// then, so one that flushes at its own phase -- the process's start, with
++	// flush_on_shutdown -- holds an interval that has ended until its next
++	// flush, up to another interval: on its grid, an interval is written as
++	// soon as it ends, and what a process killed outright takes with it is the
++	// interval in progress, not two. The other outputs write everything they
++	// have at every flush, stamped with its time, and keep their phase.
++	if (skipIncompleteFlush || scrapeTimeIntervals) && alignFlushToInterval {
+ 		minTime = minTime.Truncate(a.interval)
+ 		if !startTime.Equal(minTime) {
+ 			minTime = minTime.Add(interval)
+@@ -1096,7 +1115,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 		a.flushAfter = histogram.GetFast()
+ 	}
+ 	a.minDeadline.Store(minTime.UnixMilli())
+-	// Under sample_timestamps the interval that ended before the start is taken
++	// Under scrape_time_intervals the interval that ended before the start is taken
+ 	// as written: rounds of it go to the first interval this process writes.
+ 	a.stWritten.Store(a.intervalFloor(startTime.UnixMilli()))
+ 	cs := &currentState{}
+@@ -1116,24 +1135,24 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
+ 	return a, nil
+ }
+ 
+-// sampleTimestampsApply returns why sample_timestamps cannot apply to an
++// scrapeTimeIntervalsApply returns why scrape_time_intervals cannot apply to an
+ // aggregation, or nil if it can.
+-func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration, ignoreOldSamples bool) error {
++func scrapeTimeIntervalsApply(outputs []string, enableWindows bool, dedupInterval time.Duration, ignoreOldSamples bool) error {
+ 	if enableWindows || dedupInterval > 0 {
+-		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
++		return fmt.Errorf("`scrape_time_intervals` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
+ 	}
+ 	if ignoreOldSamples {
+-		return fmt.Errorf("`sample_timestamps` cannot be combined with `ignore_old_samples`, which drops the samples of rounds processed late that it puts into the intervals they were scraped in")
++		return fmt.Errorf("`scrape_time_intervals` cannot be combined with `ignore_old_samples`, which drops the samples of rounds processed late that it puts into the intervals they were scraped in")
+ 	}
+ 	for _, o := range outputs {
+ 		if o != "sum_samples" && o != "sum_samples_total" {
+-			return fmt.Errorf("`sample_timestamps` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
++			return fmt.Errorf("`scrape_time_intervals` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
+ 		}
+ 	}
+ 	return nil
+ }
+ 
+-func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, sampleTimestamps bool) (aggrConfig, error) {
++func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, scrapeTimeIntervals bool) (aggrConfig, error) {
+ 	// check for duplicated output
+ 	if _, ok := outputsSeen[output]; ok {
+ 		return nil, fmt.Errorf("`outputs` list contains duplicate aggregation function: %s", output)
+@@ -1197,9 +1216,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
+ 	case "stdvar":
+ 		return newStdvarAggrConfig(), nil
+ 	case "sum_samples":
+-		return newSumSamplesAggrConfig(sampleTimestamps), nil
++		return newSumSamplesAggrConfig(scrapeTimeIntervals), nil
+ 	case "sum_samples_total":
+-		return newSumSamplesTotalAggrConfig(sampleTimestamps), nil
++		return newSumSamplesTotalAggrConfig(scrapeTimeIntervals), nil
+ 	case "total":
+ 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
+ 	case "total_prometheus":
+@@ -1247,6 +1266,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
+ 
+ 	var fa *histogram.Fast
+ 	for tickerWait(t) {
++		if a.scrapeTimeIntervals && alignFlushToInterval && !a.waitForBoundary(flushTime) {
++			break // stopped while waiting
++		}
+ 		pf := pushFunc
+ 		if a.enableWindows {
+ 			// Calculate delay and wait
+@@ -1349,6 +1371,34 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
+ 	cs.maxDeadline = dedupTime.UnixMilli()
+ }
+ 
++// waitForBoundary waits until the wall clock has got to the boundary a flush on
++// the grid is due at, and reports false if a was stopped meanwhile. The ticker
++// keeps the monotonic clock, which the wall clock drifts from and is corrected
++// against: a tick a millisecond before the boundary by the wall clock would
++// leave the interval that has just ended to the next flush, an interval later,
++// see flush. A wall clock far behind is not waited for.
++func (a *aggregator) waitForBoundary(boundary time.Time) bool {
++	for {
++		d := boundary.Sub(stClock())
++		if d <= 0 || d > a.interval {
++			return true
++		}
++		// a timer of its own, as alignedSleep has: the waits are a few
++		// milliseconds, and a pooled timer would cross synctest bubbles in tests
++		timer := time.NewTimer(d)
++		select {
++		case <-a.stopCh:
++			timer.Stop()
++			return false
++		case <-timer.C:
++		}
++	}
++}
++
++// stClock is the wall clock flushes read under scrape_time_intervals: time.Now,
++// which the tests of waitForBoundary replace with one off the ticker's.
++var stClock = time.Now
++
+ // flush flushes aggregator state to pushFunc.
+ //
+ // If pushFunc is nil, then the aggregator state is just reset.
+@@ -1365,7 +1415,7 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
+ 		a.minDeadline.Store(cs.maxDeadline)
+ 		ctx.isGreen = cs.isGreen
+ 	}
+-	if a.sampleTimestamps {
++	if a.scrapeTimeIntervals {
+ 		a.stCut()
+ 		ctx.st = stState{written: a.stWritten.Load(), tailOK: a.stTailOK.Load(), closing: math.MaxInt64}
+ 		if !isLast {
+@@ -1378,7 +1428,7 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
+ 	}
+ 	ao.flushState(ctx)
+ 	ctx.flushSeries()
+-	if a.sampleTimestamps && !isLast && ctx.st.closing > ctx.st.written {
++	if a.scrapeTimeIntervals && !isLast && ctx.st.closing > ctx.st.written {
+ 		a.stWritten.Store(ctx.st.closing)
+ 		a.stTailOK.Store(true)
+ 		a.stPruneRounds(ctx.now)
+@@ -1432,13 +1482,13 @@ func (a *aggregator) pushAt(tss []prompb.TimeSeries, matchIdxs []byte, now time.
+ 	enableWindows := a.enableWindows
+ 	cs := a.cs.Load()
+ 
+-	// Under sample_timestamps a sample is kept under the end of the interval its
++	// Under scrape_time_intervals a sample is kept under the end of the interval its
+ 	// round goes to, see stPlace, not under its own timestamp. Every target is
+ 	// scraped at an offset of its own, so the exact timestamps would give an
+ 	// output fed by N targets N sums to keep and N samples to write per interval;
+ 	// and however far behind the aggregator is, an output holds only so many sums.
+-	sampleTimestamps := a.sampleTimestamps
+-	if sampleTimestamps {
++	scrapeTimeIntervals := a.scrapeTimeIntervals
++	if scrapeTimeIntervals {
+ 		in := a.stEnter()
+ 		defer in.Add(-1)
+ 	}
+@@ -1492,7 +1542,7 @@ func (a *aggregator) pushAt(tss []prompb.TimeSeries, matchIdxs []byte, now time.
+ 				maxLagMsec = lagMsec
+ 			}
+ 			timestamp := s.Timestamp
+-			if sampleTimestamps {
++			if scrapeTimeIntervals {
+ 				if stAt == 0 || stTs != s.Timestamp {
+ 					stTs, stAt = s.Timestamp, a.stPlace(s.Timestamp, nowMsec)
+ 				}
+@@ -1755,7 +1805,7 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
+ 	ctx.pushFunc = pushFunc
+ 	ctx.flushTimestamp = flushTimestamp
+ 	ctx.isLast = isLast
+-	ctx.now = time.Now().UnixMilli()
++	ctx.now = stClock().UnixMilli()
+ 	return ctx
+ }
+ 
+@@ -1783,7 +1833,7 @@ type flushCtx struct {
+ 	isGreen        bool
+ 	isLast         bool
+ 
+-	// now and st are for sample_timestamps: the wall clock no output is stamped
++	// now and st are for scrape_time_intervals: the wall clock no output is stamped
+ 	// after, and where the aggregator is in the intervals, the same for every
+ 	// output; slots is scratch for an output's sums.
+ 	now   int64
+@@ -1886,7 +1936,7 @@ func (ctx *flushCtx) appendSeriesAt(key, suffix string, timestamp int64, value f
+ }
+ 
+ // samplesCount counts the samples in tss: a series carries several under
+-// sample_timestamps, one per pending interval, see beginSeries.
++// scrape_time_intervals, one per pending interval, see beginSeries.
+ func samplesCount(tss []prompb.TimeSeries) int {
+ 	n := 0
+ 	for i := range tss {
+@@ -1897,7 +1947,7 @@ func samplesCount(tss []prompb.TimeSeries) int {
+ 
+ // beginSeries starts an output series that takes several samples, added with
+ // appendSample and closed with endSeries, so that an output writing more than
+-// one sample per flush -- one per pending interval under sample_timestamps --
++// one sample per flush -- one per pending interval under scrape_time_intervals --
+ // decompresses its labels and goes to pushFunc once rather than per sample.
+ func (ctx *flushCtx) beginSeries(key, suffix string) (labelsLen, samplesLen int) {
+ 	labelsLen = len(ctx.labels)
+diff --git a/lib/streamaggr/sum_samples.go b/lib/streamaggr/sum_samples.go
+index 0be3038c6..32fea068b 100644
+--- a/lib/streamaggr/sum_samples.go
++++ b/lib/streamaggr/sum_samples.go
+@@ -24,22 +24,22 @@ func (*sumSamplesAggrValue) state() any {
+ 	return nil
+ }
+ 
+-func newSumSamplesAggrConfig(sampleTimestamps bool) aggrConfig {
+-	return &sumSamplesAggrConfig{sampleTimestamps: sampleTimestamps}
++func newSumSamplesAggrConfig(scrapeTimeIntervals bool) aggrConfig {
++	return &sumSamplesAggrConfig{scrapeTimeIntervals: scrapeTimeIntervals}
+ }
+ 
+ type sumSamplesAggrConfig struct {
+-	sampleTimestamps bool
++	scrapeTimeIntervals bool
+ }
+ 
+ func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
+-	if c.sampleTimestamps {
++	if c.scrapeTimeIntervals {
+ 		return &sumSamplesAtValue{}
+ 	}
+ 	return &sumSamplesAggrValue{}
+ }
+ 
+-// sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
++// sumSamplesAtValue is sum_samples under scrape_time_intervals: every sum goes to
+ // the interval its samples were scraped in, written at the end of it, rather
+ // than to the one the aggregator happened to process them in. See stPlace for
+ // where a sample goes and stFlush for when it is written.
+@@ -134,7 +134,7 @@ type slot struct {
+ }
+ 
+ // bySampleTime holds the input sums of one output, one per interval, for
+-// sample_timestamps. Two are inline, which covers what an output has at any
++// scrape_time_intervals. Two are inline, which covers what an output has at any
+ // time but while the aggregator is far behind on flushing: the interval being
+ // filled, and the one written last -- or the next one, which the rounds right
+ // after a boundary start before the flush gets to the output.
+@@ -234,7 +234,7 @@ func mergeSlots(s []slot) []slot {
+ }
+ 
+ // stState is the aggregator's position in the intervals under
+-// sample_timestamps, as of the start of a flush. Every output of the aggregator
++// scrape_time_intervals, as of the start of a flush. Every output of the aggregator
+ // decides with the same one, so a round's samples go to the same interval in
+ // all of them.
+ type stState struct {
+@@ -324,12 +324,12 @@ func (av *sumSamplesTotalAggrValue) state() any {
+ 	return av.shared
+ }
+ 
+-func newSumSamplesTotalAggrConfig(sampleTimestamps bool) aggrConfig {
+-	return &sumSamplesTotalAggrConfig{sampleTimestamps: sampleTimestamps}
++func newSumSamplesTotalAggrConfig(scrapeTimeIntervals bool) aggrConfig {
++	return &sumSamplesTotalAggrConfig{scrapeTimeIntervals: scrapeTimeIntervals}
+ }
+ 
+ type sumSamplesTotalAggrConfig struct {
+-	sampleTimestamps bool
++	scrapeTimeIntervals bool
+ }
+ 
+ // sumSamplesTotalOwned is a value together with the shared state it owns when
+@@ -340,8 +340,8 @@ type sumSamplesTotalOwned struct {
+ }
+ 
+ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+-	if c.sampleTimestamps {
+-		// sample_timestamps is refused together with enable_windows, the only
++	if c.scrapeTimeIntervals {
++		// scrape_time_intervals is refused together with enable_windows, the only
+ 		// source of shared state.
+ 		return &sumSamplesTotalAtValue{}
+ 	}
+@@ -353,7 +353,7 @@ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
+ 	return &o.v
+ }
+ 
+-// sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
++// sumSamplesTotalAtValue is sum_samples_total under scrape_time_intervals. It
+ // writes the total as of the end of each interval it has samples of, in order,
+ // so an increment lands in the interval it was scraped in even when the
+ // aggregator processes it minutes later. A sample for the interval written
+@@ -448,7 +448,7 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
+ 	}
+ }
+ 
+-// state is nil: sample_timestamps is refused with enable_windows, the only user of shared state.
++// state is nil: scrape_time_intervals is refused with enable_windows, the only user of shared state.
+ func (av *sumSamplesTotalAtValue) state() any { return nil }
+ 
+ func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }
+-- 
+2.50.1 (Apple Git-155)
+

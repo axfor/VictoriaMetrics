@@ -2,7 +2,7 @@
 
 > 本文件只讲补丁本身。集成步骤、最佳配置、配额、以及已部署环境怎么升级,见 ACGCluster 仓库的 `docs/apikey-usage/vm-side.md`（边车那侧是 `app-side.md`）。
 
-三十九个补丁,**按编号顺序打**。004~027、030~033、035~042 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
+四十个补丁,**按编号顺序打**。004~027、030~033、035~043 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
@@ -47,13 +47,14 @@
 | `040-acg_streamaggr-memory` | 流式聚合省内存:刷出每批 1000 条而不是 1 万条(102 条规则同时刷出,每条规则的缓冲在两次刷出之间一直留着);输出键不再进全局 intern 表;`sum_samples_total` 每条输出 80 → 64 字节。ACG 102 条规则下堆 1251 → 752 MiB(−40%),每条规则刷出 80 → 36 毫秒,输出逐字节不变(第二十部分) | 建议,纯内存与性能 |
 | `041-acg_streamaggr-stop-one-time` | vmagent 停止(重启、发版)时,所有规则最后一次刷出用同一个时刻:原来每条规则各取各的时钟,tokens 和 cost 在不同规则里时,进行中的那一轮会写在相差几毫秒的两个时间戳上,查其中一个时刻只看到半轮(第二十一部分) | **必须**,配合 039 |
 | `042-acg_review-fixes` | 代码评审发现的问题:停止时最后一次确认只发给仍在抓取的目标、整体不超过超时(原来发给一小时内消失的 pod,拖住流式聚合的最后一次刷出);确认状态清理的无符号回绕;聚合配置重载时在途 push 不再落进已停止的聚合器或被当作原始数据写出;多个 `-remoteWrite.url` 时 `sample_timestamps` 默认关(无 1ms 去重的存储会重复计数);`final` 特性按整词匹配(第二十二部分) | **必须**,配合 client_golang v1.24.1027 |
+| `043-acg_scrape-time-intervals` | `scrape_time_intervals`(原名 `sample_timestamps`,旧名仍认)的规则按各自 interval 的网格刷出,并等墙上时钟到点再刷;vmagent 被强杀时最多丢一个 interval,配合抓取 `scrape_offset: 55s` 实测不丢(第二十三部分) | **必须** |
 
 只动源码的是 29 个文件(033 新碰了 `lib/promscrape/scraper.go`):028 改了 `lib/httpserver/httpserver.go` 并新增 `zstd.go`,029 改了 `lib/storage/index_db.go` 和 `app/vmstorage/main.go`;
 030 加的参数在 `app/vmagent/remotewrite/streamaggr.go`,031 加的判定在 `lib/promrelabel/if_expression.go`;其余 22 个是`lib/encoding/zstd/{concurrency,zstd_pure}.go`、`lib/promscrape/{client,scrapework}.go`、
 `lib/promutil/{labels,labelscompressor}.go`、`lib/streamaggr/` 下的 `deduplicator.go`、`output.go`、`streamaggr.go`
 以及每个输出类型各自的文件(`avg.go`、`sum_samples.go`、`total.go` 等,补丁 018 给它们各加了一个
 `needsInputKey()`)。其中 `concurrency.go` 和 `sum_samples.go` 是新文件。
-冲突热点是 `streamaggr.go`(17 个补丁碰它)和 `output.go`(11 个)。
+冲突热点是 `streamaggr.go`(18 个补丁碰它)和 `output.go`(12 个)。
 
 ## 基线:为什么是集群版
 
@@ -206,7 +207,7 @@ for p in 0*.patch; do git apply --check --directory=vms "$p" || echo "^^ 会冲�
 
 ## 下面的详解覆盖到哪
 
-一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十二节是 `030`~`042`。
+一~七节对应 `004`~`010`,即全部"必须"和"强烈建议"的那几条;八、九节是 `028`、`029`,十~二十三节是 `030`~`043`。
 `011`~`016` 是文档、性能和测试,上表的一句话就够了,没有单独章节。
 
 ---
@@ -916,3 +917,33 @@ client_golang v1.24.1027 同时修复了评审中复核出的边车丢数:空闲
 ### 用法与约束
 
 - 单个 `-remoteWrite.url` 时不用改配置。写往多个存储且要 `sample_timestamps` 的,显式设置 `-remoteWrite.streamAggr.sampleTimestamps`,并确认每个存储都有 `-dedup.minScrapeInterval=1ms`。
+
+## 二十三、强杀不丢用量:按网格刷出(043)
+
+### 解决什么
+
+实验集群强杀 vmagent(`kill -9`,相当于 OOMKilled;以及 `kill -9` 后强删 pod,相当于节点宕机),流量进行中:每次强杀丢 1~2 分钟用量,13 分钟的测试里两次强杀丢了 12,778 个请求中的 3,227 个。
+
+- vmagent 处理完一轮抓取就向边车确认,这一轮在下一次刷出前只在内存里。
+- ACG 每条规则都配了 `flush_on_shutdown: true`,这时刷出的相位跟着进程启动时刻(比如每分钟的第 28 秒),一个结束了的 interval 要再等最多一个 interval 才写出,强杀最多丢两个 interval。
+- 实验节点的墙上时钟相对单调时钟每 30 秒快 1.1 秒并被逐步校正:刷出时刻按墙上时钟早到哪怕一毫秒,刚结束的 interval 就留到下一次,又是一个 interval。
+
+### 改了什么
+
+- 开了 `scrape_time_intervals` 的规则按自己 interval 的网格刷出(1m 的整分、5m 的整 5 分、1h 的整点),不再看 `flush_on_shutdown`;没开的规则行为不变。
+- 刷出前等墙上时钟到达网格点。
+- `sample_timestamps` 改名为 `scrape_time_intervals`,参数改为 `-remoteWrite.streamAggr.scrapeTimeIntervals`、`-streamAggr.scrapeTimeIntervals`;旧名照样生效(启动日志提示改名),同一条规则新旧名取值不同则报错。
+- 用量 job 的抓取加上 `scrape_offset: 55s`(配置,不是代码):每分钟第 55 秒抓取,这一轮属于整分结束的那个 interval,几秒后整分刷出时写出,未写出的用量只在内存里停留几秒。代价是每分钟的用量按 :55 ~ :55 划分;单次抓取处理超过 5 秒的,记到下一分钟,不丢。
+
+### 已做的验证
+
+- 新测试:进程在整分后 28 秒启动,1m、5m 规则都在各自网格上刷出,没开的规则保持启动相位;墙上时钟比刷出计时器慢 50 毫秒时,每个 interval 仍在结束后的那次刷出写出(不等待时每个都晚一分钟)。都在 v1.126.1035 上失败、在 043 上通过。
+- 旧名、旧参数照样生效,新旧名冲突报错,各有测试。
+- 实验集群,两次强杀、13 分钟流量:12,877 个请求一个不丢(之前丢 3,227 个);每分钟一致性 300 项全部通过。
+- 加上 `scrape_offset: 55s`、显式设 `-remoteWrite.streamAggr.scrapeTimeIntervals=true`,流量中强杀一次:5,741 个请求、8,676,437 个 token 一个不丢,每一分钟都在。
+- 同样的轮次经 102 条规则,输出与 v1.126.1035 逐字节相同;全部单测通过,`-race` 通过。
+
+### 用法与约束
+
+- 按 `integration/vm-side.md` 第 2 步:用量 job 加 `scrape_offset: 55s`,`extraArgs` 里 `remoteWrite.streamAggr.sampleTimestamps` 改名为 `remoteWrite.streamAggr.scrapeTimeIntervals`。
+- 换回早于 v1.126.1036 的镜像时,参数要改回旧名,旧镜像不认新名。
