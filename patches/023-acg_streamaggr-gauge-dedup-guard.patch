@@ -1,7 +1,7 @@
 From dbfe792c409c3ea2198460b371365203137816bc Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Mon, 21 Sep 2026 04:55:19 -0700
-Subject: [PATCH 20/20] lib/streamaggr: pin that the gauge rule still sums
+Subject: [PATCH 20/40] lib/streamaggr: pin that the gauge rule still sums
  across pods with dedup on
 
 drop_input_labels removes a label before de-duplication; without removes it at

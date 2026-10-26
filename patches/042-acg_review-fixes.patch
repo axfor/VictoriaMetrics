@@ -1,7 +1,7 @@
-From 3e82dc19f7cfce1e1fea9e9ac61f1176e0530cba Mon Sep 17 00:00:00 2001
+From 63a3c2aaf1ecef664b97a48ebff2759bd552d51f Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 25 Oct 2026 11:17:40 -0700
-Subject: [PATCH 39/39] lib/promscrape, lib/streamaggr, app/vmagent: what the
+Subject: [PATCH 39/40] lib/promscrape, lib/streamaggr, app/vmagent: what the
  code review found
 
 - The last acknowledgements on stop went to every target scraped within the

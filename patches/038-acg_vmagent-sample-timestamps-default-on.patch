@@ -1,7 +1,7 @@
-From 5bfa727f76e5ff0d68df39a3f98a0851e7c8927d Mon Sep 17 00:00:00 2001
+From 750cbc5757fafedb9c47f1516ad7c5dd9152ddf4 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 25 Oct 2026 01:59:54 -0700
-Subject: [PATCH 35/35] app/vmagent/remotewrite: turn sample_timestamps on by
+Subject: [PATCH 35/40] app/vmagent/remotewrite: turn sample_timestamps on by
  default
 
 -streamAggr.sampleTimestamps and -remoteWrite.streamAggr.sampleTimestamps are

@@ -1,7 +1,7 @@
 From fd7c4e1bfca47ec4d798b9c064af1960c00b4fdb Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Fri, 2 Oct 2026 09:25:18 -0700
-Subject: [PATCH 27/27] lib/streamaggr: write sums at the timestamps of the
+Subject: [PATCH 27/40] lib/streamaggr: write sums at the timestamps of the
  samples, not of the flush
 
 Stream aggregation stamps every output with the time of the flush that

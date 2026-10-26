@@ -1,7 +1,7 @@
-From 0f10023f8303495b941e347eab4bde3a7a1e781c Mon Sep 17 00:00:00 2001
+From 3b47a8487cc517bed820dda9b60dc796d18dd9d6 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 25 Oct 2026 02:18:34 -0700
-Subject: [PATCH 36/36] lib/promscrape: send targets exposing increments a last
+Subject: [PATCH 36/40] lib/promscrape: send targets exposing increments a last
  acknowledgement on stop
 
 A vmagent stopped while a scrape was on its way -- the target had written the

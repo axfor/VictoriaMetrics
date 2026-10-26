@@ -1,7 +1,7 @@
 From f94c5ecce2866d2ef428fd73b06652eafe3e4a33 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Tue, 29 Sep 2026 21:27:23 -0700
-Subject: [PATCH 26/26] lib/storage: collect a filtered TSDB status from the
+Subject: [PATCH 26/40] lib/storage: collect a filtered TSDB status from the
  names of its series
 
 With match[] set, getTSDBStatus finds the matching metricIDs and then scans

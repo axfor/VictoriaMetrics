@@ -1,7 +1,7 @@
 From 8f4f91f5454575d0b1c418db5810e496579f795f Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Mon, 21 Sep 2026 19:41:31 -0700
-Subject: [PATCH 21/21] lib/encoding/zstd: default the encoder concurrency to
+Subject: [PATCH 21/40] lib/encoding/zstd: default the encoder concurrency to
  one slot
 
 The flag was added with the library's own default -- one slot per CPU -- so a

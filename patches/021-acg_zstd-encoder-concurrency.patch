@@ -1,7 +1,7 @@
 From b7b1fbe342e41b1a15909cde883931fd2aa7d9ad Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 20 Sep 2026 22:28:11 -0700
-Subject: [PATCH 18/18] lib/encoding/zstd: bound how many blocks may be
+Subject: [PATCH 18/40] lib/encoding/zstd: bound how many blocks may be
  compressed at once
 
 The encoder is created without WithEncoderConcurrency, so the library defaults

@@ -1,7 +1,7 @@
-From b811ddb852e3265c5d2aafc6967ba998c4a9d28e Mon Sep 17 00:00:00 2001
+From ee030b4964d474f368898aa11830b8cea2d6e8a1 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 25 Oct 2026 01:58:33 -0700
-Subject: [PATCH 34/34] lib/streamaggr: place a sample_timestamps round the
+Subject: [PATCH 34/40] lib/streamaggr: place a sample_timestamps round the
  same in every rule, at its first block
 
 A round processed late, or in blocks a boundary falls between, could still go

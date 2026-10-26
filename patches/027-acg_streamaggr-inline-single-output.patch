@@ -1,7 +1,7 @@
 From cefa6d209c07c8eb11aeef35c847f6bf4635e1be Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Wed, 23 Sep 2026 08:25:04 -0700
-Subject: [PATCH 24/24] lib/streamaggr: hold a single output inside its entry,
+Subject: [PATCH 24/40] lib/streamaggr: hold a single output inside its entry,
  and sum_samples_total's state with its value
 
 Without shared state -- enable_windows off, the common configuration and ACG's

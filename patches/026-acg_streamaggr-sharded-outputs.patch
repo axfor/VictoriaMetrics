@@ -1,7 +1,7 @@
 From 6233a36b37a448674164f39d68a09f75577a27d5 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Wed, 23 Sep 2026 08:11:18 -0700
-Subject: [PATCH 23/23] lib/streamaggr: keep output entries in sharded maps
+Subject: [PATCH 23/40] lib/streamaggr: keep output entries in sharded maps
  instead of a sync.Map
 
 A heap profile of vmagent aggregating one 30k-key deployment -- about nine

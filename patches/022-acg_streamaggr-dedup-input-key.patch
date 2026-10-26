@@ -1,7 +1,7 @@
 From 6e1524e8b0caedf01091e9fc9fb5b4435f5ea295 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Mon, 21 Sep 2026 04:22:40 -0700
-Subject: [PATCH 19/19] lib/streamaggr: dedup was losing every input series but
+Subject: [PATCH 19/40] lib/streamaggr: dedup was losing every input series but
  one
 
 An adversarial review found that the change which stopped building the input

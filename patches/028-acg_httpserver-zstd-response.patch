@@ -1,7 +1,7 @@
 From 765ba6f38000fec607e3f56b9b2154539ef81c46 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Tue, 29 Sep 2026 21:27:01 -0700
-Subject: [PATCH 25/25] lib/httpserver: compress responses with zstd for
+Subject: [PATCH 25/40] lib/httpserver: compress responses with zstd for
  clients that prefer it
 
 Responses are gzipped by gzhttp, which picks gzip whenever a client lists

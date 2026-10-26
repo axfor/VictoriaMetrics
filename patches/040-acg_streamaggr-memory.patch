@@ -1,7 +1,7 @@
-From 67afb9c39026d95f18805d8b8b0c6aa42ea1899a Mon Sep 17 00:00:00 2001
+From 0e4ad9d25875984b6e948d436f32c374b3889bb9 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Sun, 25 Oct 2026 04:51:16 -0700
-Subject: [PATCH 37/37] lib/streamaggr: 40% less heap for ACG's aggregation,
+Subject: [PATCH 37/40] lib/streamaggr: 40% less heap for ACG's aggregation,
  flushes twice as fast
 
 A heap profile of the 102 production rules on 37% of the full sidecar response

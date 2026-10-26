@@ -1,7 +1,7 @@
 From 2d73dabdea8dea370d56cac456f6d4962b7a176a Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Mon, 21 Sep 2026 22:24:11 -0700
-Subject: [PATCH 22/22] lib/streamaggr: let sum_samples_total leave out flushes
+Subject: [PATCH 22/40] lib/streamaggr: let sum_samples_total leave out flushes
  that change nothing
 
 An aggregator flushes every output every interval, whether or not the value

@@ -1,7 +1,7 @@
-From d949b281b6206560e4cbb3687c1663344f72506d Mon Sep 17 00:00:00 2001
+From 8ec2f7033d888e9053b059e20ba41705d3535707 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 22 Oct 2026 21:09:09 -0700
-Subject: [PATCH 31/31] lib/httpserver: let the zstd response writer be
+Subject: [PATCH 31/40] lib/httpserver: let the zstd response writer be
  unwrapped
 
 http.NewResponseController reaches what a wrapper does not implement,

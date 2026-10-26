@@ -1,7 +1,7 @@
-From e643e25cbbe766d8d6f30bfad13e1e36af699d2c Mon Sep 17 00:00:00 2001
+From 20af55cfa34beefa3c10b7c5fe945b46a36544c6 Mon Sep 17 00:00:00 2001
 From: axfor <aixiaoxiang2009@hotmail.com>
 Date: Thu, 22 Oct 2026 21:09:09 -0700
-Subject: [PATCH 30/30] lib/promscrape: acknowledge the rounds of targets
+Subject: [PATCH 30/40] lib/promscrape: acknowledge the rounds of targets
  exposing increments
 
 A target exposing increments with client_golang's promhttp/delta commits
