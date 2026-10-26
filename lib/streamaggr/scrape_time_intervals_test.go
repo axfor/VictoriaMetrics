@@ -109,9 +109,9 @@ func increaseIn(samples []outSample, from, to time.Duration) float64 {
 // One target's round 2 is processed after round 3 was written. It cannot be
 // written at 2m, after 3m in the series: the counter would go back. It goes to
 // 3m, off by the gap between the two targets rather than lost or misplaced.
-func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
+func TestScrapeTimeIntervalsTotalNeverGoesBack(t *testing.T) {
 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
-		"  staleness_interval: 40m\n  sample_timestamps: true\n"
+		"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
 	pushes := []latePush{
 		{at: 3*time.Minute + 10*time.Second, sampleAt: 3 * time.Minute, metrics: `foo 1`},
 		{at: 4*time.Minute + 30*time.Second, sampleAt: 2 * time.Minute, metrics: `foo 1`},
@@ -127,13 +127,13 @@ func TestSampleTimestampsTotalNeverGoesBack(t *testing.T) {
 	}
 }
 
-func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
+func TestScrapeTimeIntervalsRefusesWhatItCannotDo(t *testing.T) {
 	for _, cfg := range []string{
-		"- match: foo\n  interval: 1m\n  outputs: [total]\n  sample_timestamps: true\n",
-		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  sample_timestamps: true\n",
-		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
-		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
-		"- match: foo\n  interval: 1m\n  ignore_old_samples: true\n  outputs: [sum_samples]\n  sample_timestamps: true\n",
+		"- match: foo\n  interval: 1m\n  outputs: [total]\n  scrape_time_intervals: true\n",
+		"- match: foo\n  interval: 1m\n  outputs: [sum_samples, max]\n  scrape_time_intervals: true\n",
+		"- match: foo\n  interval: 1m\n  dedup_interval: 30s\n  outputs: [sum_samples]\n  scrape_time_intervals: true\n",
+		"- match: foo\n  interval: 1m\n  enable_windows: true\n  outputs: [sum_samples]\n  scrape_time_intervals: true\n",
+		"- match: foo\n  interval: 1m\n  ignore_old_samples: true\n  outputs: [sum_samples]\n  scrape_time_intervals: true\n",
 	} {
 		a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, nil, "test")
 		if err == nil {
@@ -146,17 +146,17 @@ func TestSampleTimestampsRefusesWhatItCannotDo(t *testing.T) {
 // The global option is one flag over a whole config: it leaves alone the
 // aggregations it cannot apply to, such as a gauge de-duplicated per interval,
 // and takes the rest.
-func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
+func TestScrapeTimeIntervalsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples_total]\n" +
 		"- match: bar\n  interval: 1m\n  dedup_interval: 60s\n  outputs: [sum_samples]\n" +
 		"- match: baz\n  interval: 1m\n  outputs: [max]\n"
-	a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, &Options{SampleTimestamps: true}, "test")
+	a, err := LoadFromData([]byte(cfg), func([]prompb.TimeSeries) {}, &Options{ScrapeTimeIntervals: true}, "test")
 	if err != nil {
 		t.Fatalf("the global option refused the config: %s", err)
 	}
 	defer a.MustStop()
 	for i, want := range []bool{true, false, false} {
-		if got := a.as[i].sampleTimestamps; got != want {
+		if got := a.as[i].scrapeTimeIntervals; got != want {
 			t.Errorf("aggregation %d: sample timestamps %v, want %v", i, got, want)
 		}
 	}
@@ -165,10 +165,10 @@ func TestSampleTimestampsGlobalOptionSkipsWhatItCannotApplyTo(t *testing.T) {
 // A flush that runs a little after its boundary finds samples scraped after the
 // boundary, of the interval still open. They must not be written into the
 // interval that just closed, and not twice.
-func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
+func TestScrapeTimeIntervalsOpenIntervalStaysOpen(t *testing.T) {
 	for _, output := range []string{"sum_samples", "sum_samples_total"} {
 		cfg := "- match: foo\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-			"  staleness_interval: 40m\n  sample_timestamps: true\n"
+			"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
 		var got []outSample
 		synctest.Test(t, func(t *testing.T) {
 			start := time.Now()
@@ -219,9 +219,9 @@ func TestSampleTimestampsOpenIntervalStaysOpen(t *testing.T) {
 // The flush on shutdown writes the interval still open, before it ends, at the
 // time of the shutdown. Right after a boundary that is still in the open
 // interval, not in the one just closed.
-func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
+func TestScrapeTimeIntervalsShutdownRightAfterBoundary(t *testing.T) {
 	cfg := "- match: foo\n  interval: 1m\n  outputs: [sum_samples]\n  keep_metric_names: true\n" +
-		"  flush_on_shutdown: true\n  sample_timestamps: true\n"
+		"  flush_on_shutdown: true\n  scrape_time_intervals: true\n"
 	var got []outSample
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
@@ -254,10 +254,10 @@ func TestSampleTimestampsShutdownRightAfterBoundary(t *testing.T) {
 // interval right after the boundary and of the one after that. Neither may be
 // written ahead of the other, or sum_samples_total, which never writes a
 // timestamp before one it has written, would move the first into the second.
-func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
+func TestScrapeTimeIntervalsFlushLongerThanInterval(t *testing.T) {
 	for _, output := range []string{"sum_samples", "sum_samples_total"} {
 		cfg := "- match: '{__name__=~\"foo|bar\"}'\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-			"  staleness_interval: 40m\n  sample_timestamps: true\n"
+			"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
 		var got []outSample
 		synctest.Test(t, func(t *testing.T) {
 			start := time.Now()
@@ -322,9 +322,9 @@ func TestSampleTimestampsFlushLongerThanInterval(t *testing.T) {
 // whose heartbeat is not due, so by its own latest point the cost of minute 1's
 // late round would go back into minute 1 while its tokens went to minute 3: the
 // two would be over in one minute and short in the other, and so in their hours.
-func TestSampleTimestampsTotalLateRoundLandsTogether(t *testing.T) {
+func TestScrapeTimeIntervalsTotalLateRoundLandsTogether(t *testing.T) {
 	cfg := "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [sum_samples_total]\n  keep_metric_names: true\n" +
-		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  sample_timestamps: true\n"
+		"  staleness_interval: 40m\n  output_heartbeat_interval: 4m\n  scrape_time_intervals: true\n"
 	pushes := []latePush{
 		{at: 30 * time.Second, sampleAt: 30 * time.Second, metrics: "tokens 10\ncost 30"},
 		{at: 150 * time.Second, sampleAt: 150 * time.Second, metrics: "tokens 5\ncost 0"}, // a free request

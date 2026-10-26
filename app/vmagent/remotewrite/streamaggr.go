@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -39,11 +40,12 @@ var (
 	streamAggrGlobalEnableWindows = flag.Bool("streamAggr.enableWindows", false, "Enables aggregation within fixed windows for all global aggregators. "+
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
-	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
+	streamAggrGlobalScrapeTimeIntervals = flag.Bool("streamAggr.scrapeTimeIntervals", false, "Whether the global aggregators write sum_samples and sum_samples_total "+
 		"at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape stay in one interval in every aggregation. "+
 		"Not set, it is true when there is a single -remoteWrite.url and false with several. "+
 		"Applies to the aggregations it can apply to and skips the others. Needs -dedup.minScrapeInterval=1ms on every storage written to. "+
-		"Can be overridden per aggregation via sample_timestamps option")
+		"Can be overridden per aggregation via scrape_time_intervals option")
+	streamAggrGlobalSampleTimestamps = flag.Bool("streamAggr.sampleTimestamps", false, "Deprecated: the former name of -streamAggr.scrapeTimeIntervals, which takes precedence when both are set")
 
 	// Per URL config
 	streamAggrConfig = flagutil.NewArrayString("remoteWrite.streamAggr.config", "Optional path to file with stream aggregation config for the corresponding -remoteWrite.url. "+
@@ -71,11 +73,13 @@ var (
 	streamAggrEnableWindows = flagutil.NewArrayBool("remoteWrite.streamAggr.enableWindows", "Enables aggregation within fixed windows for all remote write's aggregators. "+
 		"This allows to get more precise results, but impacts resource usage as it requires twice more memory to store two states. "+
 		"See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregation-windows.")
-	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
+	streamAggrScrapeTimeIntervals = flagutil.NewArrayBool("remoteWrite.streamAggr.scrapeTimeIntervals", "Whether the aggregators of the corresponding -remoteWrite.streamAggr.config "+
 		"write sum_samples and sum_samples_total at the end of the interval the input samples were scraped in instead of at the flush, so the samples of one scrape "+
 		"stay in one interval in every aggregation. Not set, it is true when there is a single -remoteWrite.url and false with several; "+
 		"applies to the aggregations it can apply to and skips the others. "+
-		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via sample_timestamps option")
+		"Needs -dedup.minScrapeInterval=1ms on the storage. Can be overridden per aggregation via scrape_time_intervals option")
+	streamAggrSampleTimestamps = flagutil.NewArrayBool("remoteWrite.streamAggr.sampleTimestamps", "Deprecated: the former name of -remoteWrite.streamAggr.scrapeTimeIntervals, "+
+		"which takes precedence when both are set")
 )
 
 // CheckStreamAggrConfigs checks -remoteWrite.streamAggr.config and -streamAggr.config.
@@ -225,7 +229,7 @@ func newStreamAggrConfigGlobal() (*streamaggr.Aggregators, error) {
 		IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
 		KeepInput:            *streamAggrGlobalKeepInput,
 		EnableWindows:        *streamAggrGlobalEnableWindows,
-		SampleTimestamps:     globalSampleTimestamps(),
+		ScrapeTimeIntervals:  globalScrapeTimeIntervals(),
 	}
 
 	sas, err := streamaggr.LoadFromFile(path, pushTimeSeriesToRemoteStoragesTrackDropped, opts, "global")
@@ -260,7 +264,7 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
 		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
 		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
 		EnableWindows:        streamAggrEnableWindows.GetOptionalArg(idx),
-		SampleTimestamps:     sampleTimestampsFor(idx),
+		ScrapeTimeIntervals:  scrapeTimeIntervalsFor(idx),
 	}
 
 	sas, err := streamaggr.LoadFromFile(path, pushFunc, opts, alias)
@@ -270,38 +274,73 @@ func newStreamAggrConfigPerURL(idx int, pushFunc streamaggr.PushFunc) (*streamag
 	return sas, nil
 }
 
-// sampleTimestampsByDefault is whether sample_timestamps is on where its flags
+// scrapeTimeIntervalsByDefault is whether scrape_time_intervals is on where its flags
 // are not set: with a single -remoteWrite.url, whose storage the deployment runs
-// with -dedup.minScrapeInterval=1ms. sample_timestamps writes an interval again
+// with -dedup.minScrapeInterval=1ms. scrape_time_intervals writes an interval again
 // at the same timestamp, and a storage without it keeps both samples and counts
 // the interval twice; with several urls, it is turned on explicitly.
-func sampleTimestampsByDefault() bool {
+func scrapeTimeIntervalsByDefault() bool {
 	return len(*remoteWriteURLs) == 1
 }
 
-// sampleTimestampsFor returns -remoteWrite.streamAggr.sampleTimestamps for the
-// -remoteWrite.url at idx, see sampleTimestampsByDefault when it is not set.
-func sampleTimestampsFor(idx int) bool {
-	if len(*streamAggrSampleTimestamps) == 0 {
-		return sampleTimestampsByDefault()
+// scrapeTimeIntervalsFor returns -remoteWrite.streamAggr.scrapeTimeIntervals for the
+// -remoteWrite.url at idx, see scrapeTimeIntervalsByDefault when it is not set.
+func scrapeTimeIntervalsFor(idx int) bool {
+	switch {
+	case len(*streamAggrScrapeTimeIntervals) > 0:
+		if len(*streamAggrSampleTimestamps) > 0 {
+			warnFormerName("-remoteWrite.streamAggr.sampleTimestamps", "-remoteWrite.streamAggr.scrapeTimeIntervals", true)
+		}
+		return streamAggrScrapeTimeIntervals.GetOptionalArg(idx)
+	case len(*streamAggrSampleTimestamps) > 0:
+		warnFormerName("-remoteWrite.streamAggr.sampleTimestamps", "-remoteWrite.streamAggr.scrapeTimeIntervals", false)
+		return streamAggrSampleTimestamps.GetOptionalArg(idx)
 	}
-	return streamAggrSampleTimestamps.GetOptionalArg(idx)
+	return scrapeTimeIntervalsByDefault()
 }
 
-// globalSampleTimestamps returns -streamAggr.sampleTimestamps, see
-// sampleTimestampsByDefault when it is not set.
-func globalSampleTimestamps() bool {
-	set := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "streamAggr.sampleTimestamps" {
+// globalScrapeTimeIntervals returns -streamAggr.scrapeTimeIntervals, see
+// scrapeTimeIntervalsByDefault when it is not set.
+func globalScrapeTimeIntervals() bool {
+	set, oldSet := false, false
+	visitSetFlags(func(f *flag.Flag) {
+		switch f.Name {
+		case "streamAggr.scrapeTimeIntervals":
 			set = true
+		case "streamAggr.sampleTimestamps":
+			oldSet = true
 		}
 	})
-	if set {
+	switch {
+	case set:
+		if oldSet {
+			warnFormerName("-streamAggr.sampleTimestamps", "-streamAggr.scrapeTimeIntervals", true)
+		}
+		return *streamAggrGlobalScrapeTimeIntervals
+	case oldSet:
+		warnFormerName("-streamAggr.sampleTimestamps", "-streamAggr.scrapeTimeIntervals", false)
 		return *streamAggrGlobalSampleTimestamps
 	}
-	return sampleTimestampsByDefault()
+	return scrapeTimeIntervalsByDefault()
 }
+
+// visitSetFlags is flag.Visit, which tests replace: a flag set once stays set.
+var visitSetFlags = flag.Visit
+
+// warnFormerName logs that a flag was given its former name, once a process
+// for each.
+func warnFormerName(former, name string, both bool) {
+	if _, warned := formerNamesWarned.LoadOrStore(former, true); warned {
+		return
+	}
+	if both {
+		logger.Warnf("%s is the former name of %s, which is set too and takes precedence; drop %s", former, name, former)
+		return
+	}
+	logger.Warnf("%s is the former name of %s; it still works, rename it", former, name)
+}
+
+var formerNamesWarned sync.Map
 
 // pushToStreamAggr pushes tss to sas, the aggregators loaded from p, and
 // reports whether any aggregation was configured to take them. A config reload

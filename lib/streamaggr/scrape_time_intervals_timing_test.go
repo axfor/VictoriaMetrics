@@ -9,19 +9,19 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 )
 
-// The ACG shape under sample_timestamps: every output is fed by many targets,
+// The ACG shape under scrape_time_intervals: every output is fed by many targets,
 // and vmagent scrapes each target at an offset of its own, so the rounds of one
 // minute reach an output with as many distinct timestamps as there are targets.
 // lag is how many minutes of rounds pile up between two flushes, as while
 // vmagent is behind.
-func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
+func BenchmarkScrapeTimeIntervalsManyTargets(b *testing.B) {
 	const (
 		targets = 20
 		keys    = 2000
 	)
 	for _, lag := range []int{1, 4} {
 		for _, mode := range []string{"off", "on"} {
-			b.Run(fmt.Sprintf("lag=%dm/sample_timestamps=%s", lag, mode), func(b *testing.B) {
+			b.Run(fmt.Sprintf("lag=%dm/scrape_time_intervals=%s", lag, mode), func(b *testing.B) {
 				config := `
 - match: acg_cost_total
   interval: 1m
@@ -29,7 +29,7 @@ func BenchmarkSampleTimestampsManyTargets(b *testing.B) {
   outputs: [sum_samples]
 `
 				if mode == "on" {
-					config += "  sample_timestamps: true\n"
+					config += "  scrape_time_intervals: true\n"
 				}
 				var outSamples atomic.Int64
 				pushFunc := func(tss []prompb.TimeSeries) {

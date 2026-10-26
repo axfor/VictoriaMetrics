@@ -119,16 +119,18 @@ specified individually per each `-remoteWrite.url`:
   #
   # reset_marker_on_stale: false
 
-  # sample_timestamps instructs to write sum_samples and sum_samples_total at the end of the interval
-  # the input samples' timestamps fall in, instead of at the flush, so samples processed late, when vmagent
-  # falls behind, still count towards the interval they were scraped in rather than the one they were processed in.
-  # Samples of all the targets within one interval are summed together and written once.
+  # scrape_time_intervals puts every input sample of sum_samples and sum_samples_total in the interval
+  # it was scraped in and writes it at the end of that interval, instead of in the interval of the flush,
+  # so the samples of one scrape stay together in every aggregation, and samples processed late, when
+  # vmagent falls behind, still count towards the interval they were scraped in. Such an aggregation
+  # flushes on the grid of its interval. It needs -dedup.minScrapeInterval=1ms on the storage.
   # It supports only sum_samples and sum_samples_total outputs, and cannot be combined with
-  # enable_windows or dedup_interval, which decide timestamps of their own.
-  # By default it is disabled unless -remoteWrite.streamAggr.sampleTimestamps or -streamAggr.sampleTimestamps
-  # command-line flags are set; the flags enable it for the aggregations it supports and leave the others alone.
+  # enable_windows, dedup_interval or ignore_old_samples.
+  # Not set, it follows -remoteWrite.streamAggr.scrapeTimeIntervals or -streamAggr.scrapeTimeIntervals,
+  # which are on with a single -remoteWrite.url and apply to the aggregations it supports.
+  # sample_timestamps is its former name, still accepted.
   #
-  # sample_timestamps: false
+  # scrape_time_intervals: false
 
   # without is an optional list of labels, which must be removed from the output aggregation.
   # See https://docs.victoriametrics.com/victoriametrics/stream-aggregation/#aggregating-by-labels

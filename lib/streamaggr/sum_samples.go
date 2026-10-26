@@ -24,22 +24,22 @@ func (*sumSamplesAggrValue) state() any {
 	return nil
 }
 
-func newSumSamplesAggrConfig(sampleTimestamps bool) aggrConfig {
-	return &sumSamplesAggrConfig{sampleTimestamps: sampleTimestamps}
+func newSumSamplesAggrConfig(scrapeTimeIntervals bool) aggrConfig {
+	return &sumSamplesAggrConfig{scrapeTimeIntervals: scrapeTimeIntervals}
 }
 
 type sumSamplesAggrConfig struct {
-	sampleTimestamps bool
+	scrapeTimeIntervals bool
 }
 
 func (c *sumSamplesAggrConfig) getValue(_ any) aggrValue {
-	if c.sampleTimestamps {
+	if c.scrapeTimeIntervals {
 		return &sumSamplesAtValue{}
 	}
 	return &sumSamplesAggrValue{}
 }
 
-// sumSamplesAtValue is sum_samples under sample_timestamps: every sum goes to
+// sumSamplesAtValue is sum_samples under scrape_time_intervals: every sum goes to
 // the interval its samples were scraped in, written at the end of it, rather
 // than to the one the aggregator happened to process them in. See stPlace for
 // where a sample goes and stFlush for when it is written.
@@ -134,7 +134,7 @@ type slot struct {
 }
 
 // bySampleTime holds the input sums of one output, one per interval, for
-// sample_timestamps. Two are inline, which covers what an output has at any
+// scrape_time_intervals. Two are inline, which covers what an output has at any
 // time but while the aggregator is far behind on flushing: the interval being
 // filled, and the one written last -- or the next one, which the rounds right
 // after a boundary start before the flush gets to the output.
@@ -234,7 +234,7 @@ func mergeSlots(s []slot) []slot {
 }
 
 // stState is the aggregator's position in the intervals under
-// sample_timestamps, as of the start of a flush. Every output of the aggregator
+// scrape_time_intervals, as of the start of a flush. Every output of the aggregator
 // decides with the same one, so a round's samples go to the same interval in
 // all of them.
 type stState struct {
@@ -324,12 +324,12 @@ func (av *sumSamplesTotalAggrValue) state() any {
 	return av.shared
 }
 
-func newSumSamplesTotalAggrConfig(sampleTimestamps bool) aggrConfig {
-	return &sumSamplesTotalAggrConfig{sampleTimestamps: sampleTimestamps}
+func newSumSamplesTotalAggrConfig(scrapeTimeIntervals bool) aggrConfig {
+	return &sumSamplesTotalAggrConfig{scrapeTimeIntervals: scrapeTimeIntervals}
 }
 
 type sumSamplesTotalAggrConfig struct {
-	sampleTimestamps bool
+	scrapeTimeIntervals bool
 }
 
 // sumSamplesTotalOwned is a value together with the shared state it owns when
@@ -340,8 +340,8 @@ type sumSamplesTotalOwned struct {
 }
 
 func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
-	if c.sampleTimestamps {
-		// sample_timestamps is refused together with enable_windows, the only
+	if c.scrapeTimeIntervals {
+		// scrape_time_intervals is refused together with enable_windows, the only
 		// source of shared state.
 		return &sumSamplesTotalAtValue{}
 	}
@@ -353,7 +353,7 @@ func (c *sumSamplesTotalAggrConfig) getValue(s any) aggrValue {
 	return &o.v
 }
 
-// sumSamplesTotalAtValue is sum_samples_total under sample_timestamps. It
+// sumSamplesTotalAtValue is sum_samples_total under scrape_time_intervals. It
 // writes the total as of the end of each interval it has samples of, in order,
 // so an increment lands in the interval it was scraped in even when the
 // aggregator processes it minutes later. A sample for the interval written
@@ -448,7 +448,7 @@ func (av *sumSamplesTotalAtValue) flush(_ aggrConfig, ctx *flushCtx, key string,
 	}
 }
 
-// state is nil: sample_timestamps is refused with enable_windows, the only user of shared state.
+// state is nil: scrape_time_intervals is refused with enable_windows, the only user of shared state.
 func (av *sumSamplesTotalAtValue) state() any { return nil }
 
 func (av *sumSamplesTotalAtValue) firstPending() (int64, bool) { return av.pending.first() }

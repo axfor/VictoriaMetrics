@@ -15,7 +15,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 )
 
-// The rules of sample_timestamps, as these tests check them. A sample belongs
+// The rules of scrape_time_intervals, as these tests check them. A sample belongs
 // to the interval [end - interval, end) its scrape timestamp falls in, and is
 // written at the end of it:
 //
@@ -33,7 +33,7 @@ func tokensCost(v float64) string { return fmt.Sprintf("tokens %v\ncost %v", v, 
 
 func stConfig(output string, extra string) string {
 	return "- match: '{__name__=~\"tokens|cost\"}'\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-		"  staleness_interval: 40m\n  sample_timestamps: true\n" + extra
+		"  staleness_interval: 40m\n  scrape_time_intervals: true\n" + extra
 }
 
 // perInterval is what an output wrote for the interval ending at to: the sum
@@ -65,7 +65,7 @@ var stOutputs = []string{"sum_samples", "sum_samples_total"}
 
 // Rounds processed within their interval are written with it, once per
 // interval however many targets feed it.
-func TestSampleTimestampsOnTimeRoundsGoToTheirInterval(t *testing.T) {
+func TestScrapeTimeIntervalsOnTimeRoundsGoToTheirInterval(t *testing.T) {
 	for _, output := range stOutputs {
 		var pushes []latePush
 		for m := 0; m < 3; m++ {
@@ -90,7 +90,7 @@ func TestSampleTimestampsOnTimeRoundsGoToTheirInterval(t *testing.T) {
 // A round scraped right on a boundary, as scrape_align_interval has them,
 // belongs to the interval that starts there; one scraped a millisecond before
 // it, to the one that ends there.
-func TestSampleTimestampsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
+func TestScrapeTimeIntervalsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
 	for _, output := range stOutputs {
 		got := runLateScenario(t, stConfig(output, ""), []latePush{
 			{at: 2*time.Minute - time.Millisecond, sampleAt: 2*time.Minute - time.Millisecond, metrics: tokensCost(1)},
@@ -103,7 +103,7 @@ func TestSampleTimestampsBoundaryBelongsToTheIntervalItStarts(t *testing.T) {
 // The tail of a round that crossed the boundary -- processed after its interval
 // was written, before the next one was -- completes that interval: it is written
 // again at the same timestamp, with the whole round.
-func TestSampleTimestampsTailCompletesTheIntervalWrittenLast(t *testing.T) {
+func TestScrapeTimeIntervalsTailCompletesTheIntervalWrittenLast(t *testing.T) {
 	for _, output := range stOutputs {
 		got := runLateScenario(t, stConfig(output, ""), []latePush{
 			{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: tokensCost(4)},
@@ -124,7 +124,7 @@ func TestSampleTimestampsTailCompletesTheIntervalWrittenLast(t *testing.T) {
 
 // A tail that would make the interval smaller cannot complete it -- VM keeps the
 // bigger of two values at one timestamp -- so it goes to the next interval.
-func TestSampleTimestampsNegativeTailGoesToTheNextInterval(t *testing.T) {
+func TestScrapeTimeIntervalsNegativeTailGoesToTheNextInterval(t *testing.T) {
 	got := runLateScenario(t, stConfig("sum_samples", ""), []latePush{
 		{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: `tokens 4`},
 		{at: 2*time.Minute + 10*time.Second, sampleAt: 80 * time.Second, metrics: `tokens -1`},
@@ -137,7 +137,7 @@ func TestSampleTimestampsNegativeTailGoesToTheNextInterval(t *testing.T) {
 // Rounds whose interval has ended by the time they are processed go to the
 // interval they are processed in, all of them together. Nothing is lost,
 // nothing counted twice.
-func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) {
+func TestScrapeTimeIntervalsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) {
 	for _, output := range stOutputs {
 		got := runLateScenario(t, stConfig(output, ""), []latePush{
 			// scraped in the minutes ending 2m to 5m, all processed at 5m10s
@@ -155,7 +155,7 @@ func TestSampleTimestampsLateRoundsGoToTheFirstIntervalNotWritten(t *testing.T) 
 // The rest of a late round processed after the flush of the interval it was
 // put in goes there too, as that interval's tail: samples sharing a scrape
 // timestamp are taken as one round, whose interval is decided at the first.
-func TestSampleTimestampsLateRoundKeepsItsInterval(t *testing.T) {
+func TestScrapeTimeIntervalsLateRoundKeepsItsInterval(t *testing.T) {
 	for _, output := range stOutputs {
 		got := runLateScenario(t, stConfig(output, ""), []latePush{
 			{at: 5*time.Minute + 10*time.Second, sampleAt: 2 * time.Minute, metrics: tokensCost(2)},
@@ -167,7 +167,7 @@ func TestSampleTimestampsLateRoundKeepsItsInterval(t *testing.T) {
 
 // Rounds scraped before the aggregator started go to the first interval it
 // writes: the one before is the previous process's, which may have written it.
-func TestSampleTimestampsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T) {
+func TestScrapeTimeIntervalsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T) {
 	for _, output := range stOutputs {
 		got := runLateScenario(t, stConfig(output, ""), []latePush{
 			{at: 10 * time.Second, sampleAt: -30 * time.Second, metrics: tokensCost(7)},
@@ -183,7 +183,7 @@ func TestSampleTimestampsRoundsBeforeTheStartGoToTheFirstInterval(t *testing.T) 
 
 // A sample stamped ahead of the clock counts as processed now; held until its
 // time came, it would keep its output from being dropped as stale.
-func TestSampleTimestampsFutureTimestampCountsNow(t *testing.T) {
+func TestScrapeTimeIntervalsFutureTimestampCountsNow(t *testing.T) {
 	got := runLateScenario(t, stConfig("sum_samples", "  flush_on_shutdown: true\n"), []latePush{
 		{at: 10 * time.Second, sampleAt: 2*time.Minute + 30*time.Second, metrics: `tokens 5`},
 	}, 4*time.Minute)["tokens"]
@@ -194,7 +194,7 @@ func TestSampleTimestampsFutureTimestampCountsNow(t *testing.T) {
 
 // sum_samples_total never goes back, puts the reset marker before its first
 // sample, and its heartbeat does not get ahead of the intervals written.
-func TestSampleTimestampsTotalStaysACounter(t *testing.T) {
+func TestScrapeTimeIntervalsTotalStaysACounter(t *testing.T) {
 	cfg := stConfig("sum_samples_total", "  output_heartbeat_interval: 4m\n  reset_marker_on_stale: true\n")
 	pushes := []latePush{{at: 30 * time.Second, sampleAt: 0, metrics: tokensCost(1)}}
 	for i := 1; i <= 11; i++ {
@@ -218,7 +218,7 @@ func TestSampleTimestampsTotalStaysACounter(t *testing.T) {
 // samples of intervals before the one written last go to the first one not
 // written. What is left is that one, the tail of the one written last and, for
 // sum_samples, what was written for it, and the next one.
-func TestSampleTimestampsPendingStaysBounded(t *testing.T) {
+func TestScrapeTimeIntervalsPendingStaysBounded(t *testing.T) {
 	for _, output := range stOutputs {
 		synctest.Test(t, func(t *testing.T) {
 			a, err := LoadFromData([]byte(stConfig(output, "")), func([]prompb.TimeSeries) {}, nil, "test")
@@ -263,23 +263,23 @@ func TestSampleTimestampsPendingStaysBounded(t *testing.T) {
 // With them -- the flush holding up the next one -- it depends on what the flush
 // had reached, and the intervals are checked for what holds regardless: a round
 // never split, no sample written before its interval, and everything counted.
-func TestSampleTimestampsRules(t *testing.T) {
+func TestScrapeTimeIntervalsRules(t *testing.T) {
 	for seed := int64(1); seed <= 20; seed++ {
 		for _, output := range stOutputs {
 			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
 				for _, overrun := range []bool{false, true} {
-					checkSampleTimestampsRules(t, seed, output, iv, overrun)
+					checkScrapeTimeIntervalsRules(t, seed, output, iv, overrun)
 				}
 			}
 		}
 	}
 }
 
-func checkSampleTimestampsRules(t *testing.T, seed int64, output string, iv time.Duration, overrun bool) {
+func checkScrapeTimeIntervalsRules(t *testing.T, seed int64, output string, iv time.Duration, overrun bool) {
 	t.Helper()
 	name := fmt.Sprintf("seed=%d output=%s interval=%s overrun=%v", seed, output, iv, overrun)
 	cfg := fmt.Sprintf("- match: '{__name__=~\"tokens|cost\"}'\n  interval: %s\n  outputs: [%s]\n  keep_metric_names: true\n"+
-		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", iv, output)
+		"  staleness_interval: 2h\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n", iv, output)
 	rnd := rand.New(rand.NewSource(seed))
 	type push struct {
 		at, sampleAt time.Duration
@@ -455,7 +455,7 @@ func checkSampleTimestampsRules(t *testing.T, seed int64, output string, iv time
 // last and write that again at the next flush. Either way the round is in the
 // same interval in every output -- for a round of the interval being written,
 // and for one processed late, whose interval is decided at its first sample.
-func TestSampleTimestampsRoundDuringTheFlushStaysTogether(t *testing.T) {
+func TestScrapeTimeIntervalsRoundDuringTheFlushStaysTogether(t *testing.T) {
 	for _, c := range []struct {
 		name               string
 		scrapedAt, firstAt time.Duration
@@ -528,7 +528,7 @@ func roundDuringTheFlush(t *testing.T, output string, scrapedAt, firstAt time.Du
 // After sum_samples_total starts its total again, as it does before float64
 // loses precision, a tail would be smaller than what was written at its
 // interval and lost to deduplication; it goes to the next interval instead.
-func TestSampleTimestampsTotalTailAfterRestartOfTheTotal(t *testing.T) {
+func TestScrapeTimeIntervalsTotalTailAfterRestartOfTheTotal(t *testing.T) {
 	big := float64(1 << 53)
 	got := runLateScenario(t, stConfig("sum_samples_total", ""), []latePush{
 		{at: 90 * time.Second, sampleAt: 80 * time.Second, metrics: fmt.Sprintf("tokens %v", big)},
@@ -554,12 +554,12 @@ func TestSampleTimestampsTotalTailAfterRestartOfTheTotal(t *testing.T) {
 // time goes to the same interval in both: where a late round goes follows from
 // when it is processed, decided once for every rule of the interval, not from
 // how far each rule's flush has got.
-func TestSampleTimestampsLateRoundSameIntervalAcrossRules(t *testing.T) {
+func TestScrapeTimeIntervalsLateRoundSameIntervalAcrossRules(t *testing.T) {
 	for _, output := range stOutputs {
 		cfg := ""
 		for _, name := range []string{"tokens", "cost"} {
 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-				"  staleness_interval: 40m\n  sample_timestamps: true\n"
+				"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
 		}
 		got := map[string][]outSample{}
 		synctest.Test(t, func(t *testing.T) {
@@ -617,7 +617,7 @@ func TestSampleTimestampsLateRoundSameIntervalAcrossRules(t *testing.T) {
 // minutes late, some while a flush walks the outputs: in every key and interval
 // the cost is three times the tokens, across the two rules, and everything is
 // counted once.
-func TestSampleTimestampsRulesAcrossRules(t *testing.T) {
+func TestScrapeTimeIntervalsRulesAcrossRules(t *testing.T) {
 	for seed := int64(1); seed <= 20; seed++ {
 		for _, output := range stOutputs {
 			for _, iv := range []time.Duration{time.Minute, 7 * time.Minute} {
@@ -632,7 +632,7 @@ func checkAcrossRules(t *testing.T, seed int64, output string, iv time.Duration)
 	name := fmt.Sprintf("seed=%d output=%s interval=%s", seed, output, iv)
 	cfg := ""
 	for _, m := range []string{"tokens", "cost"} {
-		cfg += fmt.Sprintf("- match: %s\n  interval: %s\n  by: [key]\n  outputs: [%s]\n  staleness_interval: 2h\n  flush_on_shutdown: true\n  sample_timestamps: true\n", m, iv, output)
+		cfg += fmt.Sprintf("- match: %s\n  interval: %s\n  by: [key]\n  outputs: [%s]\n  staleness_interval: 2h\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n", m, iv, output)
 	}
 	rnd := rand.New(rand.NewSource(seed))
 	type push struct {
@@ -779,7 +779,7 @@ func checkAcrossRules(t *testing.T, seed int64, output string, iv time.Duration)
 // rule must not take an interval for written before it has ended: a round
 // processed then would be the tail of the interval written last in the other
 // rules and late in this one, two intervals apart.
-func TestSampleTimestampsEarlyFlushStaysBehindTheClock(t *testing.T) {
+func TestScrapeTimeIntervalsEarlyFlushStaysBehindTheClock(t *testing.T) {
 	// Aligned to the interval, the flusher drops the tick that waited; not
 	// aligned, it takes it and flushes at once, for a boundary not yet reached.
 	for _, align := range []string{"", "  no_align_flush_to_interval: true\n"} {
@@ -795,7 +795,7 @@ func earlyFlush(t *testing.T, output, align string) {
 		cfg := ""
 		for _, name := range []string{"tokens", "cost"} {
 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-				"  staleness_interval: 40m\n  sample_timestamps: true\n" + align
+				"  staleness_interval: 40m\n  scrape_time_intervals: true\n" + align
 		}
 		got := map[string][]outSample{}
 		synctest.Test(t, func(t *testing.T) {
@@ -857,12 +857,12 @@ func earlyFlush(t *testing.T, output, align string) {
 // their own: the round goes whole to one interval. Its interval is decided at
 // its first block and kept for the rest, rather than the first block being the
 // tail of its own interval and the second, a boundary later, late.
-func TestSampleTimestampsRoundInBlocksAcrossABoundary(t *testing.T) {
+func TestScrapeTimeIntervalsRoundInBlocksAcrossABoundary(t *testing.T) {
 	for _, output := range stOutputs {
 		cfg := ""
 		for _, name := range []string{"tokens", "cost"} {
 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-				"  staleness_interval: 40m\n  sample_timestamps: true\n"
+				"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
 		}
 		scraped := 70 * time.Second // in the minute ending 2m
 		got := runLateScenario(t, cfg, []latePush{
@@ -879,12 +879,12 @@ func TestSampleTimestampsRoundInBlocksAcrossABoundary(t *testing.T) {
 // the flush waits for the pushes in progress. And every rule places a push by
 // the same reading of the clock, however long the push takes to go from one
 // rule to the next.
-func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
+func TestScrapeTimeIntervalsPushAcrossTheFlush(t *testing.T) {
 	for _, output := range stOutputs {
 		cfg := ""
 		for _, name := range []string{"tokens", "cost"} {
 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-				"  staleness_interval: 40m\n  sample_timestamps: true\n"
+				"  staleness_interval: 40m\n  scrape_time_intervals: true\n"
 		}
 		got := map[string][]outSample{}
 		synctest.Test(t, func(t *testing.T) {
@@ -945,12 +945,12 @@ func TestSampleTimestampsPushAcrossTheFlush(t *testing.T) {
 // their own is written at two timestamps a few milliseconds apart, and a query
 // at either one sees half of it. The tokens rule's last flush is held up for a
 // few milliseconds, as one rule's flush is behind another's on a real stop.
-func TestSampleTimestampsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
+func TestScrapeTimeIntervalsShutdownWritesEveryRuleAtOneTime(t *testing.T) {
 	for _, output := range stOutputs {
 		cfg := ""
 		for _, name := range []string{"tokens", "cost"} {
 			cfg += "- match: " + name + "\n  interval: 1m\n  outputs: [" + output + "]\n  keep_metric_names: true\n" +
-				"  staleness_interval: 40m\n  flush_on_shutdown: true\n  sample_timestamps: true\n"
+				"  staleness_interval: 40m\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n"
 		}
 		got := map[string][]outSample{}
 		synctest.Test(t, func(t *testing.T) {
@@ -1058,5 +1058,137 @@ func TestMustStopWaitsForThePushesInProgress(t *testing.T) {
 	defer mu.Unlock()
 	if len(got) != 1 || got[0] != 5 {
 		t.Fatalf("written %v; want the push in progress, 5, in the last flush", got)
+	}
+}
+
+// Under scrape_time_intervals a rule flushes on the grid of its own interval,
+// whenever the process started and flush_on_shutdown or not: an interval is
+// written as soon as it ends, not up to an interval later at the phase of the
+// start, and a process killed outright takes the interval in progress with it,
+// not two. A rule without scrape_time_intervals keeps the phase of the start.
+func TestScrapeTimeIntervalsFlushOnTheGridOfTheInterval(t *testing.T) {
+	cfg := "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n" +
+		"- match: cost\n  interval: 5m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n" +
+		"- match: reqs\n  interval: 1m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: false\n"
+	flushes := map[string][]time.Duration{} // per input metric, when its outputs were written
+	synctest.Test(t, func(t *testing.T) {
+		epoch := time.Now() // synctest starts on a whole hour
+		time.Sleep(28 * time.Second)
+		var mu sync.Mutex
+		a, err := LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+			mu.Lock()
+			defer mu.Unlock()
+			at := time.Since(epoch)
+			for _, ts := range tss {
+				for _, l := range ts.Labels {
+					if l.Name == "__name__" {
+						name, _, _ := strings.Cut(l.Value, ":")
+						if s := flushes[name]; len(s) == 0 || s[len(s)-1] != at {
+							flushes[name] = append(s, at)
+						}
+					}
+				}
+			}
+		}, nil, "test")
+		if err != nil {
+			t.Fatalf("cannot load config: %s", err)
+		}
+		for i := 0; i < 70; i++ {
+			now := time.Now()
+			a.Push(prometheus.MustParsePromMetrics("tokens 1\ncost 1\nreqs 1", now.Truncate(10*time.Second).UnixMilli()), nil)
+			time.Sleep(10 * time.Second)
+		}
+		a.MustStop()
+	})
+	check := func(name string, every, phase time.Duration) {
+		t.Helper()
+		got := flushes[name]
+		if len(got) < 2 {
+			t.Fatalf("%s: written at %v; want flushes", name, got)
+		}
+		for _, at := range got[:len(got)-1] { // the last is the flush on shutdown
+			if at%every != phase {
+				t.Errorf("%s: written at %v, at %v into its %v interval; want %v; all %v", name, at, at%every, every, phase, got)
+			}
+		}
+	}
+	check("tokens", time.Minute, 0)
+	check("cost", 5*time.Minute, 0)
+	check("reqs", time.Minute, 28*time.Second)
+}
+
+// sample_timestamps, the former name of scrape_time_intervals, still works the
+// same, and the two set to different values are refused.
+func TestScrapeTimeIntervalsFormerName(t *testing.T) {
+	rule := func(extra string) string {
+		return "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n" + extra
+	}
+	for _, c := range []struct {
+		extra  string
+		on, ok bool
+	}{
+		{"  scrape_time_intervals: true\n", true, true},
+		{"  sample_timestamps: true\n", true, true},
+		{"  sample_timestamps: false\n", false, true},
+		{"  scrape_time_intervals: true\n  sample_timestamps: true\n", true, true},
+		{"  scrape_time_intervals: true\n  sample_timestamps: false\n", false, false},
+	} {
+		a, err := LoadFromData([]byte(rule(c.extra)), func([]prompb.TimeSeries) {}, nil, "test")
+		if (err == nil) != c.ok {
+			t.Fatalf("%q: error %v; want ok %v", c.extra, err, c.ok)
+		}
+		if err != nil {
+			continue
+		}
+		if got := a.as[0].scrapeTimeIntervals; got != c.on {
+			t.Errorf("%q: scrape_time_intervals %v; want %v", c.extra, got, c.on)
+		}
+		a.MustStop()
+	}
+}
+
+// The flush ticker keeps the monotonic clock, and the wall clock drifts from it
+// and is corrected against it: here the wall clock is 50 ms behind, so every
+// tick comes before the boundary by the wall clock. An interval is still written
+// at the flush right after it ends, not left to the next one an interval later.
+func TestScrapeTimeIntervalsFlushWaitsForTheWallClock(t *testing.T) {
+	cfg := "- match: tokens\n  interval: 1m\n  outputs: [sum_samples]\n  flush_on_shutdown: true\n  scrape_time_intervals: true\n"
+	type write struct{ at, ts time.Duration }
+	var got []write
+	synctest.Test(t, func(t *testing.T) {
+		epoch := time.Now()
+		stClock = func() time.Time { return time.Now().Add(-50 * time.Millisecond) }
+		defer func() { stClock = time.Now }()
+		time.Sleep(28 * time.Second)
+		var mu sync.Mutex
+		a, err := LoadFromData([]byte(cfg), func(tss []prompb.TimeSeries) {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, ts := range tss {
+				for _, s := range ts.Samples {
+					got = append(got, write{time.Since(epoch), time.UnixMilli(s.Timestamp).Sub(epoch)})
+				}
+			}
+		}, nil, "test")
+		if err != nil {
+			t.Fatalf("cannot load config: %s", err)
+		}
+		for m := 1; m <= 6; m++ {
+			time.Sleep(time.Duration(m)*time.Minute + 3*time.Second - time.Since(epoch))
+			a.Push(prometheus.MustParsePromMetrics("tokens 1", epoch.Add(time.Duration(m)*time.Minute+time.Second).UnixMilli()), nil)
+		}
+		time.Sleep(7*time.Minute + 10*time.Second - time.Since(epoch))
+		a.MustStop()
+	})
+	for _, w := range got {
+		if w.ts == 7*time.Minute+10*time.Second-50*time.Millisecond { // the flush on shutdown
+			continue
+		}
+		if late := w.at - w.ts; late < 0 || late >= time.Second {
+			t.Errorf("the interval ending %v was written at %v, %v after its end; want at the flush right after it; all %v", w.ts, w.at, late, got)
+		}
+	}
+	if len(got) < 5 {
+		t.Fatalf("written %v; want the six intervals", got)
 	}
 }

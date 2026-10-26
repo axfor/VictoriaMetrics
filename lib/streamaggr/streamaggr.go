@@ -147,12 +147,12 @@ type Options struct {
 	// EnableWindows enables aggregation in windows
 	EnableWindows bool
 
-	// SampleTimestamps writes sum_samples and sum_samples_total at the end of the
+	// ScrapeTimeIntervals writes sum_samples and sum_samples_total at the end of the
 	// interval the input samples' timestamps fall in instead of at the flush, so
 	// an input processed late still counts towards the interval it was scraped in.
 	//
-	// This option can be overridden individually per each aggregation via sample_timestamps option.
-	SampleTimestamps bool
+	// This option can be overridden individually per each aggregation via scrape_time_intervals option.
+	ScrapeTimeIntervals bool
 }
 
 // Config is a configuration for a single stream aggregation.
@@ -297,7 +297,12 @@ type Config struct {
 	// EnableWindows enables aggregation in windows
 	EnableWindows *bool `yaml:"enable_windows,omitempty"`
 
-	// SampleTimestamps writes the outputs at the timestamps of the input samples instead of at the flush.
+	// ScrapeTimeIntervals puts every input sample in the interval it was scraped in and writes it at the
+	// end of that interval, instead of in the interval of the flush, so the samples of one scrape stay
+	// together in every aggregation.
+	ScrapeTimeIntervals *bool `yaml:"scrape_time_intervals,omitempty"`
+
+	// SampleTimestamps is the former name of ScrapeTimeIntervals, still accepted.
 	SampleTimestamps *bool `yaml:"sample_timestamps,omitempty"`
 }
 
@@ -442,7 +447,7 @@ func (a *Aggregators) MustStop() {
 	a.ms = nil
 
 	// The last flush of every rule is capped at one time, taken once their
-	// regular flushes have all stopped: under sample_timestamps a round whose
+	// regular flushes have all stopped: under scrape_time_intervals a round whose
 	// samples are in rules of their own, tokens in one and cost in another, is
 	// otherwise written at as many timestamps as the milliseconds the rules took
 	// to stop, and a query at any one of them sees part of it.
@@ -531,7 +536,7 @@ func (a *Aggregators) enterPush() *atomic.Int64 {
 }
 
 func (a *Aggregators) push(as []*aggregator, tss []prompb.TimeSeries, matchIdxs []byte) []byte {
-	// One reading of the clock for every rule: under sample_timestamps where a
+	// One reading of the clock for every rule: under scrape_time_intervals where a
 	// round goes depends on when it is processed, and a boundary passing while
 	// the push goes from one rule to the next must not send it two ways.
 	now := time.Now()
@@ -716,13 +721,13 @@ type aggregator struct {
 	stalenessInterval       time.Duration
 	outputHeartbeatInterval time.Duration
 
-	keepMetricNames  bool
-	ignoreOldSamples bool
-	enableWindows    bool
-	sampleTimestamps bool
+	keepMetricNames     bool
+	ignoreOldSamples    bool
+	enableWindows       bool
+	scrapeTimeIntervals bool
 
 	// stWritten is the end of the interval written last under
-	// sample_timestamps, and stTailOK whether this process wrote it; see stState.
+	// scrape_time_intervals, and stTailOK whether this process wrote it; see stState.
 	stWritten atomic.Int64
 	stTailOK  atomic.Bool
 	// stRounds is where rounds went, shared with the other rules of the config,
@@ -742,7 +747,7 @@ type aggregator struct {
 	// intervalPhaseMsec is a Unix timestamp on the grid the flushes are aligned
 	// to. time.Truncate counts intervals from the zero time, January 1 of year 1,
 	// not from the Unix epoch, and the two grids differ for an interval that does
-	// not divide a day, such as 7m. sample_timestamps puts samples into intervals
+	// not divide a day, such as 7m. scrape_time_intervals puts samples into intervals
 	// on the flushes' grid.
 	intervalPhaseMsec int64
 
@@ -938,11 +943,18 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 
 	// The global option applies where it can, so one flag covers a config that
 	// also has aggregations it cannot apply to; set on an aggregation, it has to.
-	sampleTimestamps := opts.SampleTimestamps && sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples) == nil
-	if v := cfg.SampleTimestamps; v != nil {
-		sampleTimestamps = *v
-		if sampleTimestamps {
-			if err := sampleTimestampsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples); err != nil {
+	scrapeTimeIntervals := opts.ScrapeTimeIntervals && scrapeTimeIntervalsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples) == nil
+	setting := cfg.ScrapeTimeIntervals
+	if old := cfg.SampleTimestamps; old != nil {
+		if setting != nil && *setting != *old {
+			return nil, fmt.Errorf("`scrape_time_intervals: %v` and `sample_timestamps: %v` disagree; `sample_timestamps` is the former name of `scrape_time_intervals`: keep only `scrape_time_intervals`", *setting, *old)
+		}
+		setting = old
+	}
+	if v := setting; v != nil {
+		scrapeTimeIntervals = *v
+		if scrapeTimeIntervals {
+			if err := scrapeTimeIntervalsApply(cfg.Outputs, enableWindows, dedupInterval, ignoreOldSamples); err != nil {
 				return nil, err
 			}
 		}
@@ -970,7 +982,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	}
 	outputsSeen := make(map[string]struct{}, len(cfg.Outputs))
 	for i, output := range cfg.Outputs {
-		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, sampleTimestamps)
+		ac, err := newOutputConfig(output, outputsSeen, useSharedState, ignoreFirstSampleInterval, scrapeTimeIntervals)
 		if err != nil {
 			return nil, err
 		}
@@ -1024,12 +1036,12 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		inputRelabeling:  inputRelabeling,
 		outputRelabeling: outputRelabeling,
 
-		keepMetricNames:   keepMetricNames,
-		ignoreOldSamples:  ignoreOldSamples,
-		enableWindows:     enableWindows,
-		sampleTimestamps:  sampleTimestamps,
-		stRounds:          late,
-		stalenessInterval: stalenessInterval,
+		keepMetricNames:     keepMetricNames,
+		ignoreOldSamples:    ignoreOldSamples,
+		enableWindows:       enableWindows,
+		scrapeTimeIntervals: scrapeTimeIntervals,
+		stRounds:            late,
+		stalenessInterval:   stalenessInterval,
 
 		outputHeartbeatInterval: outputHeartbeatInterval,
 
@@ -1086,7 +1098,14 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 
 	startTime := time.Now()
 	minTime := startTime
-	if skipIncompleteFlush && alignFlushToInterval {
+	// Under scrape_time_intervals a flush writes the intervals that have ended by
+	// then, so one that flushes at its own phase -- the process's start, with
+	// flush_on_shutdown -- holds an interval that has ended until its next
+	// flush, up to another interval: on its grid, an interval is written as
+	// soon as it ends, and what a process killed outright takes with it is the
+	// interval in progress, not two. The other outputs write everything they
+	// have at every flush, stamped with its time, and keep their phase.
+	if (skipIncompleteFlush || scrapeTimeIntervals) && alignFlushToInterval {
 		minTime = minTime.Truncate(a.interval)
 		if !startTime.Equal(minTime) {
 			minTime = minTime.Add(interval)
@@ -1096,7 +1115,7 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 		a.flushAfter = histogram.GetFast()
 	}
 	a.minDeadline.Store(minTime.UnixMilli())
-	// Under sample_timestamps the interval that ended before the start is taken
+	// Under scrape_time_intervals the interval that ended before the start is taken
 	// as written: rounds of it go to the first interval this process writes.
 	a.stWritten.Store(a.intervalFloor(startTime.UnixMilli()))
 	cs := &currentState{}
@@ -1116,24 +1135,24 @@ func newAggregator(cfg *Config, path string, pushFunc PushFunc, ms *metrics.Set,
 	return a, nil
 }
 
-// sampleTimestampsApply returns why sample_timestamps cannot apply to an
+// scrapeTimeIntervalsApply returns why scrape_time_intervals cannot apply to an
 // aggregation, or nil if it can.
-func sampleTimestampsApply(outputs []string, enableWindows bool, dedupInterval time.Duration, ignoreOldSamples bool) error {
+func scrapeTimeIntervalsApply(outputs []string, enableWindows bool, dedupInterval time.Duration, ignoreOldSamples bool) error {
 	if enableWindows || dedupInterval > 0 {
-		return fmt.Errorf("`sample_timestamps` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
+		return fmt.Errorf("`scrape_time_intervals` cannot be combined with `enable_windows` or `dedup_interval`, which decide timestamps of their own")
 	}
 	if ignoreOldSamples {
-		return fmt.Errorf("`sample_timestamps` cannot be combined with `ignore_old_samples`, which drops the samples of rounds processed late that it puts into the intervals they were scraped in")
+		return fmt.Errorf("`scrape_time_intervals` cannot be combined with `ignore_old_samples`, which drops the samples of rounds processed late that it puts into the intervals they were scraped in")
 	}
 	for _, o := range outputs {
 		if o != "sum_samples" && o != "sum_samples_total" {
-			return fmt.Errorf("`sample_timestamps` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
+			return fmt.Errorf("`scrape_time_intervals` supports only `sum_samples` and `sum_samples_total` outputs; got %q", o)
 		}
 	}
 	return nil
 }
 
-func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, sampleTimestamps bool) (aggrConfig, error) {
+func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedState bool, ignoreFirstSampleInterval time.Duration, scrapeTimeIntervals bool) (aggrConfig, error) {
 	// check for duplicated output
 	if _, ok := outputsSeen[output]; ok {
 		return nil, fmt.Errorf("`outputs` list contains duplicate aggregation function: %s", output)
@@ -1197,9 +1216,9 @@ func newOutputConfig(output string, outputsSeen map[string]struct{}, useSharedSt
 	case "stdvar":
 		return newStdvarAggrConfig(), nil
 	case "sum_samples":
-		return newSumSamplesAggrConfig(sampleTimestamps), nil
+		return newSumSamplesAggrConfig(scrapeTimeIntervals), nil
 	case "sum_samples_total":
-		return newSumSamplesTotalAggrConfig(sampleTimestamps), nil
+		return newSumSamplesTotalAggrConfig(scrapeTimeIntervals), nil
 	case "total":
 		return newTotalAggrConfig(ignoreFirstSampleIntervalSecs, false, true), nil
 	case "total_prometheus":
@@ -1247,6 +1266,9 @@ func (a *aggregator) runFlusher(pushFunc PushFunc, alignFlushToInterval, skipInc
 
 	var fa *histogram.Fast
 	for tickerWait(t) {
+		if a.scrapeTimeIntervals && alignFlushToInterval && !a.waitForBoundary(flushTime) {
+			break // stopped while waiting
+		}
 		pf := pushFunc
 		if a.enableWindows {
 			// Calculate delay and wait
@@ -1349,6 +1371,34 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
 	cs.maxDeadline = dedupTime.UnixMilli()
 }
 
+// waitForBoundary waits until the wall clock has got to the boundary a flush on
+// the grid is due at, and reports false if a was stopped meanwhile. The ticker
+// keeps the monotonic clock, which the wall clock drifts from and is corrected
+// against: a tick a millisecond before the boundary by the wall clock would
+// leave the interval that has just ended to the next flush, an interval later,
+// see flush. A wall clock far behind is not waited for.
+func (a *aggregator) waitForBoundary(boundary time.Time) bool {
+	for {
+		d := boundary.Sub(stClock())
+		if d <= 0 || d > a.interval {
+			return true
+		}
+		// a timer of its own, as alignedSleep has: the waits are a few
+		// milliseconds, and a pooled timer would cross synctest bubbles in tests
+		timer := time.NewTimer(d)
+		select {
+		case <-a.stopCh:
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+// stClock is the wall clock flushes read under scrape_time_intervals: time.Now,
+// which the tests of waitForBoundary replace with one off the ticker's.
+var stClock = time.Now
+
 // flush flushes aggregator state to pushFunc.
 //
 // If pushFunc is nil, then the aggregator state is just reset.
@@ -1365,7 +1415,7 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 		a.minDeadline.Store(cs.maxDeadline)
 		ctx.isGreen = cs.isGreen
 	}
-	if a.sampleTimestamps {
+	if a.scrapeTimeIntervals {
 		a.stCut()
 		ctx.st = stState{written: a.stWritten.Load(), tailOK: a.stTailOK.Load(), closing: math.MaxInt64}
 		if !isLast {
@@ -1378,7 +1428,7 @@ func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentSt
 	}
 	ao.flushState(ctx)
 	ctx.flushSeries()
-	if a.sampleTimestamps && !isLast && ctx.st.closing > ctx.st.written {
+	if a.scrapeTimeIntervals && !isLast && ctx.st.closing > ctx.st.written {
 		a.stWritten.Store(ctx.st.closing)
 		a.stTailOK.Store(true)
 		a.stPruneRounds(ctx.now)
@@ -1432,13 +1482,13 @@ func (a *aggregator) pushAt(tss []prompb.TimeSeries, matchIdxs []byte, now time.
 	enableWindows := a.enableWindows
 	cs := a.cs.Load()
 
-	// Under sample_timestamps a sample is kept under the end of the interval its
+	// Under scrape_time_intervals a sample is kept under the end of the interval its
 	// round goes to, see stPlace, not under its own timestamp. Every target is
 	// scraped at an offset of its own, so the exact timestamps would give an
 	// output fed by N targets N sums to keep and N samples to write per interval;
 	// and however far behind the aggregator is, an output holds only so many sums.
-	sampleTimestamps := a.sampleTimestamps
-	if sampleTimestamps {
+	scrapeTimeIntervals := a.scrapeTimeIntervals
+	if scrapeTimeIntervals {
 		in := a.stEnter()
 		defer in.Add(-1)
 	}
@@ -1492,7 +1542,7 @@ func (a *aggregator) pushAt(tss []prompb.TimeSeries, matchIdxs []byte, now time.
 				maxLagMsec = lagMsec
 			}
 			timestamp := s.Timestamp
-			if sampleTimestamps {
+			if scrapeTimeIntervals {
 				if stAt == 0 || stTs != s.Timestamp {
 					stTs, stAt = s.Timestamp, a.stPlace(s.Timestamp, nowMsec)
 				}
@@ -1755,7 +1805,7 @@ func getFlushCtx(a *aggregator, ao *aggrOutputs, pushFunc PushFunc, flushTimesta
 	ctx.pushFunc = pushFunc
 	ctx.flushTimestamp = flushTimestamp
 	ctx.isLast = isLast
-	ctx.now = time.Now().UnixMilli()
+	ctx.now = stClock().UnixMilli()
 	return ctx
 }
 
@@ -1783,7 +1833,7 @@ type flushCtx struct {
 	isGreen        bool
 	isLast         bool
 
-	// now and st are for sample_timestamps: the wall clock no output is stamped
+	// now and st are for scrape_time_intervals: the wall clock no output is stamped
 	// after, and where the aggregator is in the intervals, the same for every
 	// output; slots is scratch for an output's sums.
 	now   int64
@@ -1886,7 +1936,7 @@ func (ctx *flushCtx) appendSeriesAt(key, suffix string, timestamp int64, value f
 }
 
 // samplesCount counts the samples in tss: a series carries several under
-// sample_timestamps, one per pending interval, see beginSeries.
+// scrape_time_intervals, one per pending interval, see beginSeries.
 func samplesCount(tss []prompb.TimeSeries) int {
 	n := 0
 	for i := range tss {
@@ -1897,7 +1947,7 @@ func samplesCount(tss []prompb.TimeSeries) int {
 
 // beginSeries starts an output series that takes several samples, added with
 // appendSample and closed with endSeries, so that an output writing more than
-// one sample per flush -- one per pending interval under sample_timestamps --
+// one sample per flush -- one per pending interval under scrape_time_intervals --
 // decompresses its labels and goes to pushFunc once rather than per sample.
 func (ctx *flushCtx) beginSeries(key, suffix string) (labelsLen, samplesLen int) {
 	labelsLen = len(ctx.labels)
