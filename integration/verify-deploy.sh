@@ -19,6 +19,7 @@ NS=${NS:-acg-system}
 VMAGENT_PREFIX=${VMAGENT_PREFIX:-victoria-metrics-agent}
 SELECT_PREFIX=${SELECT_PREFIX:-vm-select}
 STORAGE_PREFIX=${STORAGE_PREFIX:-vm-storage}
+INSERT_PREFIX=${INSERT_PREFIX:-vm-insert}
 # model-router 是 higress-gateway pod 里的边车,所以这里找的是 gateway 的 pod,
 # 再在里面挑边车那个容器。容器名不给就按 model|router 自动认。
 ROUTER_PREFIX=${ROUTER_PREFIX:-higress-gateway}
@@ -27,6 +28,7 @@ ROUTER_CONTAINER=${ROUTER_CONTAINER:-}
 USAGE_PATH=${USAGE_PATH:-/metrics/usage}            # 用量端点
 CUMULATIVE_PATH=${CUMULATIVE_PATH:-/metrics/cumulative}
 VMAGENT_PORT=${VMAGENT_PORT:-8429}
+INSERT_PORT=${INSERT_PORT:-8480}
 SELECT_PORT=${SELECT_PORT:-8481}
 STORAGE_PORT=${STORAGE_PORT:-8482}
 TENANT=${TENANT:-0}
@@ -72,11 +74,13 @@ printf '\033[1mAPI Key 用量统计 · 部署探测\033[0m  namespace=%s\n' "$NS
 AGENT_POD=$(pods "$NS" "$VMAGENT_PREFIX" | head -1)
 SELECT_POD=$(pods "$NS" "$SELECT_PREFIX" | head -1)
 STORAGE_PODS=$(pods "$NS" "$STORAGE_PREFIX")
+INSERT_PODS=$(pods "$NS" "$INSERT_PREFIX")
 ROUTER_PODS=$(pods "$ROUTER_NS" "$ROUTER_PREFIX")
 head2 "零、发现"
 [ -n "$AGENT_POD" ]  && ok "vmagent   $AGENT_POD"   || bad "$NS 里没有 $VMAGENT_PREFIX* 的 Running pod,用 VMAGENT_PREFIX= 指定"
 [ -n "$SELECT_POD" ] && ok "vm-select $SELECT_POD"  || warn "没有 $SELECT_PREFIX*,§四跳过"
 [ -n "$STORAGE_PODS" ] && ok "vm-storage $(echo "$STORAGE_PODS" | tr '\n' ' ')" || warn "没有 $STORAGE_PREFIX*,§六跳过"
+[ -n "$INSERT_PODS" ] && ok "vm-insert $(echo "$INSERT_PODS" | tr '\n' ' ')" || warn "没有 $INSERT_PREFIX*,vm-insert 的版本核对跳过"
 if [ -n "$ROUTER_PODS" ]; then
   ok "model-router $(echo "$ROUTER_PODS" | wc -l | tr -d ' ') 个 pod"
 else
@@ -116,6 +120,16 @@ PN=$(sed -n 's/.*v1\.126\.10\([0-9][0-9]\)-cluster.*/\1/p' <<<"$VER")
 if [ -z "$PN" ]; then warn "认不出版本号,是不是 v1.126.1036-cluster 只能问镜像来源"
 elif [ "$PN" -ge 36 ]; then ok "版本 ≥ v1.126.1036-cluster"
 else bad "版本 $VER 低于 v1.126.1036-cluster,按 vm-side.md 第 2 步换镜像"; fi
+# 四个组件要是同一个 tag 构建的
+compver() { # compver <名字> <pod> <端口>
+  local v; v=$(raw "$2" "$3" "/metrics$Q" | grep -m1 '^vm_app_version' | sed -n 's/.*short_version="\([^"]*\)".*/\1/p')
+  if [ -z "$v" ]; then warn "$1 $2: 读不到 vm_app_version"
+  elif [ "$v" = "$VER" ]; then ok "$1 $2: $v,和 vmagent 同一个版本"
+  else bad "$1 $2: $v,和 vmagent 的 $VER 不是同一个版本,按 vm-side.md 第 1 步换镜像"; fi
+}
+[ -n "$SELECT_POD" ] && compver vm-select "$SELECT_POD" "$SELECT_PORT"
+for p in $STORAGE_PODS; do compver vm-storage "$p" "$STORAGE_PORT"; done
+for p in $INSERT_PODS; do compver vm-insert "$p" "$INSERT_PORT"; done
 
 # 这三个名字上游一个都没有,出现即证明补丁在。
 has 'vm_streamaggr_skipped_unchanged_outputs_total' \

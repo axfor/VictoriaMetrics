@@ -1,6 +1,6 @@
 # API Key 用量统计 · vmagent / VM / ruler 上线手册
 
-版本：vmagent `v1.126.1036-cluster`、vm-select / vm-storage `v1.126.1027-cluster`（fork `github.com/axfor/VictoriaMetrics`）· ruler `v0.1.11`（Helm chart 0.1.14，仓库 `github.com/axfor/ruler`）
+版本：vmagent、vm-insert、vm-select、vm-storage 都是 `v1.126.1036-cluster`（fork `github.com/axfor/VictoriaMetrics`，同一个 tag 构建）· ruler `v0.1.11`（Helm chart 0.1.14，仓库 `github.com/axfor/ruler`）
 
 按顺序做。每一步做完先跑“确认”，通过了再做下一步。边车那侧见 [`app-side.md`](app-side.md)。
 
@@ -8,11 +8,13 @@
 
 ---
 
-## 第 1 步：vm-select、vm-storage
+## 第 1 步：vm-insert、vm-select、vm-storage
 
 换镜像，加启动参数，调资源。
 
-镜像用 fork 的 tag `v1.126.1027-cluster` 源码构建：在仓库根目录执行 `make vmselect-linux-amd64-prod vmstorage-linux-amd64-prod`（需要 docker），产物是 `bin/vmselect-linux-amd64-prod` 和 `bin/vmstorage-linux-amd64-prod`，按现在的方式打进镜像。
+镜像用 fork 的 tag `v1.126.1036-cluster` 源码构建：在仓库根目录执行 `make vminsert-linux-amd64-prod vmselect-linux-amd64-prod vmstorage-linux-amd64-prod`（需要 docker），产物是 `bin/vminsert-linux-amd64-prod`、`bin/vmselect-linux-amd64-prod`、`bin/vmstorage-linux-amd64-prod`，按现在的方式打进镜像。用这几个 `-linux-amd64-prod` 目标，不要用 `-pure-prod`。
+
+vm-storage 一台一台地换；vm-insert 不用加参数、不用调资源，换完镜像即可。
 
 **vm-select** 启动参数加上这三行：
 
@@ -65,6 +67,10 @@ resources:
 curl -s http://vm-select:8481/flags | grep -E 'dedup|maxQueryDuration|minStaleness'
 for i in 0 1 2; do curl -s http://vm-storage-$i.vm-storage:8482/flags | grep -E 'dedup|cacheSizeStorageMetricName|allowedPercent|maxMetricIDsForDirectTSDBStatus'; done
 
+# 三个组件都是 v1.126.1036-cluster
+for u in vm-select:8481 vm-insert:8480 $(for i in 0 1 2; do echo vm-storage-$i.vm-storage:8482; done); do echo "$u $(curl -s http://$u/metrics | grep -o 'short_version="[^"]*"')"; done
+#   每一行都是 short_version="v1.126.1036-cluster"
+
 # 换了镜像的 vm-select 对 ruler 的请求头回 zstd
 curl -s -o /dev/null -D - -H 'Accept-Encoding: zstd, gzip;q=0.5' \
   'http://vm-select:8481/select/0/prometheus/api/v1/export?match[]=up&start=-1h' | grep -i content-encoding
@@ -77,7 +83,7 @@ curl -s -o /dev/null -D - -H 'Accept-Encoding: zstd, gzip;q=0.5' \
 
 ### 镜像
 
-这一步只换 vmagent。用 fork `github.com/axfor/VictoriaMetrics` 的 tag `v1.126.1036-cluster` 源码构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。vm-insert 的镜像不换。
+这一步只换 vmagent。用第 1 步同一个 tag `v1.126.1036-cluster` 构建：在仓库根目录执行 `make vmagent-linux-amd64-prod`（需要 docker），产物是 `bin/vmagent-linux-amd64-prod`，按现在的方式打进镜像。
 
 **已经在用这个 fork 的 vmagent 的：**
 
@@ -379,7 +385,7 @@ kubectl apply -f old-rules.yaml
 
 **vmagent**：换回原来的镜像，同时改 `extraArgs`：原来的镜像是 `v1.126.1028-cluster` ~ `v1.126.1035-cluster` 时，把 `remoteWrite.streamAggr.scrapeTimeIntervals` 改回 `remoteWrite.streamAggr.sampleTimestamps`（旧镜像不认新名，会启动失败）；早于 `v1.126.1028-cluster` 时，去掉这一行，内存改回 6Gi。
 
-**vm-select、vm-storage**：换回原来的镜像，并去掉 `-search.maxMetricIDsForDirectTSDBStatus` 那一行。vm-storage 一台一台地换。
+**vm-insert、vm-select、vm-storage**：换回原来的镜像，vm-storage 去掉 `-search.maxMetricIDsForDirectTSDBStatus` 那一行。vm-storage 一台一台地换。
 
 **ruler 的 :10 / 00:30**：把 4 个文件改回 1h `schedule: 3 * * * *`、`queryTime: -3m`（算力池、并发两个文件 `7 * * * *`、`-7m`），1d `schedule: 5 0 * * *`、`queryTime: -5m`（`9 0 * * *`、`-9m`），`insertTime` 不动，`kubectl apply`；monitor-api 的拼接改动一起撤回。
 
