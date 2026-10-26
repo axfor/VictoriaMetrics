@@ -1,6 +1,6 @@
 # API Key 用量统计 · model-router 边车接入
 
-SDK：`github.com/axfor/client_golang v1.24.1027`
+SDK：`github.com/axfor/client_golang v1.24.1028`
 
 指标定义、`Inc()`、`Observe()` 都不用改，只改注册和端点。采集侧见 [`vm-side.md`](vm-side.md)，上线顺序见第 4 步。
 
@@ -9,10 +9,10 @@ SDK：`github.com/axfor/client_golang v1.24.1027`
 ## 1. go.mod
 
 ```
-replace github.com/prometheus/client_golang => github.com/axfor/client_golang v1.24.1027
+replace github.com/prometheus/client_golang => github.com/axfor/client_golang v1.24.1028
 ```
 
-已经在用 v1.24.1023 ~ v1.24.1026 的：只改这里的版本，重新发版，代码不用动。
+已经在用 v1.24.1023 ~ v1.24.1027 的：只改这里的版本，重新发版，代码不用动。
 
 ## 2. 代码
 
@@ -110,7 +110,7 @@ curl -s -o /dev/null -D - -H 'X-Prometheus-Delta-Ack: peek' http://<pod>:9090/me
 #   X-Prometheus-Delta-Round: ...          两行都要有
 ```
 
-再跑一遍 [`verify-deploy.sh`](verify-deploy.sh)（`./verify-deploy.sh`，退出码 0 为通过），它读出的 client_golang 版本应为 v1.24.1027。
+再跑一遍 [`verify-deploy.sh`](verify-deploy.sh)（`./verify-deploy.sh`，退出码 0 为通过），它读出的 client_golang 版本应为 v1.24.1028。
 
 ## 5. 网络策略
 
@@ -168,7 +168,7 @@ curl -s -m 5 -o /dev/null -w "%{http_code}\n" -H 'X-Prometheus-Delta-Ack: peek' 
 | VM 里的数字比预期少一截 | 找出 vmagent 以外抓 `/metrics/usage` 的程序，停掉；手工看要带 `X-Prometheus-Delta-Ack: peek` |
 | 框架指标停了半小时后消失、或从 0 重新开始；`/metrics/usage` 里出现框架指标 | 补上 `opts.Scope = usageReg` |
 | 边车内存比第 3 步高很多 | 删掉改 `IdleScrapes` 的那一行 |
-| 检查时没有 `X-Prometheus-Delta-Features: final` | `go.mod` 里的版本改成 v1.24.1027 重新发版 |
+| 检查时没有 `X-Prometheus-Delta-Features: final` | `go.mod` 里的版本改成 v1.24.1028 重新发版 |
 | 加了第 5 步的网络策略后，vmagent 抓边车 `up=0` 或业务请求失败 | 核对网络策略里两个 pod 标签和业务端口，改对后重新 apply |
 | VM 里突然没有新数据，但 `up` 是 1 | 采集侧按 vm-side 第 2 步把 `promscrape.maxScrapeSize` 设成 500MiB，reload vmagent |
 

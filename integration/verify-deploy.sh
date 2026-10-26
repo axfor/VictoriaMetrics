@@ -290,12 +290,13 @@ for p in $ROUTER_PODS; do
           'grep -aoE "axfor/client_golang[[:space:]]+v[0-9][^[:space:]]*" /proc/1/exe 2>/dev/null | head -1' 2>/dev/null | tr -d '\0')
   v=$(awk '{print $2}' <<<"$line")
   if [ -n "$v" ]; then
-    [ "$v" = "v1.24.1027" ] && ok "$p/$c: client_golang $v" || bad "$p/$c: client_golang $v,要 v1.24.1027(app-side.md 第 1 步)"
+    # v1.24.1027 是 v1.24.1028 改发前的版本号,代码相同
+    { [ "$v" = "v1.24.1028" ] || [ "$v" = "v1.24.1027" ]; } && ok "$p/$c: client_golang $v" || bad "$p/$c: client_golang $v,要 v1.24.1028(app-side.md 第 1 步)"
   else
     warn "$p/$c: 读不到(镜像里没有 sh/grep、没有 exec 权限,或 pod 开了 shareProcessNamespace 导致 PID 1 是 pause)"
     echo "        退路: kubectl -n $ROUTER_NS exec $p -c $c -- cat /proc/1/exe > /tmp/mr"
     echo "              go version -m /tmp/mr | grep client_golang"
-    echo "        要看到 '=> github.com/axfor/client_golang v1.24.1027';只有 dep 行 = replace 没生效"
+    echo "        要看到 '=> github.com/axfor/client_golang v1.24.1028';只有 dep 行 = replace 没生效"
   fi
 done
 
