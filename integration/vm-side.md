@@ -428,8 +428,8 @@ kubectl apply -f old-rules.yaml
 | vmagent 被 OOMKilled | 内存按第 2 步给 7Gi，下调过的先改回 7Gi。7Gi 仍被杀：在 `extraArgs` 里去掉 `remoteWrite.streamAggr.scrapeTimeIntervals` 应急，并把被杀前的内存曲线发回来 |
 | vmagent 日志 `exceeds sample_limit` 或 `exceeding label_limit` | 按第 2 步去掉 `sample_limit` / `label_limit` |
 | VM 里突然没有新用量数据，但 `up` 是 1 | `vm_promscrape_max_scrape_size_exceeded_errors_total` 非零：`promscrape.maxScrapeSize` 设成 500MiB 并 `helm upgrade` vmagent |
-| vmagent 抓边车偶尔超时（`up` 偶尔为 0） | 确认 vmagent 是 `v1.126.1036-cluster`、边车是 `v1.24.1028`，不是就换版本 |
-| 每次 vmagent 重启或发版后，用量比边车实际少一分钟左右 | vmagent 换到 `v1.126.1036-cluster`、边车换到 `v1.24.1028`；`_1m_by_*` 规则按第 2 步补上 `flush_on_shutdown: true` |
+| vmagent 抓边车偶尔超时（`up` 偶尔为 0） | 确认 vmagent 是 `v1.126.1036-cluster`、边车是 `v1.24.1029`，不是就换版本 |
+| 每次 vmagent 重启或发版后，用量比边车实际少一分钟左右 | vmagent 换到 `v1.126.1036-cluster`、边车换到 `v1.24.1029`；`_1m_by_*` 规则按第 2 步补上 `flush_on_shutdown: true` |
 | vmagent 重启那一刻，某个时间点上只有费用、没有 token（或反过来） | vmagent 换到 `v1.126.1036-cluster` |
 | 看板分钟曲线时有空缺、尖刺，整点前后的小时数对不上；或某几分钟用量是 0、下一分钟翻倍 | vmagent 跟不上：按第 2 步的“确认”看落后和 `flush_timeouts`，CPU 请求给到 2 核，需要时再加 |
 | vm-storage 被 OOMKilled | 核对第 1 步的 8Gi 和 `-memory.allowedPercent=35` |

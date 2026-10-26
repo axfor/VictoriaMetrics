@@ -4,7 +4,7 @@
 
 四十个补丁,**按编号顺序打**。004~027、030~033、035~043 是 vmagent 的,028、034 是 vmselect 的(改的是各组件共用的 HTTP 服务端),029 是 vmstorage 的。源码是 fork `github.com/axfor/VictoriaMetrics`
 
-client_golang v1.24.1023 ~ v1.24.1027 已改发为 v1.24.1028(代码相同,只去掉了提交说明里的工具署名),原来的这几个 tag 已删除;文中提到它们的地方都以 v1.24.1028 为准。
+client_golang v1.24.1023 ~ v1.24.1027 的 tag 指向去掉了提交说明里工具署名的提交(代码与原来逐字节相同,校验和不变),新部署用 v1.24.1029(与 v1.24.1028 运行时代码相同,只多一个测试)。
 (本地 `/Users/axx/code/VictoriaMetrics`)分支 `v1.126.1000-cluster`,基线为上游 tag `v1.126.0-cluster`,
 一个补丁一个提交。
 
