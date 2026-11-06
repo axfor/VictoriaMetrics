@@ -304,13 +304,14 @@ for p in $ROUTER_PODS; do
           'grep -aoE "axfor/client_golang[[:space:]]+v[0-9][^[:space:]]*" /proc/1/exe 2>/dev/null | head -1' 2>/dev/null | tr -d '\0')
   v=$(awk '{print $2}' <<<"$line")
   if [ -n "$v" ]; then
-    # v1.24.1027、v1.24.1028 与 v1.24.1029 运行时代码相同
-    case "$v" in v1.24.1027|v1.24.1028|v1.24.1029) ok "$p/$c: client_golang $v";; *) bad "$p/$c: client_golang $v,要 v1.24.1029(app-side.md 第 1 步)";; esac
+    # v1.24.1027 ~ v1.24.1029 运行时代码相同;v1.24.1030 只改了 delta.New 那种接法和 summary / native histogram
+    # 的空闲判断,按 app-side.md 接入的边车行为相同
+    case "$v" in v1.24.1027|v1.24.1028|v1.24.1029|v1.24.1030) ok "$p/$c: client_golang $v";; *) bad "$p/$c: client_golang $v,要 v1.24.1030(app-side.md 第 1 步)";; esac
   else
     warn "$p/$c: 读不到(镜像里没有 sh/grep、没有 exec 权限,或 pod 开了 shareProcessNamespace 导致 PID 1 是 pause)"
     echo "        退路: kubectl -n $ROUTER_NS exec $p -c $c -- cat /proc/1/exe > /tmp/mr"
     echo "              go version -m /tmp/mr | grep client_golang"
-    echo "        要看到 '=> github.com/axfor/client_golang v1.24.1029';只有 dep 行 = replace 没生效"
+    echo "        要看到 '=> github.com/axfor/client_golang v1.24.1030';只有 dep 行 = replace 没生效"
   fi
 done
 
